@@ -15,10 +15,13 @@
  */
 
 #include "waywal/shader_graph.h"
+#include "waywal/bezier.h"
+#include "waywal/shader_parser.h"
 
 #include <assert.h>
 #include <inttypes.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -699,6 +702,579 @@ static void test_codegen_smoothstep_swizzle_coercion_mute_and_pins(void)
     printf("    -> Smoothstep guard, swizzle, muted bypass & pin-flag sync verified.\n");
 }
 
+static void test_connect_cycle_preserves_prior_edge(void)
+{
+    printf("[+] Testing AUD-047 cycle-preserving connect() & would_create_cycle()...\n");
+
+    waywal_shader_graph_t *g = waywal_shader_graph_create();
+    assert(g != NULL);
+
+    int32_t n1 = waywal_shader_graph_add_node(g, WAYWAL_NODE_IN_UV, "UV", 0, 0);
+    int32_t n2 = waywal_shader_graph_add_node(g, WAYWAL_NODE_MATH_SIN, "Sin", 100, 0);
+    int32_t n3 = waywal_shader_graph_add_node(g, WAYWAL_NODE_MATH_ADD, "Add", 200, 0);
+    int32_t n4 = waywal_shader_graph_add_node(g, WAYWAL_NODE_OUT_IMAGE_PASS, "Sink", 300, 0);
+    int32_t n_latch =
+        waywal_shader_graph_add_node(g, WAYWAL_NODE_IN_PASS_BUFFER, "Latch", 200, 120);
+
+    int32_t e_keep = waywal_shader_graph_connect(g, (uint32_t)n1, 0, (uint32_t)n2, 0);
+    int32_t e23 = waywal_shader_graph_connect(g, (uint32_t)n2, 0, (uint32_t)n3, 0);
+    int32_t e34 = waywal_shader_graph_connect(g, (uint32_t)n3, 0, (uint32_t)n4, 0);
+    int32_t e3l = waywal_shader_graph_connect(g, (uint32_t)n3, 0, (uint32_t)n_latch, 0);
+    assert(e_keep > 0 && e23 > 0 && e34 > 0 && e3l > 0);
+
+    assert(waywal_shader_graph_would_create_cycle(g, (uint32_t)n3, (uint32_t)n2));
+    assert(waywal_shader_graph_would_create_cycle(g, (uint32_t)n1, (uint32_t)n1));
+    assert(!waywal_shader_graph_would_create_cycle(g, (uint32_t)n_latch, (uint32_t)n2));
+
+    uint32_t edge_cnt_before = g->edge_count;
+    int32_t bad_e = waywal_shader_graph_connect(g, (uint32_t)n3, 0, (uint32_t)n2, 0);
+    assert(bad_e < 0);
+    assert(g->edge_count == edge_cnt_before);
+
+    bool found_kept = false;
+    for (uint32_t i = 0; i < g->edge_count; ++i) {
+        if (g->edges[i].edge_id == (uint32_t)e_keep) {
+            assert(g->edges[i].src_node_id == (uint32_t)n1);
+            assert(g->edges[i].dst_node_id == (uint32_t)n2);
+            assert(g->edges[i].dst_pin_index == 0u);
+            found_kept = true;
+        }
+    }
+    assert(found_kept);
+    assert((waywal_shader_graph_find_node(g, (uint32_t)n1)->outputs[0].flags &
+            WAYWAL_PIN_FLAG_CONNECTED) != 0u);
+    assert((waywal_shader_graph_find_node(g, (uint32_t)n2)->inputs[0].flags &
+            WAYWAL_PIN_FLAG_CONNECTED) != 0u);
+
+    waywal_shader_graph_destroy(g);
+    printf("    -> Cyclic connect() safely preserves existing incoming wire & pin flags.\n");
+}
+
+static void test_json_deep_alternating_skipper(void)
+{
+    printf(
+        "[+] Testing AUD-241 bounded iterative JSON skipper on deep alternating containers...\n");
+
+    waywal_shader_graph_t *dst = waywal_shader_graph_create();
+    assert(dst != NULL);
+    char err_buf[256] = {0};
+
+    /* 32 alternating levels of {[{"k":...}]} should skip cleanly */
+    size_t valid_depth = 32u;
+    size_t valid_cap = valid_depth * 8u + 128u;
+    char *valid_json = (char *)malloc(valid_cap);
+    assert(valid_json != NULL);
+    size_t pos = 0;
+    pos += (size_t)snprintf(valid_json + pos, valid_cap - pos, "{\"schema_version\":1,\"extra\":");
+    for (size_t d = 0; d < valid_depth; ++d) {
+        memcpy(valid_json + pos, "{\"a\":[", 6u);
+        pos += 6u;
+    }
+    memcpy(valid_json + pos, "123", 3u);
+    pos += 3u;
+    for (size_t d = 0; d < valid_depth; ++d) {
+        memcpy(valid_json + pos, "]}", 2u);
+        pos += 2u;
+    }
+    pos += (size_t)snprintf(valid_json + pos, valid_cap - pos,
+                            ",\"nodes\":[{\"node_id\":1,\"opcode\":0}],\"edges\":[]}");
+    assert(waywal_shader_graph_load_json(valid_json, pos, dst, err_buf));
+    assert(dst->node_count == 1u);
+    free(valid_json);
+
+    /* 8192 alternating levels must fail cleanly without stack overflow */
+    size_t dos_depth = 8192u;
+    size_t dos_cap = dos_depth * 8u + 128u;
+    char *dos_json = (char *)malloc(dos_cap);
+    assert(dos_json != NULL);
+    pos = 0;
+    pos += (size_t)snprintf(dos_json + pos, dos_cap - pos, "{\"schema_version\":1,\"dos\":");
+    for (size_t d = 0; d < dos_depth; ++d) {
+        memcpy(dos_json + pos, "{\"a\":[", 6u);
+        pos += 6u;
+    }
+    memcpy(dos_json + pos, "0", 1u);
+    pos += 1u;
+    for (size_t d = 0; d < dos_depth; ++d) {
+        memcpy(dos_json + pos, "]}", 2u);
+        pos += 2u;
+    }
+    memcpy(dos_json + pos, "}", 2u);
+    pos += 1u;
+    assert(!waywal_shader_graph_load_json(dos_json, pos, dst, err_buf));
+    free(dos_json);
+
+    /* Mismatched closing delimiter inside skipped value must fail */
+    const char *mismatched = "{\"schema_version\":1,\"bad\":[1, 2}}";
+    assert(!waywal_shader_graph_load_json(mismatched, strlen(mismatched), dst, err_buf));
+
+    waywal_shader_graph_destroy(dst);
+    printf("    -> Deep alternating JSON skipper bounded & stack-safe.\n");
+}
+
+static void test_safe_pow_oklab_iec_and_pin_sync(void)
+{
+    printf("[+] Testing AUD-383 wwal_safe_pow, IEC 61966-2-1 OKLab & O(V+E) pin sync...\n");
+
+    waywal_shader_graph_t *g = waywal_shader_graph_create();
+    assert(g != NULL);
+
+    int32_t n_uv = waywal_shader_graph_add_node(g, WAYWAL_NODE_IN_UV, "UV", 0, 0);
+    int32_t n_pow = waywal_shader_graph_add_node(g, WAYWAL_NODE_MATH_POW, "Pow", 100, 0);
+    int32_t n_ok = waywal_shader_graph_add_node(g, WAYWAL_NODE_COLOR_SRGB_TO_OKLCH, "ToOK", 200, 0);
+    int32_t n_srgb =
+        waywal_shader_graph_add_node(g, WAYWAL_NODE_COLOR_OKLCH_TO_SRGB, "ToSRGB", 300, 0);
+    int32_t n_hue = waywal_shader_graph_add_node(g, WAYWAL_NODE_COLOR_HUE_SHIFT, "Hue", 400, 0);
+    int32_t n_sink = waywal_shader_graph_add_node(g, WAYWAL_NODE_OUT_IMAGE_PASS, "Sink", 500, 0);
+
+    waywal_shader_graph_find_node(g, (uint32_t)n_pow)->inputs[1].default_val[0] = 0.0f;
+
+    assert(waywal_shader_graph_connect(g, (uint32_t)n_uv, 0, (uint32_t)n_pow, 0) > 0);
+    assert(waywal_shader_graph_connect(g, (uint32_t)n_pow, 0, (uint32_t)n_ok, 0) > 0);
+    assert(waywal_shader_graph_connect(g, (uint32_t)n_ok, 0, (uint32_t)n_srgb, 0) > 0);
+    assert(waywal_shader_graph_connect(g, (uint32_t)n_srgb, 0, (uint32_t)n_hue, 0) > 0);
+    assert(waywal_shader_graph_connect(g, (uint32_t)n_hue, 0, (uint32_t)n_sink, 0) > 0);
+
+    waywal_graph_schedule_t sched;
+    assert(waywal_shader_graph_analyze(g, &sched));
+    size_t glsl_len = 0;
+    char *glsl = waywal_shader_graph_compile_glsl(g, &sched, &glsl_len);
+    assert(glsl != NULL && glsl_len > 0);
+
+    assert(strstr(glsl, "vec4 wwal_safe_pow(") != NULL);
+    assert(strstr(glsl, "_out0 = wwal_safe_pow(") != NULL);
+    assert(strstr(glsl, "0.0001") == NULL);
+    assert(strstr(glsl, "wwal_srgb_to_linear(") != NULL);
+    assert(strstr(glsl, "0.04045") != NULL);
+    assert(strstr(glsl, "12.92") != NULL);
+    assert(strstr(glsl, "2.4") != NULL);
+    assert(strstr(glsl, "wwal_linear_to_srgb(") != NULL);
+    assert(strstr(glsl, "0.0031308") != NULL);
+    assert(strstr(glsl, "abs(a) < 1e-6 && abs(b) < 1e-6") != NULL);
+    free(glsl);
+    waywal_shader_graph_destroy(g);
+
+    /* Sparse node IDs (> 1024) pin flag sync test */
+    const char *sparse_json =
+        "{\"schema_version\":1,\"nodes\":[{\"node_id\":5000,\"opcode\":0},{\"node_id\":6000,"
+        "\"opcode\":50}],\"edges\":[{\"edge_id\":1,\"src_node_id\":5000,\"src_pin_index\":0,"
+        "\"dst_node_id\":6000,\"dst_pin_index\":0}]}";
+    waywal_shader_graph_t *sg = waywal_shader_graph_create();
+    char err_buf[256] = {0};
+    assert(waywal_shader_graph_load_json(sparse_json, strlen(sparse_json), sg, err_buf));
+    assert((waywal_shader_graph_find_node(sg, 5000)->outputs[0].flags &
+            WAYWAL_PIN_FLAG_CONNECTED) != 0u);
+    assert((waywal_shader_graph_find_node(sg, 6000)->inputs[0].flags & WAYWAL_PIN_FLAG_CONNECTED) !=
+           0u);
+    assert(waywal_shader_graph_disconnect(sg, 1));
+    assert((waywal_shader_graph_find_node(sg, 5000)->outputs[0].flags &
+            WAYWAL_PIN_FLAG_CONNECTED) == 0u);
+    waywal_shader_graph_destroy(sg);
+
+    printf("    -> wwal_safe_pow, IEC 61966-2-1 OKLab & O(V+E) pin sync verified.\n");
+}
+
+static bool is_valid_utf8_cstr(const char *s)
+{
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p != 0u) {
+        unsigned char c = *p;
+        if (c <= 0x7Fu) {
+            p++;
+        } else if ((c & 0xE0u) == 0xC0u) {
+            if (c < 0xC2u || (p[1] & 0xC0u) != 0x80u)
+                return false;
+            p += 2;
+        } else if ((c & 0xF0u) == 0xE0u) {
+            if ((p[1] & 0xC0u) != 0x80u || (p[2] & 0xC0u) != 0x80u)
+                return false;
+            p += 3;
+        } else if ((c & 0xF8u) == 0xF0u) {
+            if (c > 0xF4u || (p[1] & 0xC0u) != 0x80u || (p[2] & 0xC0u) != 0x80u ||
+                (p[3] & 0xC0u) != 0x80u)
+                return false;
+            p += 4;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void test_utf8_truncation_safety(void)
+{
+    printf("[+] Testing AUD-441 UTF-8 boundary truncation in SWAR JSON & node titles...\n");
+
+    waywal_shader_graph_t *dst = waywal_shader_graph_create();
+    char err_buf[256] = {0};
+
+    /* 62 ASCII bytes + 3-byte Euro sign (65 total > 63 byte payload cap of graph_name[64]) */
+    char json_buf[512];
+    char pad62[63];
+    memset(pad62, 'A', 62u);
+    pad62[62] = '\0';
+
+    snprintf(json_buf, sizeof(json_buf), "{\"schema_version\":1,\"graph_name\":\"%s\xe2\x82\xac\"}",
+             pad62);
+    assert(waywal_shader_graph_load_json(json_buf, strlen(json_buf), dst, err_buf));
+    assert(strlen(dst->graph_name) == 62u);
+    assert(is_valid_utf8_cstr(dst->graph_name));
+
+    /* 61 ASCII bytes + 4-byte rocket emoji (65 total > 63 cap, SWAR lands inside emoji) */
+    pad62[61] = '\0';
+    snprintf(json_buf, sizeof(json_buf),
+             "{\"schema_version\":1,\"graph_name\":\"%s\xf0\x9f\x9a\x80\"}", pad62);
+    assert(waywal_shader_graph_load_json(json_buf, strlen(json_buf), dst, err_buf));
+    assert(strlen(dst->graph_name) == 61u);
+    assert(is_valid_utf8_cstr(dst->graph_name));
+
+    /* 60 ASCII bytes + 3-byte Euro sign = 63 bytes (fits completely) */
+    pad62[60] = '\0';
+    snprintf(json_buf, sizeof(json_buf), "{\"schema_version\":1,\"graph_name\":\"%s\xe2\x82\xac\"}",
+             pad62);
+    assert(waywal_shader_graph_load_json(json_buf, strlen(json_buf), dst, err_buf));
+    assert(strlen(dst->graph_name) == 63u);
+    assert(is_valid_utf8_cstr(dst->graph_name));
+
+    /* Escape truncation: 61 ASCII bytes + \uD83D\uDE80 + tail must stop at 61 */
+    memset(pad62, 'A', 61u);
+    pad62[61] = '\0';
+    snprintf(json_buf, sizeof(json_buf),
+             "{\"schema_version\":1,\"graph_name\":\"%s\\uD83D\\uDE80tail\"}", pad62);
+    assert(waywal_shader_graph_load_json(json_buf, strlen(json_buf), dst, err_buf));
+    assert(strlen(dst->graph_name) == 61u);
+    assert(is_valid_utf8_cstr(dst->graph_name));
+
+    /* Direct add_node title truncation */
+    char long_title[80];
+    memset(long_title, 'B', 62u);
+    memcpy(long_title + 62u, "\xf0\x9f\x9a\x80", 5u);
+    int32_t nid = waywal_shader_graph_add_node(dst, WAYWAL_NODE_IN_UV, long_title, 0.0f, 0.0f);
+    assert(nid > 0);
+    const waywal_graph_node_t *n = waywal_shader_graph_find_node_const(dst, (uint32_t)nid);
+    assert(n != NULL && strlen(n->title) == 62u && is_valid_utf8_cstr(n->title));
+
+    waywal_shader_graph_destroy(dst);
+    printf("    -> UTF-8 boundary alignment verified across SWAR, escapes & node titles.\n");
+}
+
+static void test_shader_parser_nonfinite_guards(void)
+{
+    printf("[+] Testing AUD-442 shader_parser non-finite float guards & bounded slices...\n");
+
+    const char *shader_src = "// @scale: NaN\n"
+                             "// @uniform float u_nan = NaN; [0.0, 1.0]\n"
+                             "// @uniform float u_inf = inf; [-inf, inf, nan]\n"
+                             "// @uniform float u_ovf = 1e50; [0.0, 1e50]\n"
+                             "// @uniform bool  u_bool = NaN;\n"
+                             "// @uniform vec3  u_vec = vec3(1.0, NaN, 0.5);\n"
+                             "// [UNIFORM]\n"
+                             "// type: float\n"
+                             "// name: u_blk\n"
+                             "// default: inf\n"
+                             "// min: nan\n"
+                             "// max: 1e60\n"
+                             "// step: nan\n"
+                             "void mainImage(out vec4 fragColor, in vec2 fragCoord) {}\n";
+
+    size_t slen = strlen(shader_src);
+    char *unterminated = (char *)malloc(slen);
+    assert(unterminated != NULL);
+    memcpy(unterminated, shader_src, slen);
+
+    waywal_shader_meta_t meta;
+    assert(waywal_shader_parse_meta(unterminated, slen, &meta));
+    free(unterminated);
+
+    assert(isfinite(meta.global_scale) && meta.global_scale == 1.0f);
+    assert(meta.uniform_count == 6u);
+    for (uint32_t i = 0; i < meta.uniform_count; ++i) {
+        const waywal_shader_uniform_def_t *u = &meta.uniforms[i];
+        assert(isfinite(u->step) && u->step >= 0.0f);
+        for (uint32_t c = 0; c < 4u; ++c) {
+            assert(isfinite(u->default_val[c]));
+            assert(isfinite(u->min_val[c]));
+            assert(isfinite(u->max_val[c]));
+            assert(u->min_val[c] <= u->max_val[c]);
+        }
+    }
+    const waywal_shader_uniform_def_t *ub = waywal_shader_find_uniform(&meta, "u_bool");
+    assert(ub != NULL && ub->default_val[0] == 0.0f);
+
+    printf("    -> Non-finite shader uniform/scale values safely sanitized.\n");
+}
+
+static float eval_cubic_x(const bezier_curve_t *c, float t)
+{
+    double u = 1.0 - (double)t;
+    double tt = (double)t;
+    return (float)(3.0 * u * u * tt * (double)c->p1x + 3.0 * u * tt * tt * (double)c->p2x +
+                   tt * tt * tt);
+}
+
+static void test_bezier_safeguarded_solver(void)
+{
+    printf("[+] Testing AUD-233/234/437 safeguarded double-precision cubic Bezier...\n");
+
+    /* AUD-233: BEZIER_LINEAR (0,0,1,1) has x(t) = 3t^2 - 2t^3 != t, NOT diagonal shortcut */
+    float t_lin25 = waywal_cubic_bezier_solve_t(&BEZIER_LINEAR, 0.25f);
+    float x_lin25 = eval_cubic_x(&BEZIER_LINEAR, t_lin25);
+    assert(fabsf(x_lin25 - 0.25f) < 1e-6f);
+    assert(fabsf(t_lin25 - 0.25f) > 0.05f);
+    assert(fabsf(bezier_eval(&BEZIER_LINEAR, 0.25f) - 0.25f) < 1e-6f);
+
+    bezier_curve_t c_zero = bezier_create(0.0f, 0.0f, 0.0f, 0.0f);
+    float t_z = waywal_cubic_bezier_solve_t(&c_zero, 0.125f);
+    assert(fabsf(t_z - 0.5f) < 1e-6f);
+    assert(fabsf(bezier_eval(&c_zero, 0.125f) - 0.125f) < 1e-6f);
+
+    /* AUD-234: Flat derivative near origin (p1x=0, p2x=0) at tiny progress */
+    bezier_curve_t c_flat = bezier_create(0.0f, 0.5f, 0.0f, 0.5f);
+    const float tiny_ps[] = {5e-6f, 1e-5f, 1e-4f, 0.001f, 0.25f, 0.5f, 0.999f};
+    for (size_t i = 0; i < sizeof(tiny_ps) / sizeof(tiny_ps[0]); ++i) {
+        float p = tiny_ps[i];
+        float t = waywal_cubic_bezier_solve_t(&c_flat, p);
+        float x = eval_cubic_x(&c_flat, t);
+        assert(t >= 0.0f && t <= 1.0f);
+        assert(fabsf(x - p) <= 1e-6f);
+    }
+
+    /* Steep S-curve monotonicity and sub-1e-6 residual */
+    bezier_curve_t c_steep = bezier_create(0.95f, 0.0f, 0.05f, 1.0f);
+    float prev_t = 0.0f;
+    for (int i = 1; i < 100; ++i) {
+        float p = (float)i * 0.01f;
+        float t = waywal_cubic_bezier_solve_t(&c_steep, p);
+        float x = eval_cubic_x(&c_steep, t);
+        assert(t >= prev_t && t <= 1.0f);
+        assert(fabsf(x - p) <= 1e-6f);
+        prev_t = t;
+    }
+
+    /* AUD-437: NaN / Inf guards before clamping */
+    bezier_curve_t c_nan = bezier_create(NAN, NAN, INFINITY, -INFINITY);
+    assert(isfinite(c_nan.p1x) && isfinite(c_nan.p1y) && isfinite(c_nan.p2x) &&
+           isfinite(c_nan.p2y));
+    assert(waywal_cubic_bezier_solve_t(&BEZIER_DEFAULT, NAN) == 0.0f);
+    assert(waywal_cubic_bezier_solve_t(&BEZIER_DEFAULT, INFINITY) == 0.0f);
+    assert(waywal_cubic_bezier_solve_t(&BEZIER_DEFAULT, -INFINITY) == 0.0f);
+    assert(bezier_eval(&BEZIER_DEFAULT, NAN) == 0.0f);
+    bezier_curve_t raw_bad = {.p1x = NAN, .p1y = NAN, .p2x = 0.5f, .p2y = INFINITY};
+    assert(waywal_cubic_bezier_solve_t(&raw_bad, 0.5f) == 0.0f);
+    assert(bezier_eval(&raw_bad, 0.5f) == 0.0f);
+
+    printf("    -> Safeguarded Newton-Halley-Bisection & NaN guards verified.\n");
+}
+
+static void test_ssa_gvn_deduplication(void)
+{
+    printf("[+] Testing PERF-039 hash-consed SSA GVN deduplication...\n");
+
+    waywal_shader_graph_t *g = waywal_shader_graph_create();
+    int32_t n_uv = waywal_shader_graph_add_node(g, WAYWAL_NODE_IN_UV, "UV", 0, 0);
+    int32_t n_sin1 = waywal_shader_graph_add_node(g, WAYWAL_NODE_MATH_SIN, "Sin1", 100, 0);
+    int32_t n_sin2 = waywal_shader_graph_add_node(g, WAYWAL_NODE_MATH_SIN, "Sin2", 100, 80);
+    int32_t n_add = waywal_shader_graph_add_node(g, WAYWAL_NODE_MATH_ADD, "Add", 200, 0);
+    int32_t n_c1 = waywal_shader_graph_add_node(g, WAYWAL_NODE_IN_CONSTANT, "C1", 200, 120);
+    int32_t n_c2 = waywal_shader_graph_add_node(g, WAYWAL_NODE_IN_CONSTANT, "C2", 200, 180);
+    int32_t n_add2 = waywal_shader_graph_add_node(g, WAYWAL_NODE_MATH_ADD, "Add2", 300, 0);
+    int32_t n_add3 = waywal_shader_graph_add_node(g, WAYWAL_NODE_MATH_ADD, "Add3", 380, 0);
+    int32_t n_sink = waywal_shader_graph_add_node(g, WAYWAL_NODE_OUT_IMAGE_PASS, "Sink", 460, 0);
+
+    assert(waywal_shader_graph_connect(g, (uint32_t)n_uv, 0, (uint32_t)n_sin1, 0) > 0);
+    assert(waywal_shader_graph_connect(g, (uint32_t)n_uv, 0, (uint32_t)n_sin2, 0) > 0);
+    assert(waywal_shader_graph_connect(g, (uint32_t)n_sin1, 0, (uint32_t)n_add, 0) > 0);
+    assert(waywal_shader_graph_connect(g, (uint32_t)n_sin2, 0, (uint32_t)n_add, 1) > 0);
+    assert(waywal_shader_graph_connect(g, (uint32_t)n_add, 0, (uint32_t)n_add2, 0) > 0);
+    assert(waywal_shader_graph_connect(g, (uint32_t)n_c1, 0, (uint32_t)n_add2, 1) > 0);
+    assert(waywal_shader_graph_connect(g, (uint32_t)n_add2, 0, (uint32_t)n_add3, 0) > 0);
+    assert(waywal_shader_graph_connect(g, (uint32_t)n_c2, 0, (uint32_t)n_add3, 1) > 0);
+    assert(waywal_shader_graph_connect(g, (uint32_t)n_add3, 0, (uint32_t)n_sink, 0) > 0);
+
+    waywal_graph_schedule_t sched;
+    assert(waywal_shader_graph_analyze(g, &sched));
+    size_t glsl_len = 0;
+    char *glsl = waywal_shader_graph_compile_glsl(g, &sched, &glsl_len);
+    assert(glsl != NULL && glsl_len > 0);
+
+    const char *first_sin = strstr(glsl, " = sin(");
+    assert(first_sin != NULL);
+    assert(strstr(first_sin + 7, " = sin(") == NULL);
+    assert(strstr(glsl, "u_Node5_Const") != NULL);
+    assert(strstr(glsl, "u_Node6_Const") != NULL);
+
+    free(glsl);
+    waywal_shader_graph_destroy(g);
+    printf("    -> Duplicate pure SSA Sin(UV) deduplicated while constants stayed distinct.\n");
+}
+
+typedef struct {
+    const waywal_shader_graph_t *graph;
+    const waywal_graph_schedule_t *schedule;
+    pthread_barrier_t *barrier;
+    uint32_t iters;
+    double *latencies_ms;
+} bench_16t_worker_t;
+
+typedef struct {
+    pthread_barrier_t *barrier;
+    _Atomic bool stop;
+} malloc_churn_ctx_t;
+
+static uint64_t get_monotonic_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static int cmp_double_asc(const void *a, const void *b)
+{
+    double da = *(const double *)a;
+    double db = *(const double *)b;
+    return (da > db) - (da < db);
+}
+
+static void *malloc_churn_thread(void *arg)
+{
+    malloc_churn_ctx_t *ctx = (malloc_churn_ctx_t *)arg;
+    pthread_barrier_wait(ctx->barrier);
+    void *ring[32] = {0};
+    uint32_t idx = 0;
+    uint32_t seed = 0x9e3779b9u;
+    uint32_t ops = 0;
+    while (!__atomic_load_n(&ctx->stop, __ATOMIC_ACQUIRE)) {
+        seed = seed * 1664525u + 1013904223u;
+        size_t sz = 16u + (seed % 32768u);
+        free(ring[idx]);
+        ring[idx] = malloc(sz);
+        if (ring[idx]) {
+            ((volatile char *)ring[idx])[0] = 1;
+        }
+        idx = (idx + 1u) & 31u;
+        if ((++ops & 7u) == 0u) {
+            struct timespec pause = {0, 25000L}; /* 25 us */
+            nanosleep(&pause, NULL);
+        }
+    }
+    for (size_t i = 0; i < 32u; ++i) {
+        free(ring[i]);
+    }
+    return NULL;
+}
+
+static void *bench_16t_compile_worker(void *arg)
+{
+    bench_16t_worker_t *w = (bench_16t_worker_t *)arg;
+    pthread_barrier_wait(w->barrier);
+    /* Warm up TLS slab once before timing. */
+    size_t warm_len = 0;
+    char *warm = waywal_shader_graph_compile_glsl(w->graph, w->schedule, &warm_len);
+    assert(warm != NULL && warm_len > 0);
+    free(warm);
+
+    for (uint32_t i = 0; i < w->iters; ++i) {
+        uint64_t t0 = get_monotonic_ns();
+        size_t glsl_len = 0;
+        char *glsl = waywal_shader_graph_compile_glsl(w->graph, w->schedule, &glsl_len);
+        uint64_t t1 = get_monotonic_ns();
+        assert(glsl != NULL && glsl_len > 0);
+        free(glsl);
+        w->latencies_ms[i] = (double)(t1 - t0) / 1000000.0;
+        /* 250 us frame pacing across 16 workers avoids pure OS CFS timeslice starvation on
+         * <=12-core hosts while sustaining ~64k contended compiles/s alongside malloc churn. */
+        struct timespec pause = {0, 250000L};
+        nanosleep(&pause, NULL);
+    }
+    return NULL;
+}
+
+static void test_multithreaded_16t_compile_p99_slo(void)
+{
+    printf(
+        "[+] Benchmarking PERF-039 (VD-08) 16-thread 256-node compile wall p99 (< 0.50 ms)...\n");
+
+    waywal_shader_graph_t *graph = waywal_shader_graph_create();
+    assert(graph != NULL);
+
+    int32_t prev_id = waywal_shader_graph_add_node(graph, WAYWAL_NODE_IN_UV, "UVRoot", 0.0f, 0.0f);
+    for (int i = 1; i < 255; ++i) {
+        uint32_t op = (i % 2 == 0) ? WAYWAL_NODE_MATH_ADD : WAYWAL_NODE_MATH_MUL;
+        char name[32];
+        snprintf(name, sizeof(name), "Op%d", i);
+        int32_t curr_id = waywal_shader_graph_add_node(graph, op, name, (float)i * 10.0f, 0.0f);
+        waywal_shader_graph_connect(graph, (uint32_t)prev_id, 0, (uint32_t)curr_id, 0);
+        prev_id = curr_id;
+    }
+    int32_t sink_id =
+        waywal_shader_graph_add_node(graph, WAYWAL_NODE_OUT_IMAGE_PASS, "Sink", 3000.0f, 0.0f);
+    waywal_shader_graph_connect(graph, (uint32_t)prev_id, 0, (uint32_t)sink_id, 0);
+
+    waywal_graph_schedule_t schedule;
+    assert(waywal_shader_graph_analyze(graph, &schedule));
+
+    enum { kThreads = 16, kChurnThreads = 4, kIters = 100 };
+    double *all_lat = (double *)calloc((size_t)(kThreads * kIters), sizeof(double));
+    assert(all_lat != NULL);
+
+    pthread_barrier_t barrier;
+    pthread_barrier_init(&barrier, NULL, kThreads + kChurnThreads);
+
+    malloc_churn_ctx_t churn = {.barrier = &barrier, .stop = false};
+    pthread_t churn_tids[kChurnThreads];
+    for (int c = 0; c < kChurnThreads; ++c) {
+        assert(pthread_create(&churn_tids[c], NULL, malloc_churn_thread, &churn) == 0);
+    }
+
+    bench_16t_worker_t workers[kThreads];
+    pthread_t tids[kThreads];
+    for (int t = 0; t < kThreads; ++t) {
+        workers[t] = (bench_16t_worker_t){
+            .graph = graph,
+            .schedule = &schedule,
+            .barrier = &barrier,
+            .iters = kIters,
+            .latencies_ms = all_lat + (size_t)t * kIters,
+        };
+        assert(pthread_create(&tids[t], NULL, bench_16t_compile_worker, &workers[t]) == 0);
+    }
+
+    for (int t = 0; t < kThreads; ++t) {
+        pthread_join(tids[t], NULL);
+    }
+    __atomic_store_n(&churn.stop, true, __ATOMIC_RELEASE);
+    for (int c = 0; c < kChurnThreads; ++c) {
+        pthread_join(churn_tids[c], NULL);
+    }
+    pthread_barrier_destroy(&barrier);
+
+    const size_t total = (size_t)kThreads * kIters;
+    qsort(all_lat, total, sizeof(double), cmp_double_asc);
+    double p50_ms = all_lat[total / 2u];
+    double p99_ms = all_lat[(total * 99u) / 100u];
+    double max_ms = all_lat[total - 1u];
+
+    printf("    -> 16T contended 256-node compile wall latency: p50=%.3f ms, p99=%.3f ms, "
+           "max=%.3f ms (SLO: < 0.500 ms)\n",
+           p50_ms, p99_ms, max_ms);
+
+    const char *strict_env = getenv("WWAL_STRICT_PERF_ASSERTS");
+    bool strict_perf = (strict_env != NULL && strcmp(strict_env, "1") == 0);
+#if defined(WWAL_PERF_GATES)
+    strict_perf = true;
+#endif
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer) ||                           \
+    defined(__SANITIZE_THREAD__) || __has_feature(thread_sanitizer)
+    strict_perf = false;
+#endif
+    if (strict_perf) {
+        assert(p99_ms < 0.50 && "16T shader_graph compile wall p99 exceeded 0.50 ms SLO (VD-08)");
+    }
+
+    free(all_lat);
+    waywal_shader_graph_destroy(graph);
+}
+
 int main(void)
 {
     printf("==========================================================\n");
@@ -715,6 +1291,14 @@ int main(void)
     test_large_graph_compilation_benchmark();
     test_readonly_const_analyze_and_dead_helper_pruning();
     test_codegen_smoothstep_swizzle_coercion_mute_and_pins();
+    test_connect_cycle_preserves_prior_edge();
+    test_json_deep_alternating_skipper();
+    test_safe_pow_oklab_iec_and_pin_sync();
+    test_utf8_truncation_safety();
+    test_shader_parser_nonfinite_guards();
+    test_bezier_safeguarded_solver();
+    test_ssa_gvn_deduplication();
+    test_multithreaded_16t_compile_p99_slo();
 
     printf("==========================================================\n");
     printf("  >>> ALL SHADER GRAPH COMPILER TESTS PASSED (100%%) <<<\n");

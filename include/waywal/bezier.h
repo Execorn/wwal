@@ -35,15 +35,14 @@ extern const bezier_curve_t BEZIER_EASE_IN;     /* (0.42, 0.0, 1.0, 1.0) */
 extern const bezier_curve_t BEZIER_EASE_OUT;    /* (0.0, 0.0, 0.58, 1.0) */
 extern const bezier_curve_t BEZIER_EASE_IN_OUT; /* (0.42, 0.0, 0.58, 1.0) */
 
-/* Creates a cubic Bézier curve with validated control points in range [0, 1] */
+/* Clamps x control points to [0, 1] and sanitizes non-finite inputs to 0.0f. */
 bezier_curve_t bezier_create(float p1x, float p1y, float p2x, float p2y);
 
-/* Solves x(t) = progress for t via Newton-Raphson iteration (with bisection fallback) */
+/* Solves x(t) = progress for t via bracketed double-precision Newton-Halley-Bisection. */
 float waywal_cubic_bezier_solve_t(const bezier_curve_t *curve, float progress);
 float bezier_solve_t(const bezier_curve_t *curve, float progress);
 
-/* Solves x(t) = progress for t via Newton-Raphson iteration (with bisection fallback)
-   and returns y(t). Evaluates in < 5ns with 4-iteration convergence. */
+/* Solves x(t) = progress for t and returns y(t), sanitizing non-finite inputs to 0.0f. */
 float bezier_eval(const bezier_curve_t *curve, float progress);
 
 #ifdef __cplusplus

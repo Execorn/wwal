@@ -35,6 +35,59 @@ static inline int32_t safe_f32_to_i32(float v)
     return (int32_t)d;
 }
 
+static size_t utf8_clamp_boundary(const char *s, size_t len)
+{
+    if (!s || len == 0u) {
+        return 0u;
+    }
+    unsigned char last = (unsigned char)s[len - 1u];
+    if (last < 0x80u) {
+        return len;
+    }
+    if ((last & 0xC0u) == 0xC0u) {
+        return len - 1u;
+    }
+    size_t back = 1u;
+    while (back < len && back < 4u && ((unsigned char)s[len - 1u - back] & 0xC0u) == 0x80u) {
+        back++;
+    }
+    if (back >= len || back >= 4u) {
+        return len;
+    }
+    size_t start = len - 1u - back;
+    unsigned char lead = (unsigned char)s[start];
+    size_t expected = 0u;
+    if ((lead & 0xE0u) == 0xC0u) {
+        expected = 2u;
+    } else if ((lead & 0xF0u) == 0xE0u) {
+        expected = 3u;
+    } else if ((lead & 0xF8u) == 0xF0u) {
+        expected = 4u;
+    } else {
+        return len;
+    }
+    return (len - start < expected) ? start : len;
+}
+
+static void safe_utf8_copy(char *dst, size_t cap, const char *src)
+{
+    if (!dst || cap == 0u) {
+        return;
+    }
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    size_t slen = strlen(src);
+    if (slen < cap) {
+        memcpy(dst, src, slen + 1u);
+        return;
+    }
+    size_t copy_len = utf8_clamp_boundary(src, cap - 1u);
+    memcpy(dst, src, copy_len);
+    dst[copy_len] = '\0';
+}
+
 /* ========================================================================= */
 /* Dynamic String Buffer Helper for Codegen & Serialization                  */
 /* ========================================================================= */
@@ -252,10 +305,10 @@ static void set_pin(waywal_graph_pin_t *pin, const char *name, const char *label
 {
     memset(pin, 0, sizeof(*pin));
     if (name) {
-        strncpy(pin->name, name, sizeof(pin->name) - 1);
+        safe_utf8_copy(pin->name, sizeof(pin->name), name);
     }
     if (label) {
-        strncpy(pin->label, label, sizeof(pin->label) - 1);
+        safe_utf8_copy(pin->label, sizeof(pin->label), label);
     }
     pin->pin_type = pin_type;
     pin->is_output = is_output;
@@ -700,11 +753,11 @@ void waywal_shader_graph_init(waywal_shader_graph_t *graph, const char *name)
     graph->schema_version = WAYWAL_GRAPH_SCHEMA_VERSION;
     graph->flags = WAYWAL_GRAPH_FLAG_AUTO_COMPILE;
     if (name && name[0] != '\0') {
-        strncpy(graph->graph_name, name, sizeof(graph->graph_name) - 1);
+        safe_utf8_copy(graph->graph_name, sizeof(graph->graph_name), name);
     } else {
-        strncpy(graph->graph_name, "Untitled Shader Graph", sizeof(graph->graph_name) - 1);
+        safe_utf8_copy(graph->graph_name, sizeof(graph->graph_name), "Untitled Shader Graph");
     }
-    strncpy(graph->author, "wwal", sizeof(graph->author) - 1);
+    safe_utf8_copy(graph->author, sizeof(graph->author), "wwal");
 }
 
 /* ========================================================================= */
@@ -736,6 +789,33 @@ const waywal_graph_node_t *waywal_shader_graph_find_node_const(const waywal_shad
     return NULL;
 }
 
+#define GRAPH_DENSE_ID_CAP 1024
+
+typedef struct {
+    uint32_t id;
+    int16_t idx;
+} sparse_id_slot_t;
+
+static inline int32_t lookup_node_idx_fast(const sparse_id_slot_t sparse_map[512], bool has_sparse,
+                                           const int16_t dense_id_to_idx[GRAPH_DENSE_ID_CAP],
+                                           uint32_t node_id)
+{
+    if (node_id == 0u) {
+        return -1;
+    }
+    if (node_id < GRAPH_DENSE_ID_CAP) {
+        return (int32_t)dense_id_to_idx[node_id];
+    }
+    if (!has_sparse) {
+        return -1;
+    }
+    uint32_t slot = (node_id * 2654435761u) & 511u;
+    while (sparse_map[slot].id != 0u && sparse_map[slot].id != node_id) {
+        slot = (slot + 1u) & 511u;
+    }
+    return (sparse_map[slot].id == node_id) ? (int32_t)sparse_map[slot].idx : -1;
+}
+
 static void sync_connected_pin_flags(waywal_shader_graph_t *graph)
 {
     if (!graph)
@@ -745,8 +825,29 @@ static void sync_connected_pin_flags(waywal_shader_graph_t *graph)
     uint32_t ecnt =
         (graph->edge_count <= WAYWAL_GRAPH_MAX_EDGES) ? graph->edge_count : WAYWAL_GRAPH_MAX_EDGES;
 
+    int16_t dense_id_to_idx[GRAPH_DENSE_ID_CAP];
+    memset(dense_id_to_idx, 0xFF, sizeof(dense_id_to_idx));
+
+    bool has_sparse = false;
+    sparse_id_slot_t sparse_map[512];
+
     for (uint32_t i = 0; i < ncnt; ++i) {
         waywal_graph_node_t *n = &graph->nodes[i];
+        uint32_t nid = n->node_id;
+        if (nid > 0u && nid < GRAPH_DENSE_ID_CAP) {
+            dense_id_to_idx[nid] = (int16_t)i;
+        } else if (nid >= GRAPH_DENSE_ID_CAP) {
+            if (!has_sparse) {
+                memset(sparse_map, 0, sizeof(sparse_map));
+                has_sparse = true;
+            }
+            uint32_t slot = (nid * 2654435761u) & 511u;
+            while (sparse_map[slot].id != 0u && sparse_map[slot].id != nid) {
+                slot = (slot + 1u) & 511u;
+            }
+            sparse_map[slot].id = nid;
+            sparse_map[slot].idx = (int16_t)i;
+        }
         for (uint32_t p = 0; p < n->input_pin_count && p < WAYWAL_GRAPH_MAX_PINS_PER_NODE; ++p)
             n->inputs[p].flags &= ~WAYWAL_PIN_FLAG_CONNECTED;
         for (uint32_t p = 0; p < n->output_pin_count && p < WAYWAL_GRAPH_MAX_PINS_PER_NODE; ++p)
@@ -755,15 +856,24 @@ static void sync_connected_pin_flags(waywal_shader_graph_t *graph)
 
     for (uint32_t i = 0; i < ecnt; ++i) {
         const waywal_graph_edge_t *e = &graph->edges[i];
-        waywal_graph_node_t *sn = waywal_shader_graph_find_node(graph, e->src_node_id);
-        waywal_graph_node_t *dn = waywal_shader_graph_find_node(graph, e->dst_node_id);
-        if (sn && e->src_pin_index < sn->output_pin_count &&
-            e->src_pin_index < WAYWAL_GRAPH_MAX_PINS_PER_NODE) {
-            sn->outputs[e->src_pin_index].flags |= WAYWAL_PIN_FLAG_CONNECTED;
+        int32_t s_idx =
+            lookup_node_idx_fast(sparse_map, has_sparse, dense_id_to_idx, e->src_node_id);
+        int32_t d_idx =
+            lookup_node_idx_fast(sparse_map, has_sparse, dense_id_to_idx, e->dst_node_id);
+
+        if (s_idx >= 0 && (uint32_t)s_idx < ncnt) {
+            waywal_graph_node_t *sn = &graph->nodes[s_idx];
+            if (e->src_pin_index < sn->output_pin_count &&
+                e->src_pin_index < WAYWAL_GRAPH_MAX_PINS_PER_NODE) {
+                sn->outputs[e->src_pin_index].flags |= WAYWAL_PIN_FLAG_CONNECTED;
+            }
         }
-        if (dn && e->dst_pin_index < dn->input_pin_count &&
-            e->dst_pin_index < WAYWAL_GRAPH_MAX_PINS_PER_NODE) {
-            dn->inputs[e->dst_pin_index].flags |= WAYWAL_PIN_FLAG_CONNECTED;
+        if (d_idx >= 0 && (uint32_t)d_idx < ncnt) {
+            waywal_graph_node_t *dn = &graph->nodes[d_idx];
+            if (e->dst_pin_index < dn->input_pin_count &&
+                e->dst_pin_index < WAYWAL_GRAPH_MAX_PINS_PER_NODE) {
+                dn->inputs[e->dst_pin_index].flags |= WAYWAL_PIN_FLAG_CONNECTED;
+            }
         }
     }
 }
@@ -791,7 +901,7 @@ int32_t waywal_shader_graph_add_node(waywal_shader_graph_t *graph, uint32_t opco
     n->node_id = new_id;
     n->opcode = opcode;
     if (title && title[0] != '\0') {
-        strncpy(n->title, title, sizeof(n->title) - 1);
+        safe_utf8_copy(n->title, sizeof(n->title), title);
     } else {
         snprintf(n->title, sizeof(n->title), "Node %u", new_id);
     }
@@ -906,7 +1016,7 @@ int32_t waywal_shader_graph_connect(waywal_shader_graph_t *graph, uint32_t src_n
                                     uint32_t src_pin_idx, uint32_t dst_node_id,
                                     uint32_t dst_pin_idx)
 {
-    if (!graph || graph->edge_count >= WAYWAL_GRAPH_MAX_EDGES) {
+    if (!graph) {
         return -1;
     }
 
@@ -926,22 +1036,38 @@ int32_t waywal_shader_graph_connect(waywal_shader_graph_t *graph, uint32_t src_n
         return -1;
     }
 
-    /* Single-input constraint: remove existing incoming wire to (dst_node_id, dst_pin_idx) */
-    waywal_shader_graph_disconnect_pins(graph, dst_node_id, dst_pin_idx);
+    /* Validate cycle safety BEFORE mutating or disconnecting any existing incoming wire. */
+    if (waywal_shader_graph_would_create_cycle(graph, src_node_id, dst_node_id)) {
+        return -1;
+    }
 
-    /* Allocate new edge ID */
+    bool has_existing_dst = false;
     uint32_t max_eid = 0;
     for (uint32_t i = 0; i < graph->edge_count; ++i) {
         if (graph->edges[i].edge_id > max_eid) {
             max_eid = graph->edges[i].edge_id;
         }
+        if (graph->edges[i].dst_node_id == dst_node_id &&
+            graph->edges[i].dst_pin_index == dst_pin_idx) {
+            has_existing_dst = true;
+        }
+    }
+    if (!has_existing_dst && graph->edge_count >= WAYWAL_GRAPH_MAX_EDGES) {
+        return -1;
     }
     if (max_eid >= (uint32_t)INT32_MAX) {
         return -1;
     }
-    uint32_t new_eid = max_eid + 1;
+    uint32_t new_eid = max_eid + 1u;
 
-    /* Tentatively add edge */
+    /* Single-input constraint: remove existing incoming wire to (dst_node_id, dst_pin_idx) */
+    if (has_existing_dst) {
+        waywal_shader_graph_disconnect_pins(graph, dst_node_id, dst_pin_idx);
+    }
+    if (graph->edge_count >= WAYWAL_GRAPH_MAX_EDGES) {
+        return -1;
+    }
+
     uint32_t edge_idx = graph->edge_count;
     waywal_graph_edge_t *e = &graph->edges[edge_idx];
     memset(e, 0, sizeof(*e));
@@ -954,14 +1080,6 @@ int32_t waywal_shader_graph_connect(waywal_shader_graph_t *graph, uint32_t src_n
     e->flags = 0;
     e->reserved = 0;
     graph->edge_count++;
-
-    /* Check if candidate edge creates an illegal directed cycle */
-    uint32_t cycle_id = 0;
-    if (waywal_shader_graph_has_cycle(graph, &cycle_id)) {
-        /* Roll back edge */
-        graph->edge_count--;
-        return -1;
-    }
 
     dst_node->inputs[dst_pin_idx].flags |= WAYWAL_PIN_FLAG_CONNECTED;
     src_node->outputs[src_pin_idx].flags |= WAYWAL_PIN_FLAG_CONNECTED;
@@ -1019,8 +1137,6 @@ bool waywal_shader_graph_disconnect_pins(waywal_shader_graph_t *graph, uint32_t 
 /* ========================================================================= */
 /* Compact O(|V| + |E|) Adjacency Index & Tarjan SCC Cycle Detector          */
 /* ========================================================================= */
-
-#define GRAPH_DENSE_ID_CAP 1024
 
 /* Fixed 10 KB stack adjacency table avoids 492 KB waywal_shader_graph_t copies
  * and turns repeated O(|V| * |E|) node/wire scans into O(1) array lookups. */
@@ -1092,77 +1208,10 @@ typedef struct {
     bool on_stack;
 } tarjan_node_state_t;
 
-static bool tarjan_dfs(const waywal_shader_graph_t *graph, const graph_adj_t *adj, uint32_t u_idx,
-                       int32_t *dfs_clock, tarjan_node_state_t *states, uint32_t *stack,
-                       uint32_t *stack_top, uint32_t *out_cycle_node_id)
-{
-    states[u_idx].index = *dfs_clock;
-    states[u_idx].lowlink = *dfs_clock;
-    (*dfs_clock)++;
-
-    stack[*stack_top] = u_idx;
-    (*stack_top)++;
-    states[u_idx].on_stack = true;
-
-    uint32_t u_id = graph->nodes[u_idx].node_id;
-
-    for (int16_t e = adj->head_out[u_idx]; e >= 0; e = adj->next_out[e]) {
-        int16_t v_idx_s = adj->edge_dst_idx[e];
-        if (v_idx_s < 0)
-            continue;
-        uint32_t v_idx = (uint32_t)v_idx_s;
-
-        /* Self-loops are never valid temporal latches even on IN_PASS_BUFFER. */
-        if (v_idx == u_idx) {
-            if (out_cycle_node_id) {
-                *out_cycle_node_id = u_id;
-            }
-            return true;
-        }
-
-        /* Temporal feedback latches sample frame (t - 1) and break combinational cycles. */
-        if (graph->nodes[u_idx].opcode == WAYWAL_NODE_IN_PASS_BUFFER ||
-            (graph->edges[e].flags & WAYWAL_EDGE_FLAG_FEEDBACK_LATCH)) {
-            continue;
-        }
-
-        if (states[v_idx].index == -1) {
-            if (tarjan_dfs(graph, adj, v_idx, dfs_clock, states, stack, stack_top,
-                           out_cycle_node_id)) {
-                return true;
-            }
-            if (states[v_idx].lowlink < states[u_idx].lowlink) {
-                states[u_idx].lowlink = states[v_idx].lowlink;
-            }
-        } else if (states[v_idx].on_stack) {
-            if (states[v_idx].index < states[u_idx].lowlink) {
-                states[u_idx].lowlink = states[v_idx].index;
-            }
-        }
-    }
-
-    if (states[u_idx].lowlink == states[u_idx].index) {
-        uint32_t scc_size = 0;
-        uint32_t popped_idx;
-        do {
-            if (*stack_top == 0)
-                break;
-            (*stack_top)--;
-            popped_idx = stack[*stack_top];
-            states[popped_idx].on_stack = false;
-            scc_size++;
-        } while (popped_idx != u_idx);
-
-        if (scc_size > 1) {
-            if (out_cycle_node_id) {
-                *out_cycle_node_id = u_id;
-            }
-            return true;
-        }
-    }
-
-    return false;
-}
+typedef struct {
+    uint16_t node_idx;
+    int16_t next_edge;
+} tarjan_frame_t;
 
 static bool has_cycle_with_adj(const waywal_shader_graph_t *graph, const graph_adj_t *adj,
                                uint32_t *out_cycle_node_id)
@@ -1170,8 +1219,9 @@ static bool has_cycle_with_adj(const waywal_shader_graph_t *graph, const graph_a
     uint32_t ncnt =
         (graph->node_count <= WAYWAL_GRAPH_MAX_NODES) ? graph->node_count : WAYWAL_GRAPH_MAX_NODES;
     tarjan_node_state_t states[WAYWAL_GRAPH_MAX_NODES];
-    uint32_t stack[WAYWAL_GRAPH_MAX_NODES];
-    uint32_t stack_top = 0;
+    uint16_t scc_stack[WAYWAL_GRAPH_MAX_NODES];
+    tarjan_frame_t dfs_stack[WAYWAL_GRAPH_MAX_NODES];
+    uint32_t scc_top = 0;
     int32_t dfs_clock = 0;
 
     for (uint32_t i = 0; i < ncnt; ++i) {
@@ -1180,11 +1230,86 @@ static bool has_cycle_with_adj(const waywal_shader_graph_t *graph, const graph_a
         states[i].on_stack = false;
     }
 
-    for (uint32_t i = 0; i < ncnt; ++i) {
-        if (states[i].index == -1) {
-            if (tarjan_dfs(graph, adj, i, &dfs_clock, states, stack, &stack_top,
-                           out_cycle_node_id)) {
-                return true;
+    for (uint32_t root = 0; root < ncnt; ++root) {
+        if (states[root].index != -1) {
+            continue;
+        }
+        uint32_t dfs_top = 0;
+        states[root].index = dfs_clock;
+        states[root].lowlink = dfs_clock;
+        dfs_clock++;
+        scc_stack[scc_top++] = (uint16_t)root;
+        states[root].on_stack = true;
+        dfs_stack[dfs_top++] =
+            (tarjan_frame_t){.node_idx = (uint16_t)root, .next_edge = adj->head_out[root]};
+
+        while (dfs_top > 0u) {
+            tarjan_frame_t *frame = &dfs_stack[dfs_top - 1u];
+            uint32_t u_idx = frame->node_idx;
+            int16_t e = frame->next_edge;
+
+            if (e >= 0) {
+                frame->next_edge = adj->next_out[e];
+                int16_t v_idx_s = adj->edge_dst_idx[e];
+                if (v_idx_s < 0) {
+                    continue;
+                }
+                uint32_t v_idx = (uint32_t)v_idx_s;
+
+                /* Self-loops are never valid temporal latches even on IN_PASS_BUFFER. */
+                if (v_idx == u_idx) {
+                    if (out_cycle_node_id) {
+                        *out_cycle_node_id = graph->nodes[u_idx].node_id;
+                    }
+                    return true;
+                }
+
+                /* Temporal feedback latches sample frame (t - 1) and break combinational cycles. */
+                if (graph->nodes[u_idx].opcode == WAYWAL_NODE_IN_PASS_BUFFER ||
+                    (graph->edges[e].flags & WAYWAL_EDGE_FLAG_FEEDBACK_LATCH)) {
+                    continue;
+                }
+
+                if (states[v_idx].index == -1) {
+                    states[v_idx].index = dfs_clock;
+                    states[v_idx].lowlink = dfs_clock;
+                    dfs_clock++;
+                    scc_stack[scc_top++] = (uint16_t)v_idx;
+                    states[v_idx].on_stack = true;
+                    dfs_stack[dfs_top++] = (tarjan_frame_t){.node_idx = (uint16_t)v_idx,
+                                                            .next_edge = adj->head_out[v_idx]};
+                } else if (states[v_idx].on_stack) {
+                    if (states[v_idx].index < states[u_idx].lowlink) {
+                        states[u_idx].lowlink = states[v_idx].index;
+                    }
+                }
+            } else {
+                dfs_top--;
+                if (dfs_top > 0u) {
+                    uint32_t parent_idx = dfs_stack[dfs_top - 1u].node_idx;
+                    if (states[u_idx].lowlink < states[parent_idx].lowlink) {
+                        states[parent_idx].lowlink = states[u_idx].lowlink;
+                    }
+                }
+                if (states[u_idx].lowlink == states[u_idx].index) {
+                    uint32_t scc_size = 0;
+                    uint32_t popped_idx = 0;
+                    do {
+                        if (scc_top == 0u) {
+                            break;
+                        }
+                        popped_idx = scc_stack[--scc_top];
+                        states[popped_idx].on_stack = false;
+                        scc_size++;
+                    } while (popped_idx != u_idx);
+
+                    if (scc_size > 1u) {
+                        if (out_cycle_node_id) {
+                            *out_cycle_node_id = graph->nodes[u_idx].node_id;
+                        }
+                        return true;
+                    }
+                }
             }
         }
     }
@@ -1199,6 +1324,63 @@ bool waywal_shader_graph_has_cycle(const waywal_shader_graph_t *graph, uint32_t 
     graph_adj_t adj;
     graph_adj_build(graph, &adj);
     return has_cycle_with_adj(graph, &adj, out_cycle_node_id);
+}
+
+bool waywal_shader_graph_would_create_cycle(const waywal_shader_graph_t *graph,
+                                            uint32_t src_node_id, uint32_t dst_node_id)
+{
+    if (!graph || src_node_id == 0u || dst_node_id == 0u || graph->node_count == 0u) {
+        return false;
+    }
+    const waywal_graph_node_t *src_node = waywal_shader_graph_find_node_const(graph, src_node_id);
+    const waywal_graph_node_t *dst_node = waywal_shader_graph_find_node_const(graph, dst_node_id);
+    if (!src_node || !dst_node) {
+        return false;
+    }
+    if (src_node_id == dst_node_id) {
+        return true;
+    }
+    if (src_node->opcode == WAYWAL_NODE_IN_PASS_BUFFER) {
+        return false;
+    }
+
+    graph_adj_t adj;
+    graph_adj_build(graph, &adj);
+    int16_t src_idx = graph_adj_find_idx(graph, &adj, src_node_id);
+    int16_t dst_idx = graph_adj_find_idx(graph, &adj, dst_node_id);
+    if (src_idx < 0 || dst_idx < 0) {
+        return false;
+    }
+
+    bool visited[WAYWAL_GRAPH_MAX_NODES] = {false};
+    uint16_t stack[WAYWAL_GRAPH_MAX_NODES];
+    uint32_t top = 0;
+    visited[dst_idx] = true;
+    stack[top++] = (uint16_t)dst_idx;
+
+    while (top > 0u) {
+        uint16_t u = stack[--top];
+        if (graph->nodes[u].opcode == WAYWAL_NODE_IN_PASS_BUFFER) {
+            continue;
+        }
+        for (int16_t e = adj.head_out[u]; e >= 0; e = adj.next_out[e]) {
+            if (graph->edges[e].flags & WAYWAL_EDGE_FLAG_FEEDBACK_LATCH) {
+                continue;
+            }
+            int16_t v = adj.edge_dst_idx[e];
+            if (v < 0) {
+                continue;
+            }
+            if (v == src_idx) {
+                return true;
+            }
+            if (!visited[v]) {
+                visited[v] = true;
+                stack[top++] = (uint16_t)v;
+            }
+        }
+    }
+    return false;
 }
 
 /* ========================================================================= */
@@ -1270,75 +1452,100 @@ static inline bool edge_requires_barrier_split(const waywal_shader_graph_t *grap
     return (edge->dst_pin_index == 0);
 }
 
-static uint32_t compute_sethi_ullman_adj(const waywal_shader_graph_t *graph, const graph_adj_t *adj,
-                                         uint32_t node_idx, const bool *reachable,
-                                         uint32_t *weights, bool *visiting)
+typedef struct {
+    uint16_t node_idx;
+    uint8_t next_pin;
+} sethi_frame_t;
+
+static void compute_sethi_ullman_all(const waywal_shader_graph_t *graph, const graph_adj_t *adj,
+                                     uint32_t ncnt, const bool *reachable,
+                                     uint32_t weights[WAYWAL_GRAPH_MAX_NODES])
 {
-    if (!reachable[node_idx])
-        return 0;
-    if (weights[node_idx] > 0)
-        return weights[node_idx];
-    if (visiting[node_idx])
-        return 1;
+    bool visiting[WAYWAL_GRAPH_MAX_NODES] = {false};
+    sethi_frame_t stack[WAYWAL_GRAPH_MAX_NODES];
 
-    const waywal_graph_node_t *node = &graph->nodes[node_idx];
-    if (node->input_pin_count == 0) {
-        weights[node_idx] = 1;
-        return 1;
-    }
-
-    visiting[node_idx] = true;
-    uint32_t child_weights[WAYWAL_GRAPH_MAX_PINS_PER_NODE];
-    uint32_t child_count = 0;
-
-    uint32_t pcnt = (node->input_pin_count <= WAYWAL_GRAPH_MAX_PINS_PER_NODE)
-                        ? node->input_pin_count
-                        : WAYWAL_GRAPH_MAX_PINS_PER_NODE;
-    for (uint32_t p = 0; p < pcnt; ++p) {
-        int16_t e_idx = adj->pin_in_edge[node_idx][p];
-        if (e_idx < 0)
-            continue;
-        if (graph->edges[e_idx].flags & WAYWAL_EDGE_FLAG_FEEDBACK_LATCH) {
-            child_weights[child_count++] = 1;
+    for (uint32_t root = 0; root < ncnt; ++root) {
+        if (!reachable[root] || weights[root] > 0u) {
             continue;
         }
-        int16_t s_idx = adj->edge_src_idx[e_idx];
-        if (s_idx >= 0 && reachable[s_idx]) {
-            if (graph->nodes[s_idx].opcode == WAYWAL_NODE_IN_PASS_BUFFER) {
-                child_weights[child_count++] = 1;
-            } else {
-                child_weights[child_count++] = compute_sethi_ullman_adj(
-                    graph, adj, (uint32_t)s_idx, reachable, weights, visiting);
+        uint32_t top = 0;
+        visiting[root] = true;
+        stack[top++] = (sethi_frame_t){.node_idx = (uint16_t)root, .next_pin = 0u};
+
+        while (top > 0u) {
+            sethi_frame_t *f = &stack[top - 1u];
+            uint32_t u = f->node_idx;
+            const waywal_graph_node_t *node = &graph->nodes[u];
+            uint32_t pcnt = (node->input_pin_count <= WAYWAL_GRAPH_MAX_PINS_PER_NODE)
+                                ? node->input_pin_count
+                                : WAYWAL_GRAPH_MAX_PINS_PER_NODE;
+
+            if (f->next_pin < pcnt) {
+                uint32_t p = f->next_pin++;
+                int16_t e_idx = adj->pin_in_edge[u][p];
+                if (e_idx < 0 || (graph->edges[e_idx].flags & WAYWAL_EDGE_FLAG_FEEDBACK_LATCH)) {
+                    continue;
+                }
+                int16_t s_idx = adj->edge_src_idx[e_idx];
+                if (s_idx >= 0 && reachable[s_idx] &&
+                    graph->nodes[s_idx].opcode != WAYWAL_NODE_IN_PASS_BUFFER &&
+                    weights[s_idx] == 0u && !visiting[s_idx]) {
+                    visiting[s_idx] = true;
+                    stack[top++] = (sethi_frame_t){.node_idx = (uint16_t)s_idx, .next_pin = 0u};
+                }
+                continue;
             }
-        }
-    }
 
-    visiting[node_idx] = false;
+            top--;
+            visiting[u] = false;
 
-    if (child_count == 0) {
-        weights[node_idx] = 1;
-        return 1;
-    }
-
-    for (uint32_t i = 0; i < child_count; ++i) {
-        for (uint32_t j = i + 1; j < child_count; ++j) {
-            if (child_weights[j] > child_weights[i]) {
-                uint32_t tmp = child_weights[i];
-                child_weights[i] = child_weights[j];
-                child_weights[j] = tmp;
+            uint32_t child_weights[WAYWAL_GRAPH_MAX_PINS_PER_NODE];
+            uint32_t child_count = 0;
+            for (uint32_t p = 0; p < pcnt; ++p) {
+                int16_t e_idx = adj->pin_in_edge[u][p];
+                if (e_idx < 0) {
+                    continue;
+                }
+                if (graph->edges[e_idx].flags & WAYWAL_EDGE_FLAG_FEEDBACK_LATCH) {
+                    child_weights[child_count++] = 1u;
+                    continue;
+                }
+                int16_t s_idx = adj->edge_src_idx[e_idx];
+                if (s_idx >= 0 && reachable[s_idx]) {
+                    if (graph->nodes[s_idx].opcode == WAYWAL_NODE_IN_PASS_BUFFER) {
+                        child_weights[child_count++] = 1u;
+                    } else {
+                        uint32_t w = weights[s_idx];
+                        child_weights[child_count++] = (w > 0u) ? w : 1u;
+                    }
+                }
             }
-        }
-    }
 
-    uint32_t max_weight = 1;
-    for (uint32_t i = 0; i < child_count; ++i) {
-        uint32_t w = child_weights[i] + i;
-        if (w > max_weight) {
-            max_weight = w;
+            if (child_count == 0u) {
+                weights[u] = 1u;
+                continue;
+            }
+
+            for (uint32_t i = 0; i < child_count; ++i) {
+                for (uint32_t j = i + 1u; j < child_count; ++j) {
+                    if (child_weights[j] > child_weights[i]) {
+                        uint32_t tmp = child_weights[i];
+                        child_weights[i] = child_weights[j];
+                        child_weights[j] = tmp;
+                    }
+                }
+            }
+
+            uint32_t max_weight = 1u;
+            for (uint32_t i = 0; i < child_count; ++i) {
+                uint32_t w = child_weights[i] + i;
+                if (w > max_weight) {
+                    max_weight = w;
+                }
+            }
+            weights[u] = max_weight;
         }
     }
-    weights[node_idx] = max_weight;
-    return max_weight;
 }
 
 static void compute_node_passes_readonly(const waywal_shader_graph_t *graph_in,
@@ -1359,35 +1566,49 @@ static void compute_node_passes_readonly(const waywal_shader_graph_t *graph_in,
     memset(explicit_buf_pass, -1, sizeof(explicit_buf_pass));
 
     uint16_t bfs_stack[WAYWAL_GRAPH_MAX_NODES];
+    uint32_t img_top = 0;
     bool any_sink = false;
 
     for (uint32_t i = 0; i < ncnt; ++i) {
-        uint32_t op = graph_in->nodes[i].opcode;
-        if (op != WAYWAL_NODE_OUT_IMAGE_PASS && op != WAYWAL_NODE_OUT_BUFFER_PASS) {
+        if (graph_in->nodes[i].opcode == WAYWAL_NODE_OUT_IMAGE_PASS) {
+            any_sink = true;
+            reaches_image_sink[i] = true;
+            reachable[i] = true;
+            bfs_stack[img_top++] = (uint16_t)i;
+        }
+    }
+    while (img_top > 0u) {
+        uint16_t cur = bfs_stack[--img_top];
+        for (int16_t e = adj->head_in[cur]; e >= 0; e = adj->next_in[e]) {
+            int16_t s = adj->edge_src_idx[e];
+            if (s >= 0 && !reaches_image_sink[s]) {
+                reaches_image_sink[s] = true;
+                reachable[s] = true;
+                bfs_stack[img_top++] = (uint16_t)s;
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < ncnt; ++i) {
+        if (graph_in->nodes[i].opcode != WAYWAL_NODE_OUT_BUFFER_PASS) {
             continue;
         }
         any_sink = true;
-        bool is_img = (op == WAYWAL_NODE_OUT_IMAGE_PASS);
-        int8_t bpass = is_img ? -1 : (int8_t)resolve_buffer_pass_index(&graph_in->nodes[i]);
-
-        bool visited_local[WAYWAL_GRAPH_MAX_NODES] = {false};
+        int8_t bpass = (int8_t)resolve_buffer_pass_index(&graph_in->nodes[i]);
+        if (explicit_buf_pass[i] >= 0) {
+            continue;
+        }
         uint32_t top = 0;
+        explicit_buf_pass[i] = bpass;
+        reachable[i] = true;
         bfs_stack[top++] = (uint16_t)i;
-        visited_local[i] = true;
-
-        while (top > 0) {
+        while (top > 0u) {
             uint16_t cur = bfs_stack[--top];
-            reachable[cur] = true;
-            if (is_img) {
-                reaches_image_sink[cur] = true;
-            } else if (explicit_buf_pass[cur] < 0) {
-                explicit_buf_pass[cur] = bpass;
-            }
-
             for (int16_t e = adj->head_in[cur]; e >= 0; e = adj->next_in[e]) {
                 int16_t s = adj->edge_src_idx[e];
-                if (s >= 0 && !visited_local[s]) {
-                    visited_local[s] = true;
+                if (s >= 0 && explicit_buf_pass[s] < 0) {
+                    explicit_buf_pass[s] = bpass;
+                    reachable[s] = true;
                     bfs_stack[top++] = (uint16_t)s;
                 }
             }
@@ -1401,73 +1622,128 @@ static void compute_node_passes_readonly(const waywal_shader_graph_t *graph_in,
         }
     }
 
+    /* Single O(|V| + |E|) topological pass for barrier stage propagation & leaf pull-up. */
+    uint16_t in_deg[WAYWAL_GRAPH_MAX_NODES] = {0};
+    uint16_t topo[WAYWAL_GRAPH_MAX_NODES];
+    uint32_t reach_cnt = 0;
+    for (uint32_t e = 0; e < ecnt; ++e) {
+        int16_t s = adj->edge_src_idx[e];
+        int16_t d = adj->edge_dst_idx[e];
+        if (s < 0 || d < 0 || !reachable[s] || !reachable[d]) {
+            continue;
+        }
+        if (graph_in->nodes[s].opcode == WAYWAL_NODE_IN_PASS_BUFFER ||
+            (graph_in->edges[e].flags & WAYWAL_EDGE_FLAG_FEEDBACK_LATCH)) {
+            continue;
+        }
+        in_deg[d]++;
+    }
+    uint32_t q_head = 0;
+    uint32_t q_tail = 0;
+    for (uint32_t i = 0; i < ncnt; ++i) {
+        if (!reachable[i]) {
+            continue;
+        }
+        reach_cnt++;
+        if (in_deg[i] == 0u) {
+            topo[q_tail++] = (uint16_t)i;
+        }
+    }
     uint32_t barrier_stage[WAYWAL_GRAPH_MAX_NODES] = {0};
-    for (uint32_t iter = 0; iter < ncnt; ++iter) {
-        bool changed = false;
-        for (uint32_t e = 0; e < ecnt; ++e) {
-            int16_t s = adj->edge_src_idx[e];
-            int16_t d = adj->edge_dst_idx[e];
-            if (s < 0 || d < 0 || !reachable[s] || !reachable[d])
-                continue;
-
-            if (graph_in->nodes[s].opcode == WAYWAL_NODE_IN_PASS_BUFFER ||
-                (graph_in->edges[e].flags & WAYWAL_EDGE_FLAG_FEEDBACK_LATCH)) {
+    while (q_head < q_tail) {
+        uint16_t u = topo[q_head++];
+        if (graph_in->nodes[u].opcode == WAYWAL_NODE_IN_PASS_BUFFER) {
+            continue;
+        }
+        uint32_t base_stage = barrier_stage[u];
+        for (int16_t e = adj->head_out[u]; e >= 0; e = adj->next_out[e]) {
+            if (graph_in->edges[e].flags & WAYWAL_EDGE_FLAG_FEEDBACK_LATCH) {
                 continue;
             }
-
-            bool split = edge_requires_barrier_split(graph_in, (uint32_t)s, (uint32_t)d,
-                                                     &graph_in->edges[e]);
-            uint32_t new_s = barrier_stage[s] + (split ? 1u : 0u);
-            if (new_s > 4u)
+            int16_t d = adj->edge_dst_idx[e];
+            if (d < 0 || !reachable[d]) {
+                continue;
+            }
+            bool split = edge_requires_barrier_split(graph_in, u, (uint32_t)d, &graph_in->edges[e]);
+            uint32_t new_s = base_stage + (split ? 1u : 0u);
+            if (new_s > 4u) {
                 new_s = 4u;
+            }
             if (new_s > barrier_stage[d]) {
                 barrier_stage[d] = new_s;
-                changed = true;
+            }
+            if (--in_deg[d] == 0u) {
+                topo[q_tail++] = (uint16_t)d;
             }
         }
-        if (!changed)
-            break;
     }
 
-    /* Pull non-barrier leaf inputs up to their consumer stage so constants/UVs do not force
-     * spurious intermediate pass splits. */
-    for (uint32_t iter = 0; iter < ncnt; ++iter) {
-        bool changed = false;
-        for (uint32_t u = 0; u < ncnt; ++u) {
-            if (!reachable[u] || !reaches_image_sink[u])
-                continue;
-            uint32_t op = graph_in->nodes[u].opcode;
-            if (op == WAYWAL_NODE_OUT_IMAGE_PASS || op == WAYWAL_NODE_OUT_BUFFER_PASS ||
-                op == WAYWAL_NODE_IN_PASS_BUFFER) {
-                continue;
-            }
-
-            uint32_t min_dst_stage = UINT32_MAX;
-            bool has_consumer = false;
-            bool has_split_out = false;
-            for (int16_t e = adj->head_out[u]; e >= 0; e = adj->next_out[e]) {
-                if (graph_in->edges[e].flags & WAYWAL_EDGE_FLAG_FEEDBACK_LATCH)
-                    continue;
+    if (q_tail < reach_cnt) {
+        /* Defensive fallback if an unvalidated cyclic graph reaches compile_glsl directly. */
+        for (uint32_t iter = 0; iter < ncnt; ++iter) {
+            bool changed = false;
+            for (uint32_t e = 0; e < ecnt; ++e) {
+                int16_t s = adj->edge_src_idx[e];
                 int16_t d = adj->edge_dst_idx[e];
-                if (d < 0 || !reachable[d])
+                if (s < 0 || d < 0 || !reachable[s] || !reachable[d]) {
                     continue;
-                has_consumer = true;
-                if (edge_requires_barrier_split(graph_in, u, (uint32_t)d, &graph_in->edges[e])) {
-                    has_split_out = true;
-                    break;
                 }
-                if (barrier_stage[d] < min_dst_stage) {
-                    min_dst_stage = barrier_stage[d];
+                if (graph_in->nodes[s].opcode == WAYWAL_NODE_IN_PASS_BUFFER ||
+                    (graph_in->edges[e].flags & WAYWAL_EDGE_FLAG_FEEDBACK_LATCH)) {
+                    continue;
+                }
+                bool split = edge_requires_barrier_split(graph_in, (uint32_t)s, (uint32_t)d,
+                                                         &graph_in->edges[e]);
+                uint32_t new_s = barrier_stage[s] + (split ? 1u : 0u);
+                if (new_s > 4u) {
+                    new_s = 4u;
+                }
+                if (new_s > barrier_stage[d]) {
+                    barrier_stage[d] = new_s;
+                    changed = true;
                 }
             }
-            if (has_consumer && !has_split_out && min_dst_stage < UINT32_MAX &&
-                min_dst_stage > barrier_stage[u]) {
-                barrier_stage[u] = min_dst_stage;
-                changed = true;
+            if (!changed) {
+                break;
             }
         }
-        if (!changed)
-            break;
+    }
+
+    /* Pull non-barrier leaf inputs up to their consumer stage in reverse topological order. */
+    for (uint32_t k = q_tail; k > 0u; --k) {
+        uint32_t u = topo[k - 1u];
+        if (!reaches_image_sink[u]) {
+            continue;
+        }
+        uint32_t op = graph_in->nodes[u].opcode;
+        if (op == WAYWAL_NODE_OUT_IMAGE_PASS || op == WAYWAL_NODE_OUT_BUFFER_PASS ||
+            op == WAYWAL_NODE_IN_PASS_BUFFER) {
+            continue;
+        }
+        uint32_t min_dst_stage = UINT32_MAX;
+        bool has_consumer = false;
+        bool has_split_out = false;
+        for (int16_t e = adj->head_out[u]; e >= 0; e = adj->next_out[e]) {
+            if (graph_in->edges[e].flags & WAYWAL_EDGE_FLAG_FEEDBACK_LATCH) {
+                continue;
+            }
+            int16_t d = adj->edge_dst_idx[e];
+            if (d < 0 || !reachable[d]) {
+                continue;
+            }
+            has_consumer = true;
+            if (edge_requires_barrier_split(graph_in, u, (uint32_t)d, &graph_in->edges[e])) {
+                has_split_out = true;
+                break;
+            }
+            if (barrier_stage[d] < min_dst_stage) {
+                min_dst_stage = barrier_stage[d];
+            }
+        }
+        if (has_consumer && !has_split_out && min_dst_stage < UINT32_MAX &&
+            min_dst_stage > barrier_stage[u]) {
+            barrier_stage[u] = min_dst_stage;
+        }
     }
 
     uint32_t max_image_stage = 0;
@@ -1542,12 +1818,7 @@ bool waywal_shader_graph_analyze(const waywal_shader_graph_t *graph_in,
                                  &out_schedule->active_pass_mask);
 
     uint32_t sethi_ullman[WAYWAL_GRAPH_MAX_NODES] = {0};
-    bool visiting[WAYWAL_GRAPH_MAX_NODES] = {false};
-    for (uint32_t i = 0; i < ncnt; ++i) {
-        if (reachable[i] && sethi_ullman[i] == 0) {
-            compute_sethi_ullman_adj(graph_in, &adj, i, reachable, sethi_ullman, visiting);
-        }
-    }
+    compute_sethi_ullman_all(graph_in, &adj, ncnt, reachable, sethi_ullman);
 
     uint32_t scheduled_count = 0;
     for (uint32_t pass = 0; pass < WAYWAL_GRAPH_MAX_PASSES; ++pass) {
@@ -1764,6 +2035,7 @@ enum {
     WWAL_HLP_FX_VIGNETTE = (1u << 20),
     WWAL_HLP_FX_CRT_PIXELATE = (1u << 21),
     WWAL_HLP_FX_GODRAYS = (1u << 22),
+    WWAL_HLP_SAFE_POW = (1u << 23),
 };
 
 static uint32_t helper_mask_for_builtin_key(const char *key)
@@ -1827,6 +2099,8 @@ static uint32_t helper_mask_for_node(const waywal_shader_graph_t *graph, const g
         return 0u;
     }
     switch (node->opcode) {
+    case WAYWAL_NODE_MATH_POW:
+        return WWAL_HLP_SAFE_POW;
     case WAYWAL_NODE_NOISE_SIMPLEX2D:
         return WWAL_HLP_SIMPLEX2D;
     case WAYWAL_NODE_NOISE_CURL2D:
@@ -1874,7 +2148,533 @@ static uint32_t helper_mask_for_node(const waywal_shader_graph_t *graph, const g
     }
 }
 
-static void emit_glsl_helpers(str_buf_t *sb, uint32_t helper_mask)
+/* ========================================================================= */
+/* Hanson Monotonic Bump Arena & Fast Ryu Float Emitter (PERF-039)           */
+/* ========================================================================= */
+
+typedef struct wwal_bump_chunk {
+    struct wwal_bump_chunk *next;
+    size_t used;
+    size_t cap;
+    uint8_t *data;
+} wwal_bump_chunk_t;
+
+typedef struct {
+    wwal_bump_chunk_t *head;
+    wwal_bump_chunk_t *tail;
+    wwal_bump_chunk_t *current;
+    wwal_bump_chunk_t *tls_chunk;
+    size_t default_chunk_bytes;
+} wwal_bump_arena_t;
+
+/* 128 KiB per-thread primary slab eliminates glibc arena lock contention during compile. */
+static _Thread_local struct {
+    bool in_use;
+    wwal_bump_chunk_t chunk;
+    _Alignas(16) uint8_t storage[128u * 1024u];
+} g_compile_tls_slab;
+
+static void wwal_bump_arena_init_compile(wwal_bump_arena_t *arena)
+{
+    arena->default_chunk_bytes = 128u * 1024u;
+    if (!g_compile_tls_slab.in_use) {
+        g_compile_tls_slab.in_use = true;
+        g_compile_tls_slab.chunk.next = NULL;
+        g_compile_tls_slab.chunk.used = 0u;
+        g_compile_tls_slab.chunk.cap = sizeof(g_compile_tls_slab.storage);
+        g_compile_tls_slab.chunk.data = g_compile_tls_slab.storage;
+        arena->head = &g_compile_tls_slab.chunk;
+        arena->tail = &g_compile_tls_slab.chunk;
+        arena->current = &g_compile_tls_slab.chunk;
+        arena->tls_chunk = &g_compile_tls_slab.chunk;
+    } else {
+        arena->head = NULL;
+        arena->tail = NULL;
+        arena->current = NULL;
+        arena->tls_chunk = NULL;
+    }
+}
+
+static inline size_t wwal_ptr_align_pad(const uint8_t *base, size_t used, size_t align)
+{
+    uintptr_t misalign = ((uintptr_t)base + (uintptr_t)used) & (uintptr_t)(align - 1u);
+    return (misalign != 0u) ? (align - (size_t)misalign) : 0u;
+}
+
+static void *wwal_bump_alloc(wwal_bump_arena_t *arena, size_t size, size_t align)
+{
+    if (!arena || size == 0u || align == 0u || (align & (align - 1u)) != 0u) {
+        return NULL;
+    }
+    wwal_bump_chunk_t *c = arena->current;
+    if (c) {
+        size_t pad = wwal_ptr_align_pad(c->data, c->used, align);
+        size_t rem = c->cap - c->used;
+        if (pad <= rem && size <= rem - pad) {
+            void *ptr = c->data + c->used + pad;
+            c->used += pad + size;
+            return ptr;
+        }
+    }
+    if (align - 1u > SIZE_MAX - size) {
+        return NULL;
+    }
+    size_t need = size + (align - 1u);
+    size_t min_cap = (arena->default_chunk_bytes > 4096u) ? arena->default_chunk_bytes : 4096u;
+    size_t cap = (need > min_cap) ? need : min_cap;
+    if (cap > SIZE_MAX - sizeof(wwal_bump_chunk_t) - 16u) {
+        return NULL;
+    }
+    wwal_bump_chunk_t *nc = (wwal_bump_chunk_t *)malloc(sizeof(wwal_bump_chunk_t) + 16u + cap);
+    if (!nc) {
+        return NULL;
+    }
+    uintptr_t raw = (uintptr_t)(nc + 1);
+    nc->data = (uint8_t *)((raw + 15u) & ~(uintptr_t)15u);
+    nc->next = NULL;
+    nc->used = 0u;
+    nc->cap = cap;
+
+    if (!arena->head) {
+        arena->head = nc;
+        arena->tail = nc;
+    } else {
+        arena->tail->next = nc;
+        arena->tail = nc;
+    }
+    arena->current = nc;
+
+    size_t pad = wwal_ptr_align_pad(nc->data, 0u, align);
+    void *ptr = nc->data + pad;
+    nc->used = pad + size;
+    return ptr;
+}
+
+static void wwal_bump_arena_free(wwal_bump_arena_t *arena)
+{
+    if (!arena) {
+        return;
+    }
+    wwal_bump_chunk_t *cur = arena->head;
+    while (cur) {
+        wwal_bump_chunk_t *nxt = cur->next;
+        if (cur != arena->tls_chunk) {
+            free(cur);
+        }
+        cur = nxt;
+    }
+    if (arena->tls_chunk) {
+        g_compile_tls_slab.in_use = false;
+    }
+    arena->head = NULL;
+    arena->tail = NULL;
+    arena->current = NULL;
+    arena->tls_chunk = NULL;
+}
+
+/* Ryu binary32 shortest decimal formatter emitting GLSL-valid float literals (always '.' or 'e').
+ */
+#define RYU_F32_POW5_INV_BITCOUNT 59
+#define RYU_F32_POW5_BITCOUNT     61
+
+static const uint64_t k_ryu_f32_pow5_inv[31] = {
+    0x0800000000000001ULL, 0x0666666666666667ULL, 0x051eb851eb851eb9ULL, 0x04189374bc6a7efaULL,
+    0x068db8bac710cb2aULL, 0x053e2d6238da3c22ULL, 0x0431bde82d7b634eULL, 0x06b5fca6af2bd216ULL,
+    0x055e63b88c230e78ULL, 0x044b82fa09b5a52dULL, 0x06df37f675ef6eaeULL, 0x057f5ff85e592558ULL,
+    0x0465e6604b7a8447ULL, 0x0709709a125da071ULL, 0x05a126e1a84ae6c1ULL, 0x0480ebe7b9d58567ULL,
+    0x0734aca5f6226f0bULL, 0x05c3bd5191b525a3ULL, 0x049c97747490eae9ULL, 0x0760f253edb4ab0eULL,
+    0x05e72843249088d8ULL, 0x04b8ed0283a6d3e0ULL, 0x078e480405d7b966ULL, 0x060b6cd004ac9452ULL,
+    0x04d5f0a66a23a9dbULL, 0x07bcb43d769f762bULL, 0x063090312bb2c4efULL, 0x04f3a68dbc8f03f3ULL,
+    0x07ec3daf94180651ULL, 0x065697bfa9acd1daULL, 0x051212ffbaf0a7e2ULL,
+};
+
+static const uint64_t k_ryu_f32_pow5_fwd[47] = {
+    0x1000000000000000ULL, 0x1400000000000000ULL, 0x1900000000000000ULL, 0x1f40000000000000ULL,
+    0x1388000000000000ULL, 0x186a000000000000ULL, 0x1e84800000000000ULL, 0x1312d00000000000ULL,
+    0x17d7840000000000ULL, 0x1dcd650000000000ULL, 0x12a05f2000000000ULL, 0x174876e800000000ULL,
+    0x1d1a94a200000000ULL, 0x12309ce540000000ULL, 0x16bcc41e90000000ULL, 0x1c6bf52634000000ULL,
+    0x11c37937e0800000ULL, 0x16345785d8a00000ULL, 0x1bc16d674ec80000ULL, 0x1158e460913d0000ULL,
+    0x15af1d78b58c4000ULL, 0x1b1ae4d6e2ef5000ULL, 0x10f0cf064dd59200ULL, 0x152d02c7e14af680ULL,
+    0x1a784379d99db420ULL, 0x108b2a2c28029094ULL, 0x14adf4b7320334b9ULL, 0x19d971e4fe8401e7ULL,
+    0x1027e72f1f128130ULL, 0x1431e0fae6d7217cULL, 0x193e5939a08ce9dbULL, 0x1f8def8808b02452ULL,
+    0x13b8b5b5056e16b3ULL, 0x18a6e32246c99c60ULL, 0x1ed09bead87c0378ULL, 0x13426172c74d822bULL,
+    0x1812f9cf7920e2b6ULL, 0x1e17b84357691b64ULL, 0x12ced32a16a1b11eULL, 0x178287f49c4a1d66ULL,
+    0x1d6329f1c35ca4bfULL, 0x125dfa371a19e6f7ULL, 0x16f578c4e0a060b5ULL, 0x1cb2d6f618c878e3ULL,
+    0x11efc659cf7d4b8dULL, 0x166bb7f0435c9e71ULL, 0x1c06a5ec5433c60dULL,
+};
+
+static inline uint32_t ryu_pow5bits(int32_t e)
+{
+    return (e == 0) ? 1u : (uint32_t)((((uint32_t)e * 1217359u) >> 19) + 1u);
+}
+
+static inline uint32_t ryu_mul_shift32(uint32_t m, uint64_t factor, int32_t shift)
+{
+    uint64_t bits0 = (uint64_t)m * (uint32_t)factor;
+    uint64_t bits1 = (uint64_t)m * (uint32_t)(factor >> 32);
+    uint64_t sum = (bits0 >> 32) + bits1;
+    return (uint32_t)(sum >> (shift - 32));
+}
+
+static inline uint32_t ryu_pow5_factor(uint32_t v)
+{
+    uint32_t count = 0;
+    while (v > 0u && (v % 5u) == 0u) {
+        v /= 5u;
+        count++;
+    }
+    return count;
+}
+
+static inline uint32_t ryu_dec_len9(uint32_t v)
+{
+    if (v >= 100000000u)
+        return 9u;
+    if (v >= 10000000u)
+        return 8u;
+    if (v >= 1000000u)
+        return 7u;
+    if (v >= 100000u)
+        return 6u;
+    if (v >= 10000u)
+        return 5u;
+    if (v >= 1000u)
+        return 4u;
+    if (v >= 100u)
+        return 3u;
+    if (v >= 10u)
+        return 2u;
+    return 1u;
+}
+
+static size_t ryu_f32_to_glsl(float f, char out[24])
+{
+    uint32_t bits = 0;
+    memcpy(&bits, &f, sizeof(bits));
+    bool sign = ((bits >> 31) & 1u) != 0u;
+    uint32_t ieee_m = bits & ((1u << 23) - 1u);
+    uint32_t ieee_e = (bits >> 23) & 0xFFu;
+
+    if ((ieee_e == 0u && ieee_m == 0u) || ieee_e == 0xFFu) {
+        memcpy(out, "0.0", 3u);
+        return 3u;
+    }
+
+    int32_t e2;
+    uint32_t m2;
+    if (ieee_e == 0u) {
+        e2 = 1 - 127 - 23 - 2;
+        m2 = ieee_m;
+    } else {
+        e2 = (int32_t)ieee_e - 127 - 23 - 2;
+        m2 = (1u << 23) | ieee_m;
+    }
+    bool accept_bounds = (m2 & 1u) == 0u;
+    uint32_t mv = 4u * m2;
+    uint32_t mp = 4u * m2 + 2u;
+    uint32_t mm_shift = (ieee_m != 0u || ieee_e <= 1u) ? 1u : 0u;
+    uint32_t mm = 4u * m2 - 1u - mm_shift;
+
+    uint32_t vr, vp, vm;
+    int32_t e10;
+    bool vm_tz = false;
+    bool vr_tz = false;
+    uint8_t last_digit = 0;
+
+    if (e2 >= 0) {
+        uint32_t q = ((uint32_t)e2 * 78913u) >> 18;
+        e10 = (int32_t)q;
+        int32_t k = RYU_F32_POW5_INV_BITCOUNT + (int32_t)ryu_pow5bits((int32_t)q) - 1;
+        int32_t i = -e2 + (int32_t)q + k;
+        vr = ryu_mul_shift32(mv, k_ryu_f32_pow5_inv[q], i);
+        vp = ryu_mul_shift32(mp, k_ryu_f32_pow5_inv[q], i);
+        vm = ryu_mul_shift32(mm, k_ryu_f32_pow5_inv[q], i);
+        if (q != 0u && (vp - 1u) / 10u <= vm / 10u) {
+            int32_t l = RYU_F32_POW5_INV_BITCOUNT + (int32_t)ryu_pow5bits((int32_t)(q - 1u)) - 1;
+            last_digit = (uint8_t)(ryu_mul_shift32(mv, k_ryu_f32_pow5_inv[q - 1u],
+                                                   -e2 + (int32_t)q - 1 + l) %
+                                   10u);
+        }
+        if (q <= 9u) {
+            if (mv % 5u == 0u) {
+                vr_tz = (ryu_pow5_factor(mv) >= q);
+            } else if (accept_bounds) {
+                vm_tz = (ryu_pow5_factor(mm) >= q);
+            } else {
+                vp -= (ryu_pow5_factor(mp) >= q) ? 1u : 0u;
+            }
+        }
+    } else {
+        uint32_t q = ((uint32_t)(-e2) * 732923u) >> 20;
+        e10 = (int32_t)q + e2;
+        int32_t i = -e2 - (int32_t)q;
+        int32_t k = (int32_t)ryu_pow5bits(i) - RYU_F32_POW5_BITCOUNT;
+        int32_t j = (int32_t)q - k;
+        vr = ryu_mul_shift32(mv, k_ryu_f32_pow5_fwd[i], j);
+        vp = ryu_mul_shift32(mp, k_ryu_f32_pow5_fwd[i], j);
+        vm = ryu_mul_shift32(mm, k_ryu_f32_pow5_fwd[i], j);
+        if (q != 0u && (vp - 1u) / 10u <= vm / 10u) {
+            j = (int32_t)q - 1 - ((int32_t)ryu_pow5bits(i + 1) - RYU_F32_POW5_BITCOUNT);
+            last_digit = (uint8_t)(ryu_mul_shift32(mv, k_ryu_f32_pow5_fwd[i + 1], j) % 10u);
+        }
+        if (q <= 1u) {
+            vr_tz = true;
+            if (accept_bounds) {
+                vm_tz = (mm_shift == 1u);
+            } else {
+                --vp;
+            }
+        } else if (q < 31u) {
+            vr_tz = ((mv & ((1u << (q - 1u)) - 1u)) == 0u);
+        }
+    }
+
+    uint32_t removed = 0;
+    if (vm_tz || vr_tz) {
+        while (vp / 10u > vm / 10u) {
+            vm_tz &= ((vm % 10u) == 0u);
+            vr_tz &= (last_digit == 0u);
+            last_digit = (uint8_t)(vr % 10u);
+            vr /= 10u;
+            vp /= 10u;
+            vm /= 10u;
+            ++removed;
+        }
+        if (vm_tz) {
+            while ((vm % 10u) == 0u) {
+                vr_tz &= (last_digit == 0u);
+                last_digit = (uint8_t)(vr % 10u);
+                vr /= 10u;
+                vp /= 10u;
+                vm /= 10u;
+                ++removed;
+            }
+        }
+        if (vr_tz && last_digit == 5u && (vr % 2u) == 0u) {
+            last_digit = 4u;
+        }
+        vr += ((vr == vm && (!accept_bounds || !vm_tz)) || last_digit >= 5u) ? 1u : 0u;
+    } else {
+        while (vp / 10u > vm / 10u) {
+            last_digit = (uint8_t)(vr % 10u);
+            vr /= 10u;
+            vp /= 10u;
+            vm /= 10u;
+            ++removed;
+        }
+        vr += (vr == vm || last_digit >= 5u) ? 1u : 0u;
+    }
+
+    uint32_t olength = ryu_dec_len9(vr);
+    int32_t kk = e10 + (int32_t)removed + (int32_t)olength;
+    size_t idx = 0;
+    if (sign) {
+        out[idx++] = '-';
+    }
+
+    char digits[12];
+    uint32_t tmp = vr;
+    for (int32_t d = (int32_t)olength - 1; d >= 0; --d) {
+        digits[d] = (char)('0' + (tmp % 10u));
+        tmp /= 10u;
+    }
+
+    if (kk >= 1 && kk <= 7) {
+        if ((int32_t)olength <= kk) {
+            memcpy(out + idx, digits, olength);
+            idx += olength;
+            for (int32_t z = (int32_t)olength; z < kk; ++z) {
+                out[idx++] = '0';
+            }
+            out[idx++] = '.';
+            out[idx++] = '0';
+        } else {
+            memcpy(out + idx, digits, (size_t)kk);
+            idx += (size_t)kk;
+            out[idx++] = '.';
+            memcpy(out + idx, digits + kk, olength - (uint32_t)kk);
+            idx += olength - (uint32_t)kk;
+        }
+    } else if (kk > -4 && kk <= 0) {
+        out[idx++] = '0';
+        out[idx++] = '.';
+        for (int32_t z = 0; z < -kk; ++z) {
+            out[idx++] = '0';
+        }
+        memcpy(out + idx, digits, olength);
+        idx += olength;
+    } else {
+        out[idx++] = digits[0];
+        out[idx++] = '.';
+        if (olength > 1u) {
+            memcpy(out + idx, digits + 1, olength - 1u);
+            idx += olength - 1u;
+        } else {
+            out[idx++] = '0';
+        }
+        out[idx++] = 'e';
+        int32_t eval = kk - 1;
+        if (eval < 0) {
+            out[idx++] = '-';
+            eval = -eval;
+        }
+        if (eval >= 10) {
+            out[idx++] = (char)('0' + eval / 10);
+            out[idx++] = (char)('0' + eval % 10);
+        } else {
+            out[idx++] = (char)('0' + eval);
+        }
+    }
+    return idx;
+}
+
+typedef struct {
+    wwal_bump_arena_t *arena;
+    char *data;
+    size_t len;
+    size_t cap;
+    bool oom;
+} arena_str_t;
+
+static bool ab_init(arena_str_t *ab, wwal_bump_arena_t *arena, size_t init_cap)
+{
+    ab->arena = arena;
+    ab->len = 0u;
+    ab->oom = false;
+    ab->cap = (init_cap > 4096u) ? init_cap : 4096u;
+    ab->data = (char *)wwal_bump_alloc(arena, ab->cap, 16u);
+    if (!ab->data) {
+        ab->oom = true;
+        ab->cap = 0u;
+        return false;
+    }
+    return true;
+}
+
+static bool ab_grow(arena_str_t *ab, size_t extra)
+{
+    if (!ab || ab->oom || !ab->data) {
+        return false;
+    }
+    if (extra > SIZE_MAX - ab->len - 1u) {
+        ab->oom = true;
+        return false;
+    }
+    size_t needed = ab->len + extra + 1u;
+    if (needed <= ab->cap) {
+        return true;
+    }
+    size_t new_cap = (ab->cap <= SIZE_MAX / 2u) ? (ab->cap * 2u) : SIZE_MAX;
+    if (new_cap < needed) {
+        new_cap = (needed <= SIZE_MAX - 4096u) ? (needed + 4096u) : needed;
+    }
+    /* Extend in-place when this buffer sits at the active bump frontier. */
+    wwal_bump_chunk_t *cur = ab->arena->current;
+    if (cur && (uint8_t *)ab->data + ab->cap == cur->data + cur->used) {
+        size_t delta = new_cap - ab->cap;
+        if (delta <= cur->cap - cur->used) {
+            cur->used += delta;
+            ab->cap = new_cap;
+            return true;
+        }
+    }
+    char *nd = (char *)wwal_bump_alloc(ab->arena, new_cap, 16u);
+    if (!nd) {
+        ab->oom = true;
+        return false;
+    }
+    memcpy(nd, ab->data, ab->len);
+    ab->data = nd;
+    ab->cap = new_cap;
+    return true;
+}
+
+static inline void ab_append_n(arena_str_t *ab, const char *s, size_t n)
+{
+    if (!s || n == 0u) {
+        return;
+    }
+    if (ab->len + n + 1u > ab->cap && !ab_grow(ab, n)) {
+        return;
+    }
+    memcpy(ab->data + ab->len, s, n);
+    ab->len += n;
+}
+
+#define ab_append_lit(ab, lit) ab_append_n((ab), (lit), sizeof(lit) - 1u)
+
+static inline void ab_append_cstr(arena_str_t *ab, const char *s)
+{
+    if (s && s[0] != '\0') {
+        ab_append_n(ab, s, strlen(s));
+    }
+}
+
+static inline void ab_append_u32(arena_str_t *ab, uint32_t v)
+{
+    char tmp[12];
+    size_t pos = sizeof(tmp);
+    do {
+        tmp[--pos] = (char)('0' + (v % 10u));
+        v /= 10u;
+    } while (v != 0u);
+    ab_append_n(ab, tmp + pos, sizeof(tmp) - pos);
+}
+
+static inline void ab_append_f32(arena_str_t *ab, float f)
+{
+    char tmp[24];
+    size_t n = ryu_f32_to_glsl(f, tmp);
+    ab_append_n(ab, tmp, n);
+}
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} stack_writer_t;
+
+static inline void sw_append_n(stack_writer_t *w, const char *s, size_t n)
+{
+    if (!s || n == 0u || w->len >= w->cap - 1u) {
+        return;
+    }
+    size_t avail = w->cap - 1u - w->len;
+    size_t copy_n = (n < avail) ? n : avail;
+    memcpy(w->data + w->len, s, copy_n);
+    w->len += copy_n;
+}
+
+#define sw_append_lit(w, lit) sw_append_n((w), (lit), sizeof(lit) - 1u)
+
+static inline void sw_append_u32(stack_writer_t *w, uint32_t v)
+{
+    char tmp[12];
+    size_t pos = sizeof(tmp);
+    do {
+        tmp[--pos] = (char)('0' + (v % 10u));
+        v /= 10u;
+    } while (v != 0u);
+    sw_append_n(w, tmp + pos, sizeof(tmp) - pos);
+}
+
+static inline void sw_append_i32(stack_writer_t *w, int32_t v)
+{
+    if (v < 0) {
+        sw_append_n(w, "-", 1u);
+    }
+    uint32_t mag = (v < 0) ? (0u - (uint32_t)v) : (uint32_t)v;
+    sw_append_u32(w, mag);
+}
+
+static inline void sw_append_f32(stack_writer_t *w, float f)
+{
+    char tmp[24];
+    size_t n = ryu_f32_to_glsl(f, tmp);
+    sw_append_n(w, tmp, n);
+}
+
+static void emit_glsl_helpers(arena_str_t *sb, uint32_t helper_mask)
 {
     if (helper_mask & (WWAL_HLP_CURL2D | WWAL_HLP_FBM2D))
         helper_mask |= WWAL_HLP_SIMPLEX2D;
@@ -1886,25 +2686,48 @@ static void emit_glsl_helpers(str_buf_t *sb, uint32_t helper_mask)
     if (helper_mask == 0u)
         return;
 
+    if (helper_mask & WWAL_HLP_SAFE_POW) {
+        ab_append_lit(sb,
+                      "vec4 wwal_safe_pow(vec4 base, vec4 exp_v) {\n"
+                      "    bvec4 pos_base = greaterThan(base, vec4(0.0));\n"
+                      "    bvec4 pos_exp = greaterThan(exp_v, vec4(0.0));\n"
+                      "    vec4 safe_base = mix(vec4(1.0), base, pos_base);\n"
+                      "    vec4 p = pow(safe_base, exp_v);\n"
+                      "    vec4 zero_base = mix(vec4(0.0), vec4(1.0), equal(exp_v, vec4(0.0)));\n"
+                      "    return mix(mix(zero_base, vec4(0.0), pos_exp), p, pos_base);\n"
+                      "}\n\n");
+    }
     if (helper_mask & WWAL_HLP_OKLCH_TO_SRGB) {
-        str_buf_append(sb,
-                       "vec3 wwal_oklch_to_srgb(vec4 oklch) {\n"
-                       "    float L = oklch.x, C = oklch.y, h = oklch.z;\n"
-                       "    float a = C * cos(h), b = C * sin(h);\n"
-                       "    float l_ = L + 0.3963377774 * a + 0.2158037573 * b;\n"
-                       "    float m_ = L - 0.1055613458 * a - 0.0638541728 * b;\n"
-                       "    float s_ = L - 0.0894841775 * a - 1.2914855480 * b;\n"
-                       "    float l = l_ * l_ * l_, m = m_ * m_ * m_, s = s_ * s_ * s_;\n"
-                       "    float r = +4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;\n"
-                       "    float g = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;\n"
-                       "    float bl = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s;\n"
-                       "    return clamp(vec3(r, g, bl), 0.0, 1.0);\n"
-                       "}\n\n");
+        ab_append_lit(
+            sb, "vec3 wwal_linear_to_srgb(vec3 lin) {\n"
+                "    vec3 c = clamp(lin, 0.0, 1.0);\n"
+                "    vec3 lo = c * 12.92;\n"
+                "    vec3 hi = 1.055 * pow(max(c, vec3(0.0031308)), vec3(1.0 / 2.4)) - 0.055;\n"
+                "    return clamp(mix(hi, lo, lessThanEqual(c, vec3(0.0031308))), 0.0, 1.0);\n"
+                "}\n\n"
+                "vec3 wwal_oklch_to_srgb(vec4 oklch) {\n"
+                "    float L = oklch.x, C = oklch.y, h = oklch.z;\n"
+                "    float a = C * cos(h), b = C * sin(h);\n"
+                "    float l_ = L + 0.3963377774 * a + 0.2158037573 * b;\n"
+                "    float m_ = L - 0.1055613458 * a - 0.0638541728 * b;\n"
+                "    float s_ = L - 0.0894841775 * a - 1.2914855480 * b;\n"
+                "    float l = l_ * l_ * l_, m = m_ * m_ * m_, s = s_ * s_ * s_;\n"
+                "    float r = +4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;\n"
+                "    float g = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;\n"
+                "    float bl = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s;\n"
+                "    return wwal_linear_to_srgb(vec3(r, g, bl));\n"
+                "}\n\n");
     }
     if (helper_mask & WWAL_HLP_SRGB_TO_OKLCH) {
-        str_buf_append(
-            sb, "vec3 wwal_srgb_to_oklch(vec4 srgb) {\n"
-                "    vec3 c = srgb.rgb;\n"
+        ab_append_lit(
+            sb, "vec3 wwal_srgb_to_linear(vec3 srgb) {\n"
+                "    vec3 c = max(srgb, vec3(0.0));\n"
+                "    vec3 lo = c / 12.92;\n"
+                "    vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));\n"
+                "    return mix(hi, lo, lessThanEqual(c, vec3(0.04045)));\n"
+                "}\n\n"
+                "vec3 wwal_srgb_to_oklch(vec4 srgb) {\n"
+                "    vec3 c = wwal_srgb_to_linear(srgb.rgb);\n"
                 "    float l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;\n"
                 "    float m = 0.2119034982 * c.r + 0.6806995451 * c.g + 0.1073969566 * c.b;\n"
                 "    float s = 0.0883024619 * c.r + 0.2817188376 * c.g + 0.6299787005 * c.b;\n"
@@ -1915,131 +2738,131 @@ static void emit_glsl_helpers(str_buf_t *sb, uint32_t helper_mask)
                 "    float a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_;\n"
                 "    float b = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_;\n"
                 "    float C = sqrt(max(a * a + b * b, 0.0));\n"
-                "    float h = atan(b, a);\n"
+                "    float h = (abs(a) < 1e-6 && abs(b) < 1e-6) ? 0.0 : atan(b, a);\n"
                 "    return vec3(L, C, h);\n"
                 "}\n\n");
     }
     if (helper_mask & WWAL_HLP_HASH21) {
-        str_buf_append(sb, "float wwal_hash21(vec2 p) {\n"
-                           "    vec3 p3 = fract(vec3(p.xyx) * 0.1031);\n"
-                           "    p3 += dot(p3, p3.yzx + 33.33);\n"
-                           "    return fract((p3.x + p3.y) * p3.z);\n"
-                           "}\n\n");
+        ab_append_lit(sb, "float wwal_hash21(vec2 p) {\n"
+                          "    vec3 p3 = fract(vec3(p.xyx) * 0.1031);\n"
+                          "    p3 += dot(p3, p3.yzx + 33.33);\n"
+                          "    return fract((p3.x + p3.y) * p3.z);\n"
+                          "}\n\n");
     }
     if (helper_mask & WWAL_HLP_SIMPLEX2D) {
-        str_buf_append(sb,
-                       "float wwal_simplex2d(vec2 p) {\n"
-                       "    const float K1 = 0.366025404;\n"
-                       "    const float K2 = 0.211324865;\n"
-                       "    vec2 i = floor(p + (p.x + p.y) * K1);\n"
-                       "    vec2 a = p - i + (i.x + i.y) * K2;\n"
-                       "    float m = step(a.y, a.x);\n"
-                       "    vec2 o = vec2(m, 1.0 - m);\n"
-                       "    vec2 b = a - o + K2;\n"
-                       "    vec2 c = a - 1.0 + 2.0 * K2;\n"
-                       "    vec3 h = max(0.5 - vec3(dot(a, a), dot(b, b), dot(c, c)), 0.0);\n"
-                       "    vec3 n = h * h * h * h * vec3(dot(a, vec2(wwal_hash21(i) - 0.5, "
-                       "wwal_hash21(i + 13.0) - 0.5)),\n"
-                       "                                  dot(b, vec2(wwal_hash21(i + o) - 0.5, "
-                       "wwal_hash21(i + o + 13.0) - 0.5)),\n"
-                       "                                  dot(c, vec2(wwal_hash21(i + 1.0) - 0.5, "
-                       "wwal_hash21(i + 14.0) - 0.5)));\n"
-                       "    return dot(n, vec3(70.0));\n"
-                       "}\n\n");
+        ab_append_lit(sb,
+                      "float wwal_simplex2d(vec2 p) {\n"
+                      "    const float K1 = 0.366025404;\n"
+                      "    const float K2 = 0.211324865;\n"
+                      "    vec2 i = floor(p + (p.x + p.y) * K1);\n"
+                      "    vec2 a = p - i + (i.x + i.y) * K2;\n"
+                      "    float m = step(a.y, a.x);\n"
+                      "    vec2 o = vec2(m, 1.0 - m);\n"
+                      "    vec2 b = a - o + K2;\n"
+                      "    vec2 c = a - 1.0 + 2.0 * K2;\n"
+                      "    vec3 h = max(0.5 - vec3(dot(a, a), dot(b, b), dot(c, c)), 0.0);\n"
+                      "    vec3 n = h * h * h * h * vec3(dot(a, vec2(wwal_hash21(i) - 0.5, "
+                      "wwal_hash21(i + 13.0) - 0.5)),\n"
+                      "                                  dot(b, vec2(wwal_hash21(i + o) - 0.5, "
+                      "wwal_hash21(i + o + 13.0) - 0.5)),\n"
+                      "                                  dot(c, vec2(wwal_hash21(i + 1.0) - 0.5, "
+                      "wwal_hash21(i + 14.0) - 0.5)));\n"
+                      "    return dot(n, vec3(70.0));\n"
+                      "}\n\n");
     }
     if (helper_mask & WWAL_HLP_CURL2D) {
-        str_buf_append(sb, "vec2 wwal_curl2d(vec2 p, float t) {\n"
-                           "    const float eps = 0.005;\n"
-                           "    float n1 = wwal_simplex2d(p + vec2(0.0, eps) + vec2(t * 0.1));\n"
-                           "    float n2 = wwal_simplex2d(p - vec2(0.0, eps) + vec2(t * 0.1));\n"
-                           "    float n3 = wwal_simplex2d(p + vec2(eps, 0.0) + vec2(t * 0.1));\n"
-                           "    float n4 = wwal_simplex2d(p - vec2(eps, 0.0) + vec2(t * 0.1));\n"
-                           "    float dy = (n1 - n2) / (2.0 * eps);\n"
-                           "    float dx = (n3 - n4) / (2.0 * eps);\n"
-                           "    return vec2(-dy, dx);\n"
-                           "}\n\n");
+        ab_append_lit(sb, "vec2 wwal_curl2d(vec2 p, float t) {\n"
+                          "    const float eps = 0.005;\n"
+                          "    float n1 = wwal_simplex2d(p + vec2(0.0, eps) + vec2(t * 0.1));\n"
+                          "    float n2 = wwal_simplex2d(p - vec2(0.0, eps) + vec2(t * 0.1));\n"
+                          "    float n3 = wwal_simplex2d(p + vec2(eps, 0.0) + vec2(t * 0.1));\n"
+                          "    float n4 = wwal_simplex2d(p - vec2(eps, 0.0) + vec2(t * 0.1));\n"
+                          "    float dy = (n1 - n2) / (2.0 * eps);\n"
+                          "    float dx = (n3 - n4) / (2.0 * eps);\n"
+                          "    return vec2(-dy, dx);\n"
+                          "}\n\n");
     }
     if (helper_mask & WWAL_HLP_VORONOI2D) {
-        str_buf_append(sb,
-                       "vec2 wwal_voronoi2d(vec2 p) {\n"
-                       "    vec2 n = floor(p);\n"
-                       "    vec2 f = fract(p);\n"
-                       "    float m_dist = 8.0;\n"
-                       "    vec2 m_point = vec2(0.0);\n"
-                       "    for (int j = -1; j <= 1; ++j) {\n"
-                       "        for (int i = -1; i <= 1; ++i) {\n"
-                       "            vec2 g = vec2(float(i), float(j));\n"
-                       "            vec2 o = vec2(wwal_hash21(n + g), wwal_hash21(n + g + 17.0));\n"
-                       "            vec2 diff = g + o - f;\n"
-                       "            float d = dot(diff, diff);\n"
-                       "            if (d < m_dist) {\n"
-                       "                m_dist = d;\n"
-                       "                m_point = n + g;\n"
-                       "            }\n"
-                       "        }\n"
-                       "    }\n"
-                       "    return vec2(sqrt(m_dist), length(m_point));\n"
-                       "}\n\n");
+        ab_append_lit(sb,
+                      "vec2 wwal_voronoi2d(vec2 p) {\n"
+                      "    vec2 n = floor(p);\n"
+                      "    vec2 f = fract(p);\n"
+                      "    float m_dist = 8.0;\n"
+                      "    vec2 m_point = vec2(0.0);\n"
+                      "    for (int j = -1; j <= 1; ++j) {\n"
+                      "        for (int i = -1; i <= 1; ++i) {\n"
+                      "            vec2 g = vec2(float(i), float(j));\n"
+                      "            vec2 o = vec2(wwal_hash21(n + g), wwal_hash21(n + g + 17.0));\n"
+                      "            vec2 diff = g + o - f;\n"
+                      "            float d = dot(diff, diff);\n"
+                      "            if (d < m_dist) {\n"
+                      "                m_dist = d;\n"
+                      "                m_point = n + g;\n"
+                      "            }\n"
+                      "        }\n"
+                      "    }\n"
+                      "    return vec2(sqrt(m_dist), length(m_point));\n"
+                      "}\n\n");
     }
     if (helper_mask & WWAL_HLP_FBM2D) {
-        str_buf_append(sb, "float wwal_fbm2d(vec2 p, int octaves, float lacunarity) {\n"
-                           "    float val = 0.0;\n"
-                           "    float amp = 0.5;\n"
-                           "    float freq = 1.0;\n"
-                           "    for (int i = 0; i < octaves && i < 8; ++i) {\n"
-                           "        val += amp * wwal_simplex2d(p * freq);\n"
-                           "        freq *= lacunarity;\n"
-                           "        amp *= 0.5;\n"
-                           "    }\n"
-                           "    return val;\n"
-                           "}\n\n");
+        ab_append_lit(sb, "float wwal_fbm2d(vec2 p, int octaves, float lacunarity) {\n"
+                          "    float val = 0.0;\n"
+                          "    float amp = 0.5;\n"
+                          "    float freq = 1.0;\n"
+                          "    for (int i = 0; i < octaves && i < 8; ++i) {\n"
+                          "        val += amp * wwal_simplex2d(p * freq);\n"
+                          "        freq *= lacunarity;\n"
+                          "        amp *= 0.5;\n"
+                          "    }\n"
+                          "    return val;\n"
+                          "}\n\n");
     }
     if (helper_mask & WWAL_HLP_SDF_BOX) {
-        str_buf_append(sb, "float wwal_sdf_box(vec2 p, vec2 b) {\n"
-                           "    vec2 d = abs(p) - b;\n"
-                           "    return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);\n"
-                           "}\n\n");
+        ab_append_lit(sb, "float wwal_sdf_box(vec2 p, vec2 b) {\n"
+                          "    vec2 d = abs(p) - b;\n"
+                          "    return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);\n"
+                          "}\n\n");
     }
     if (helper_mask & WWAL_HLP_UV_POLAR) {
-        str_buf_append(sb, "vec2 wwal_uv_polar(vec2 uv, vec2 center) {\n"
-                           "    vec2 d = uv - center;\n"
-                           "    float r = length(d);\n"
-                           "    float a = atan(d.y, d.x) / 6.28318530718 + 0.5;\n"
-                           "    return vec2(a, r);\n"
-                           "}\n\n");
+        ab_append_lit(sb, "vec2 wwal_uv_polar(vec2 uv, vec2 center) {\n"
+                          "    vec2 d = uv - center;\n"
+                          "    float r = length(d);\n"
+                          "    float a = atan(d.y, d.x) / 6.28318530718 + 0.5;\n"
+                          "    return vec2(a, r);\n"
+                          "}\n\n");
     }
     if (helper_mask & WWAL_HLP_UV_TWIRL) {
-        str_buf_append(sb,
-                       "vec2 wwal_uv_twirl(vec2 uv, vec2 center, float strength, float radius) {\n"
-                       "    vec2 d = uv - center;\n"
-                       "    float dist = length(d);\n"
-                       "    float r_safe = max(radius, 1e-4);\n"
-                       "    if (dist < r_safe) {\n"
-                       "        float percent = (r_safe - dist) / r_safe;\n"
-                       "        float theta = percent * percent * strength;\n"
-                       "        float s = sin(theta), c = cos(theta);\n"
-                       "        d = vec2(dot(d, vec2(c, -s)), dot(d, vec2(s, c)));\n"
-                       "    }\n"
-                       "    return center + d;\n"
-                       "}\n\n");
+        ab_append_lit(sb,
+                      "vec2 wwal_uv_twirl(vec2 uv, vec2 center, float strength, float radius) {\n"
+                      "    vec2 d = uv - center;\n"
+                      "    float dist = length(d);\n"
+                      "    float r_safe = max(radius, 1e-4);\n"
+                      "    if (dist < r_safe) {\n"
+                      "        float percent = (r_safe - dist) / r_safe;\n"
+                      "        float theta = percent * percent * strength;\n"
+                      "        float s = sin(theta), c = cos(theta);\n"
+                      "        d = vec2(dot(d, vec2(c, -s)), dot(d, vec2(s, c)));\n"
+                      "    }\n"
+                      "    return center + d;\n"
+                      "}\n\n");
     }
     if (helper_mask & WWAL_HLP_HUE_SHIFT) {
-        str_buf_append(sb, "vec4 wwal_hue_shift(vec4 col, float shift) {\n"
-                           "    vec3 oklch = wwal_srgb_to_oklch(col);\n"
-                           "    oklch.z += shift;\n"
-                           "    return vec4(wwal_oklch_to_srgb(vec4(oklch, 1.0)), col.a);\n"
-                           "}\n\n");
+        ab_append_lit(sb, "vec4 wwal_hue_shift(vec4 col, float shift) {\n"
+                          "    vec3 oklch = wwal_srgb_to_oklch(col);\n"
+                          "    oklch.z += shift;\n"
+                          "    return vec4(wwal_oklch_to_srgb(vec4(oklch, 1.0)), col.a);\n"
+                          "}\n\n");
     }
     if (helper_mask & WWAL_HLP_CONTRAST_SAT) {
-        str_buf_append(sb, "vec4 wwal_contrast_saturation(vec4 col, float c, float s) {\n"
-                           "    vec3 rgb = (col.rgb - 0.5) * c + 0.5;\n"
-                           "    float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));\n"
-                           "    rgb = mix(vec3(luma), rgb, s);\n"
-                           "    return vec4(clamp(rgb, 0.0, 1.0), col.a);\n"
-                           "}\n\n");
+        ab_append_lit(sb, "vec4 wwal_contrast_saturation(vec4 col, float c, float s) {\n"
+                          "    vec3 rgb = (col.rgb - 0.5) * c + 0.5;\n"
+                          "    float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));\n"
+                          "    rgb = mix(vec3(luma), rgb, s);\n"
+                          "    return vec4(clamp(rgb, 0.0, 1.0), col.a);\n"
+                          "}\n\n");
     }
     if (helper_mask & WWAL_HLP_DUAL_KAWASE) {
-        str_buf_append(
+        ab_append_lit(
             sb, "vec4 wwal_dual_kawase(sampler2D tex, vec2 uv, float offset) {\n"
                 "    vec2 halfpixel = max(offset, 0.0) / max(u_Resolution, vec2(1.0));\n"
                 "    vec4 sum = texture(tex, uv) * 4.0;\n"
@@ -2053,17 +2876,17 @@ static void emit_glsl_helpers(str_buf_t *sb, uint32_t helper_mask)
                 "}\n\n");
     }
     if (helper_mask & WWAL_HLP_CHROMATIC_ABERR) {
-        str_buf_append(sb,
-                       "vec4 wwal_chromatic_aberration(sampler2D tex, vec2 uv, float intensity) {\n"
-                       "    vec2 dir = (uv - vec2(0.5)) * intensity;\n"
-                       "    float r = texture(tex, clamp(uv + dir, vec2(0.0), vec2(1.0))).r;\n"
-                       "    vec4 center = texture(tex, uv);\n"
-                       "    float b = texture(tex, clamp(uv - dir, vec2(0.0), vec2(1.0))).b;\n"
-                       "    return vec4(r, center.g, b, center.a);\n"
-                       "}\n\n");
+        ab_append_lit(sb,
+                      "vec4 wwal_chromatic_aberration(sampler2D tex, vec2 uv, float intensity) {\n"
+                      "    vec2 dir = (uv - vec2(0.5)) * intensity;\n"
+                      "    float r = texture(tex, clamp(uv + dir, vec2(0.0), vec2(1.0))).r;\n"
+                      "    vec4 center = texture(tex, uv);\n"
+                      "    float b = texture(tex, clamp(uv - dir, vec2(0.0), vec2(1.0))).b;\n"
+                      "    return vec4(r, center.g, b, center.a);\n"
+                      "}\n\n");
     }
     if (helper_mask & WWAL_HLP_NORMAL_HEIGHT_TEX) {
-        str_buf_append(
+        ab_append_lit(
             sb, "vec3 wwal_normal_from_height_tex(sampler2D tex, vec2 uv, float strength) {\n"
                 "    vec2 texel = 1.0 / max(u_Resolution, vec2(1.0));\n"
                 "    float hL = texture(tex, uv - vec2(texel.x, 0.0)).x;\n"
@@ -2074,14 +2897,14 @@ static void emit_glsl_helpers(str_buf_t *sb, uint32_t helper_mask)
                 "}\n\n");
     }
     if (helper_mask & WWAL_HLP_NORMAL_HEIGHT) {
-        str_buf_append(sb, "vec3 wwal_normal_from_height(float h, vec2 uv, float strength) {\n"
-                           "    float dx = dFdx(h + uv.x * 0.0) * strength;\n"
-                           "    float dy = dFdy(h + uv.y * 0.0) * strength;\n"
-                           "    return normalize(vec3(-dx, -dy, 1.0));\n"
-                           "}\n\n");
+        ab_append_lit(sb, "vec3 wwal_normal_from_height(float h, vec2 uv, float strength) {\n"
+                          "    float dx = dFdx(h + uv.x * 0.0) * strength;\n"
+                          "    float dy = dFdy(h + uv.y * 0.0) * strength;\n"
+                          "    return normalize(vec3(-dx, -dy, 1.0));\n"
+                          "}\n\n");
     }
     if (helper_mask & WWAL_HLP_BLINN_PHONG) {
-        str_buf_append(
+        ab_append_lit(
             sb, "vec4 wwal_blinn_phong(vec3 n, vec3 l, vec3 v, vec4 albedo, float shininess) {\n"
                 "    vec3 nn = normalize(n);\n"
                 "    vec3 nl = normalize(l);\n"
@@ -2094,7 +2917,7 @@ static void emit_glsl_helpers(str_buf_t *sb, uint32_t helper_mask)
                 "}\n\n");
     }
     if (helper_mask & WWAL_HLP_FX_WATERRIPPLE) {
-        str_buf_append(
+        ab_append_lit(
             sb,
             "vec4 wwal_effect_waterripple(sampler2D tex, vec2 uv_base, vec2 uv_in, float speed, "
             "float amp, float freq) {\n"
@@ -2110,7 +2933,7 @@ static void emit_glsl_helpers(str_buf_t *sb, uint32_t helper_mask)
             "}\n\n");
     }
     if (helper_mask & WWAL_HLP_FX_WATERWAVES) {
-        str_buf_append(
+        ab_append_lit(
             sb,
             "vec4 wwal_effect_waterwaves(sampler2D tex, vec2 uv, float speed, float amp, float "
             "freq) {\n"
@@ -2123,7 +2946,7 @@ static void emit_glsl_helpers(str_buf_t *sb, uint32_t helper_mask)
             "}\n\n");
     }
     if (helper_mask & WWAL_HLP_FX_CAS_SHARPEN) {
-        str_buf_append(
+        ab_append_lit(
             sb,
             "vec4 wwal_effect_cas_sharpen(sampler2D tex, vec2 uv, float sharpness) {\n"
             "    vec2 texel = 1.0 / max(u_Resolution, vec2(1.0));\n"
@@ -2142,7 +2965,7 @@ static void emit_glsl_helpers(str_buf_t *sb, uint32_t helper_mask)
             "}\n\n");
     }
     if (helper_mask & WWAL_HLP_FX_VIGNETTE) {
-        str_buf_append(
+        ab_append_lit(
             sb,
             "vec4 wwal_effect_vignette(sampler2D tex, vec2 uv, float radius, float softness) {\n"
             "    vec4 c = texture(tex, uv);\n"
@@ -2156,7 +2979,7 @@ static void emit_glsl_helpers(str_buf_t *sb, uint32_t helper_mask)
             "}\n\n");
     }
     if (helper_mask & WWAL_HLP_FX_CRT_PIXELATE) {
-        str_buf_append(
+        ab_append_lit(
             sb, "vec4 wwal_effect_crt_pixelate(sampler2D tex, vec2 uv, float density, float "
                 "scan_strength) {\n"
                 "    float cells = max(density, 64.0);\n"
@@ -2168,7 +2991,7 @@ static void emit_glsl_helpers(str_buf_t *sb, uint32_t helper_mask)
                 "}\n\n");
     }
     if (helper_mask & WWAL_HLP_FX_GODRAYS) {
-        str_buf_append(
+        ab_append_lit(
             sb, "vec4 wwal_effect_godrays(sampler2D tex, vec2 uv, float intensity, float decay) {\n"
                 "    vec2 delta = (uv - vec2(0.5)) * 0.12;\n"
                 "    vec2 cur = uv;\n"
@@ -2201,97 +3024,144 @@ static uint32_t pin_lane_count(uint32_t pin_type)
     }
 }
 
-static void coerce_glsl_expr(uint32_t src_type, uint32_t dst_type, const char *raw_var,
-                             char *out_expr, size_t out_cap)
+static size_t coerce_glsl_expr_fast(uint32_t src_type, uint32_t dst_type, const char *raw_var,
+                                    size_t raw_len, char *out_expr, size_t out_cap)
 {
     uint32_t s_norm = (src_type == WAYWAL_PIN_AUDIO_SPECTRUM) ? WAYWAL_PIN_VEC4 : src_type;
     uint32_t d_norm = (dst_type == WAYWAL_PIN_AUDIO_SPECTRUM) ? WAYWAL_PIN_VEC4 : dst_type;
 
+    stack_writer_t w = {.data = out_expr, .len = 0u, .cap = out_cap};
     if (s_norm == d_norm) {
-        snprintf(out_expr, out_cap, "%s", raw_var);
-        return;
+        sw_append_n(&w, raw_var, raw_len);
+        out_expr[w.len] = '\0';
+        return w.len;
     }
 
     switch (d_norm) {
     case WAYWAL_PIN_FLOAT:
-        if (s_norm == WAYWAL_PIN_INT)
-            snprintf(out_expr, out_cap, "float(%s)", raw_var);
-        else if (s_norm == WAYWAL_PIN_BOOL)
-            snprintf(out_expr, out_cap, "(%s ? 1.0 : 0.0)", raw_var);
-        else
-            snprintf(out_expr, out_cap, "(%s).x", raw_var);
-        return;
-
+        if (s_norm == WAYWAL_PIN_INT) {
+            sw_append_lit(&w, "float(");
+            sw_append_n(&w, raw_var, raw_len);
+            sw_append_lit(&w, ")");
+        } else if (s_norm == WAYWAL_PIN_BOOL) {
+            sw_append_lit(&w, "(");
+            sw_append_n(&w, raw_var, raw_len);
+            sw_append_lit(&w, " ? 1.0 : 0.0)");
+        } else {
+            sw_append_lit(&w, "(");
+            sw_append_n(&w, raw_var, raw_len);
+            sw_append_lit(&w, ").x");
+        }
+        break;
     case WAYWAL_PIN_INT:
-        if (s_norm == WAYWAL_PIN_FLOAT)
-            snprintf(out_expr, out_cap, "int(%s)", raw_var);
-        else if (s_norm == WAYWAL_PIN_BOOL)
-            snprintf(out_expr, out_cap, "(%s ? 1 : 0)", raw_var);
-        else
-            snprintf(out_expr, out_cap, "int((%s).x)", raw_var);
-        return;
-
+        if (s_norm == WAYWAL_PIN_FLOAT) {
+            sw_append_lit(&w, "int(");
+            sw_append_n(&w, raw_var, raw_len);
+            sw_append_lit(&w, ")");
+        } else if (s_norm == WAYWAL_PIN_BOOL) {
+            sw_append_lit(&w, "(");
+            sw_append_n(&w, raw_var, raw_len);
+            sw_append_lit(&w, " ? 1 : 0)");
+        } else {
+            sw_append_lit(&w, "int((");
+            sw_append_n(&w, raw_var, raw_len);
+            sw_append_lit(&w, ").x)");
+        }
+        break;
     case WAYWAL_PIN_BOOL:
-        if (s_norm == WAYWAL_PIN_INT)
-            snprintf(out_expr, out_cap, "((%s) != 0)", raw_var);
-        else if (s_norm == WAYWAL_PIN_FLOAT)
-            snprintf(out_expr, out_cap, "((%s) != 0.0)", raw_var);
-        else
-            snprintf(out_expr, out_cap, "((%s).x != 0.0)", raw_var);
-        return;
-
+        sw_append_lit(&w, "((");
+        sw_append_n(&w, raw_var, raw_len);
+        if (s_norm == WAYWAL_PIN_INT) {
+            sw_append_lit(&w, ") != 0)");
+        } else if (s_norm == WAYWAL_PIN_FLOAT) {
+            sw_append_lit(&w, ") != 0.0)");
+        } else {
+            sw_append_lit(&w, ").x != 0.0)");
+        }
+        break;
     case WAYWAL_PIN_VEC2:
-        if (s_norm == WAYWAL_PIN_FLOAT)
-            snprintf(out_expr, out_cap, "vec2(%s)", raw_var);
-        else if (s_norm == WAYWAL_PIN_INT)
-            snprintf(out_expr, out_cap, "vec2(float(%s))", raw_var);
-        else if (s_norm == WAYWAL_PIN_BOOL)
-            snprintf(out_expr, out_cap, "vec2(%s ? 1.0 : 0.0)", raw_var);
-        else
-            snprintf(out_expr, out_cap, "(%s).xy", raw_var);
-        return;
-
+        if (s_norm == WAYWAL_PIN_FLOAT) {
+            sw_append_lit(&w, "vec2(");
+            sw_append_n(&w, raw_var, raw_len);
+            sw_append_lit(&w, ")");
+        } else if (s_norm == WAYWAL_PIN_INT) {
+            sw_append_lit(&w, "vec2(float(");
+            sw_append_n(&w, raw_var, raw_len);
+            sw_append_lit(&w, "))");
+        } else if (s_norm == WAYWAL_PIN_BOOL) {
+            sw_append_lit(&w, "vec2(");
+            sw_append_n(&w, raw_var, raw_len);
+            sw_append_lit(&w, " ? 1.0 : 0.0)");
+        } else {
+            sw_append_lit(&w, "(");
+            sw_append_n(&w, raw_var, raw_len);
+            sw_append_lit(&w, ").xy");
+        }
+        break;
     case WAYWAL_PIN_VEC3:
-        if (s_norm == WAYWAL_PIN_FLOAT)
-            snprintf(out_expr, out_cap, "vec3(%s)", raw_var);
-        else if (s_norm == WAYWAL_PIN_INT)
-            snprintf(out_expr, out_cap, "vec3(float(%s))", raw_var);
-        else if (s_norm == WAYWAL_PIN_BOOL)
-            snprintf(out_expr, out_cap, "vec3(%s ? 1.0 : 0.0)", raw_var);
-        else if (s_norm == WAYWAL_PIN_VEC2)
-            snprintf(out_expr, out_cap, "vec3(%s, 0.0)", raw_var);
-        else
-            snprintf(out_expr, out_cap, "(%s).xyz", raw_var);
-        return;
-
+        if (s_norm == WAYWAL_PIN_FLOAT) {
+            sw_append_lit(&w, "vec3(");
+            sw_append_n(&w, raw_var, raw_len);
+            sw_append_lit(&w, ")");
+        } else if (s_norm == WAYWAL_PIN_INT) {
+            sw_append_lit(&w, "vec3(float(");
+            sw_append_n(&w, raw_var, raw_len);
+            sw_append_lit(&w, "))");
+        } else if (s_norm == WAYWAL_PIN_BOOL) {
+            sw_append_lit(&w, "vec3(");
+            sw_append_n(&w, raw_var, raw_len);
+            sw_append_lit(&w, " ? 1.0 : 0.0)");
+        } else if (s_norm == WAYWAL_PIN_VEC2) {
+            sw_append_lit(&w, "vec3(");
+            sw_append_n(&w, raw_var, raw_len);
+            sw_append_lit(&w, ", 0.0)");
+        } else {
+            sw_append_lit(&w, "(");
+            sw_append_n(&w, raw_var, raw_len);
+            sw_append_lit(&w, ").xyz");
+        }
+        break;
     case WAYWAL_PIN_VEC4:
-        if (s_norm == WAYWAL_PIN_FLOAT)
-            snprintf(out_expr, out_cap, "vec4(vec3(%s), 1.0)", raw_var);
-        else if (s_norm == WAYWAL_PIN_INT)
-            snprintf(out_expr, out_cap, "vec4(vec3(float(%s)), 1.0)", raw_var);
-        else if (s_norm == WAYWAL_PIN_BOOL)
-            snprintf(out_expr, out_cap, "vec4(vec3(%s ? 1.0 : 0.0), 1.0)", raw_var);
-        else if (s_norm == WAYWAL_PIN_VEC2)
-            snprintf(out_expr, out_cap, "vec4(%s, 0.0, 1.0)", raw_var);
-        else
-            snprintf(out_expr, out_cap, "vec4(%s, 1.0)", raw_var);
-        return;
-
+        if (s_norm == WAYWAL_PIN_FLOAT) {
+            sw_append_lit(&w, "vec4(vec3(");
+            sw_append_n(&w, raw_var, raw_len);
+            sw_append_lit(&w, "), 1.0)");
+        } else if (s_norm == WAYWAL_PIN_INT) {
+            sw_append_lit(&w, "vec4(vec3(float(");
+            sw_append_n(&w, raw_var, raw_len);
+            sw_append_lit(&w, ")), 1.0)");
+        } else if (s_norm == WAYWAL_PIN_BOOL) {
+            sw_append_lit(&w, "vec4(vec3(");
+            sw_append_n(&w, raw_var, raw_len);
+            sw_append_lit(&w, " ? 1.0 : 0.0), 1.0)");
+        } else if (s_norm == WAYWAL_PIN_VEC2) {
+            sw_append_lit(&w, "vec4(");
+            sw_append_n(&w, raw_var, raw_len);
+            sw_append_lit(&w, ", 0.0, 1.0)");
+        } else {
+            sw_append_lit(&w, "vec4(");
+            sw_append_n(&w, raw_var, raw_len);
+            sw_append_lit(&w, ", 1.0)");
+        }
+        break;
     default:
-        snprintf(out_expr, out_cap, "%s", raw_var);
-        return;
+        sw_append_n(&w, raw_var, raw_len);
+        break;
     }
+    out_expr[w.len] = '\0';
+    return w.len;
 }
 
-static void format_operand_typed_adj(const waywal_shader_graph_t *graph, const graph_adj_t *adj,
-                                     const uint32_t *node_pass, const bool *emitted_in_pass,
-                                     uint32_t dst_idx, uint32_t pin_idx, uint32_t dst_type,
-                                     char *out_expr, size_t out_cap)
+static size_t format_operand_typed_fast(const waywal_shader_graph_t *graph, const graph_adj_t *adj,
+                                        const uint32_t *node_pass, const bool *emitted_in_pass,
+                                        const uint16_t *canon_idx, uint32_t dst_idx,
+                                        uint32_t pin_idx, uint32_t dst_type, char *out_expr,
+                                        size_t out_cap)
 {
     const waywal_graph_node_t *dst_node = &graph->nodes[dst_idx];
     if (pin_idx >= dst_node->input_pin_count || pin_idx >= WAYWAL_GRAPH_MAX_PINS_PER_NODE) {
-        snprintf(out_expr, out_cap, "0.0");
-        return;
+        memcpy(out_expr, "0.0", 4u);
+        return 3u;
     }
 
     const waywal_graph_pin_t *dst_pin = &dst_node->inputs[pin_idx];
@@ -2305,6 +3175,7 @@ static void format_operand_typed_adj(const waywal_shader_graph_t *graph, const g
             if (incoming_edge->src_pin_index < src_node->output_pin_count) {
                 uint32_t src_type = src_node->outputs[incoming_edge->src_pin_index].pin_type;
                 char raw_var[80];
+                stack_writer_t rw = {.data = raw_var, .len = 0u, .cap = sizeof(raw_var)};
 
                 if (node_pass[s_idx] != node_pass[dst_idx] || !emitted_in_pass[s_idx]) {
                     const char *buf_name =
@@ -2312,100 +3183,129 @@ static void format_operand_typed_adj(const waywal_shader_graph_t *graph, const g
                                                         ? src_node->prop_or_asset_key
                                                         : NULL,
                                                     node_pass[s_idx]);
-                    snprintf(raw_var, sizeof(raw_var), "texture(%s, v_TexCoord)", buf_name);
+                    sw_append_lit(&rw, "texture(");
+                    sw_append_n(&rw, buf_name, strlen(buf_name));
+                    sw_append_lit(&rw, ", v_TexCoord)");
                     src_type = WAYWAL_PIN_VEC4;
                 } else {
-                    snprintf(raw_var, sizeof(raw_var), "n%u_out%u", incoming_edge->src_node_id,
-                             incoming_edge->src_pin_index);
+                    uint16_t real_s = canon_idx[s_idx];
+                    sw_append_lit(&rw, "n");
+                    sw_append_u32(&rw, graph->nodes[real_s].node_id);
+                    sw_append_lit(&rw, "_out");
+                    sw_append_u32(&rw, incoming_edge->src_pin_index);
                 }
+                raw_var[rw.len] = '\0';
 
                 uint32_t src_lanes = pin_lane_count(src_type);
                 if (incoming_edge->swizzle_mask != 0u && src_lanes >= 2u) {
                     static const char k_swz_chars[4] = {'x', 'y', 'z', 'w'};
                     uint32_t swz_lanes = pin_lane_count(dst_type);
-                    char swz[5];
+                    char swizzled_var[96];
+                    stack_writer_t swz_w = {
+                        .data = swizzled_var, .len = 0u, .cap = sizeof(swizzled_var)};
+                    sw_append_lit(&swz_w, "(");
+                    sw_append_n(&swz_w, raw_var, rw.len);
+                    sw_append_lit(&swz_w, ").");
                     for (uint32_t i = 0; i < swz_lanes; ++i) {
                         uint32_t lane = (incoming_edge->swizzle_mask >> (i * 2u)) & 3u;
                         if (lane >= src_lanes)
                             lane = src_lanes - 1u;
-                        swz[i] = k_swz_chars[lane];
+                        sw_append_n(&swz_w, &k_swz_chars[lane], 1u);
                     }
-                    swz[swz_lanes] = '\0';
-                    char swizzled_var[96];
-                    snprintf(swizzled_var, sizeof(swizzled_var), "(%s).%s", raw_var, swz);
+                    swizzled_var[swz_w.len] = '\0';
                     uint32_t swz_type = (swz_lanes == 1u)   ? WAYWAL_PIN_FLOAT
                                         : (swz_lanes == 2u) ? WAYWAL_PIN_VEC2
                                         : (swz_lanes == 3u) ? WAYWAL_PIN_VEC3
                                                             : WAYWAL_PIN_VEC4;
-                    coerce_glsl_expr(swz_type, dst_type, swizzled_var, out_expr, out_cap);
-                } else {
-                    coerce_glsl_expr(src_type, dst_type, raw_var, out_expr, out_cap);
+                    return coerce_glsl_expr_fast(swz_type, dst_type, swizzled_var, swz_w.len,
+                                                 out_expr, out_cap);
                 }
-                return;
+                return coerce_glsl_expr_fast(src_type, dst_type, raw_var, rw.len, out_expr,
+                                             out_cap);
             }
         }
     }
 
-    char def_expr[80];
+    char def_expr[128];
+    stack_writer_t dw = {.data = def_expr, .len = 0u, .cap = sizeof(def_expr)};
     switch (dst_pin->pin_type) {
     case WAYWAL_PIN_FLOAT:
-        snprintf(def_expr, sizeof(def_expr), "%.6f", finite_or_zero(dst_pin->default_val[0]));
+        sw_append_f32(&dw, finite_or_zero(dst_pin->default_val[0]));
         break;
     case WAYWAL_PIN_VEC2:
         if (dst_node->opcode == WAYWAL_NODE_IN_TEXTURE2D ||
             dst_node->opcode == WAYWAL_NODE_IN_PASS_BUFFER ||
             dst_node->opcode == WAYWAL_NODE_IN_DEPTH_MAP || strcasecmp(dst_pin->name, "uv") == 0) {
-            snprintf(def_expr, sizeof(def_expr), "v_TexCoord");
+            sw_append_lit(&dw, "v_TexCoord");
         } else {
-            snprintf(def_expr, sizeof(def_expr), "vec2(%.6f, %.6f)",
-                     finite_or_zero(dst_pin->default_val[0]),
-                     finite_or_zero(dst_pin->default_val[1]));
+            sw_append_lit(&dw, "vec2(");
+            sw_append_f32(&dw, finite_or_zero(dst_pin->default_val[0]));
+            sw_append_lit(&dw, ", ");
+            sw_append_f32(&dw, finite_or_zero(dst_pin->default_val[1]));
+            sw_append_lit(&dw, ")");
         }
         break;
     case WAYWAL_PIN_VEC3:
-        snprintf(def_expr, sizeof(def_expr), "vec3(%.6f, %.6f, %.6f)",
-                 finite_or_zero(dst_pin->default_val[0]), finite_or_zero(dst_pin->default_val[1]),
-                 finite_or_zero(dst_pin->default_val[2]));
+        sw_append_lit(&dw, "vec3(");
+        sw_append_f32(&dw, finite_or_zero(dst_pin->default_val[0]));
+        sw_append_lit(&dw, ", ");
+        sw_append_f32(&dw, finite_or_zero(dst_pin->default_val[1]));
+        sw_append_lit(&dw, ", ");
+        sw_append_f32(&dw, finite_or_zero(dst_pin->default_val[2]));
+        sw_append_lit(&dw, ")");
         break;
     case WAYWAL_PIN_VEC4:
     case WAYWAL_PIN_AUDIO_SPECTRUM:
-        snprintf(def_expr, sizeof(def_expr), "vec4(%.6f, %.6f, %.6f, %.6f)",
-                 finite_or_zero(dst_pin->default_val[0]), finite_or_zero(dst_pin->default_val[1]),
-                 finite_or_zero(dst_pin->default_val[2]), finite_or_zero(dst_pin->default_val[3]));
+        sw_append_lit(&dw, "vec4(");
+        sw_append_f32(&dw, finite_or_zero(dst_pin->default_val[0]));
+        sw_append_lit(&dw, ", ");
+        sw_append_f32(&dw, finite_or_zero(dst_pin->default_val[1]));
+        sw_append_lit(&dw, ", ");
+        sw_append_f32(&dw, finite_or_zero(dst_pin->default_val[2]));
+        sw_append_lit(&dw, ", ");
+        sw_append_f32(&dw, finite_or_zero(dst_pin->default_val[3]));
+        sw_append_lit(&dw, ")");
         break;
     case WAYWAL_PIN_INT:
-        snprintf(def_expr, sizeof(def_expr), "%d", (int)safe_f32_to_i32(dst_pin->default_val[0]));
+        sw_append_i32(&dw, safe_f32_to_i32(dst_pin->default_val[0]));
         break;
     case WAYWAL_PIN_BOOL:
-        snprintf(def_expr, sizeof(def_expr), "%s",
-                 (finite_or_zero(dst_pin->default_val[0]) != 0.0f) ? "true" : "false");
+        if (finite_or_zero(dst_pin->default_val[0]) != 0.0f) {
+            sw_append_lit(&dw, "true");
+        } else {
+            sw_append_lit(&dw, "false");
+        }
         break;
     case WAYWAL_PIN_SAMPLER2D:
-        snprintf(out_expr, out_cap, "u_BufferA");
-        return;
+        memcpy(out_expr, "u_BufferA", 10u);
+        return 9u;
     default:
-        snprintf(out_expr, out_cap, "0.0");
-        return;
+        memcpy(out_expr, "0.0", 4u);
+        return 3u;
     }
-    coerce_glsl_expr(dst_pin->pin_type, dst_type, def_expr, out_expr, out_cap);
+    def_expr[dw.len] = '\0';
+    return coerce_glsl_expr_fast(dst_pin->pin_type, dst_type, def_expr, dw.len, out_expr, out_cap);
 }
 
-static void format_operand_adj(const waywal_shader_graph_t *graph, const graph_adj_t *adj,
-                               const uint32_t *node_pass, const bool *emitted_in_pass,
-                               uint32_t dst_idx, uint32_t pin_idx, char *out_expr, size_t out_cap)
+static size_t format_operand_fast(const waywal_shader_graph_t *graph, const graph_adj_t *adj,
+                                  const uint32_t *node_pass, const bool *emitted_in_pass,
+                                  const uint16_t *canon_idx, uint32_t dst_idx, uint32_t pin_idx,
+                                  char *out_expr, size_t out_cap)
 {
     const waywal_graph_node_t *dst_node = &graph->nodes[dst_idx];
     if (pin_idx >= dst_node->input_pin_count || pin_idx >= WAYWAL_GRAPH_MAX_PINS_PER_NODE) {
-        snprintf(out_expr, out_cap, "0.0");
-        return;
+        memcpy(out_expr, "0.0", 4u);
+        return 3u;
     }
-    format_operand_typed_adj(graph, adj, node_pass, emitted_in_pass, dst_idx, pin_idx,
-                             dst_node->inputs[pin_idx].pin_type, out_expr, out_cap);
+    return format_operand_typed_fast(graph, adj, node_pass, emitted_in_pass, canon_idx, dst_idx,
+                                     pin_idx, dst_node->inputs[pin_idx].pin_type, out_expr,
+                                     out_cap);
 }
 
-static void emit_muted_bypass_node(str_buf_t *sb, const waywal_shader_graph_t *graph,
+static void emit_muted_bypass_node(arena_str_t *sb, const waywal_shader_graph_t *graph,
                                    const graph_adj_t *adj, const uint32_t *node_pass,
-                                   const bool *emitted_in_pass, uint32_t idx)
+                                   const bool *emitted_in_pass, const uint16_t *canon_idx,
+                                   uint32_t idx)
 {
     const waywal_graph_node_t *node = &graph->nodes[idx];
     uint32_t nid = node->node_id;
@@ -2441,20 +3341,34 @@ static void emit_muted_bypass_node(str_buf_t *sb, const waywal_shader_graph_t *g
         default:
             break;
         }
+        ab_append_lit(sb, "    ");
+        ab_append_cstr(sb, glsl_type);
+        ab_append_lit(sb, " n");
+        ab_append_u32(sb, nid);
+        ab_append_lit(sb, "_out");
+        ab_append_u32(sb, out_p);
+        ab_append_lit(sb, " = ");
         if (node->input_pin_count > 0) {
-            char expr[128];
-            format_operand_typed_adj(graph, adj, node_pass, emitted_in_pass, idx, 0, out_type, expr,
-                                     sizeof(expr));
-            str_buf_append_fmt(sb, "    %s n%u_out%u = %s;\n", glsl_type, nid, out_p, expr);
+            char expr[160];
+            size_t elen =
+                format_operand_typed_fast(graph, adj, node_pass, emitted_in_pass, canon_idx, idx, 0,
+                                          out_type, expr, sizeof(expr));
+            ab_append_n(sb, expr, elen);
         } else {
-            str_buf_append_fmt(sb, "    %s n%u_out%u = %s;\n", glsl_type, nid, out_p, zero_lit);
+            ab_append_cstr(sb, zero_lit);
         }
+        ab_append_lit(sb, ";\n");
     }
 }
 
-static void emit_builtin_effect_node(str_buf_t *sb, const waywal_graph_node_t *node,
-                                     const char *sampler, const char *in0, const char *in1,
-                                     const char *in2, const char *in3)
+typedef struct {
+    const char *s;
+    size_t len;
+} op_view_t;
+
+static void emit_builtin_effect_node(arena_str_t *sb, const waywal_graph_node_t *node,
+                                     const char *sampler, op_view_t in0, op_view_t in1,
+                                     op_view_t in2, op_view_t in3)
 {
     uint32_t nid = node->node_id;
     const char *key = node->prop_or_asset_key;
@@ -2469,83 +3383,303 @@ static void emit_builtin_effect_node(str_buf_t *sb, const waywal_graph_node_t *n
             safe_key[sk_len++] = (char)c;
         }
     }
-    safe_key[sk_len] = '\0';
 
-    str_buf_append_fmt(sb, "    // Builtin Effect: %s\n", (sk_len > 0) ? safe_key : "waterripple");
+    ab_append_lit(sb, "    // Builtin Effect: ");
+    if (sk_len > 0u) {
+        ab_append_n(sb, safe_key, sk_len);
+    } else {
+        ab_append_lit(sb, "waterripple");
+    }
+    ab_append_lit(sb, "\n    vec4 n");
+    ab_append_u32(sb, nid);
+    ab_append_lit(sb, "_out0 = ");
 
+    size_t smp_len = strlen(sampler);
     if (key[0] == '\0' || key_contains_ci(key, "waterripple") || key_contains_ci(key, "ripple")) {
-        str_buf_append_fmt(
-            sb,
-            "    vec4 n%u_out0 = wwal_effect_waterripple(%s, v_TexCoord, (%s).xy, %s, %s, %s);\n",
-            nid, sampler, in0, in1, in2, in3);
+        ab_append_lit(sb, "wwal_effect_waterripple(");
+        ab_append_n(sb, sampler, smp_len);
+        ab_append_lit(sb, ", v_TexCoord, (");
+        ab_append_n(sb, in0.s, in0.len);
+        ab_append_lit(sb, ").xy, ");
+        ab_append_n(sb, in1.s, in1.len);
+        ab_append_lit(sb, ", ");
+        ab_append_n(sb, in2.s, in2.len);
+        ab_append_lit(sb, ", ");
+        ab_append_n(sb, in3.s, in3.len);
+        ab_append_lit(sb, ");\n");
     } else if (key_contains_ci(key, "water") || key_contains_ci(key, "refract") ||
                key_contains_ci(key, "rain")) {
-        str_buf_append_fmt(sb,
-                           "    vec4 n%u_out0 = wwal_effect_waterwaves(%s, (%s).xy, %s, %s, %s);\n",
-                           nid, sampler, in0, in1, in2, in3);
+        ab_append_lit(sb, "wwal_effect_waterwaves(");
+        ab_append_n(sb, sampler, smp_len);
+        ab_append_lit(sb, ", (");
+        ab_append_n(sb, in0.s, in0.len);
+        ab_append_lit(sb, ").xy, ");
+        ab_append_n(sb, in1.s, in1.len);
+        ab_append_lit(sb, ", ");
+        ab_append_n(sb, in2.s, in2.len);
+        ab_append_lit(sb, ", ");
+        ab_append_n(sb, in3.s, in3.len);
+        ab_append_lit(sb, ");\n");
     } else if (key_contains_ci(key, "bloom") || key_contains_ci(key, "halo") ||
                key_contains_ci(key, "flare") || key_contains_ci(key, "shine")) {
-        str_buf_append_fmt(
-            sb,
-            "    vec4 n%u_out0 = vec4(clamp(texture(%s, (%s).xy).rgb + wwal_dual_kawase(%s, "
-            "(%s).xy, max(%s, 1.5)).rgb * max(%s, 0.5), 0.0, 1.0), 1.0);\n",
-            nid, sampler, in0, sampler, in0, in1, in2);
+        ab_append_lit(sb, "vec4(clamp(texture(");
+        ab_append_n(sb, sampler, smp_len);
+        ab_append_lit(sb, ", (");
+        ab_append_n(sb, in0.s, in0.len);
+        ab_append_lit(sb, ").xy).rgb + wwal_dual_kawase(");
+        ab_append_n(sb, sampler, smp_len);
+        ab_append_lit(sb, ", (");
+        ab_append_n(sb, in0.s, in0.len);
+        ab_append_lit(sb, ").xy, max(");
+        ab_append_n(sb, in1.s, in1.len);
+        ab_append_lit(sb, ", 1.5)).rgb * max(");
+        ab_append_n(sb, in2.s, in2.len);
+        ab_append_lit(sb, ", 0.5), 0.0, 1.0), 1.0);\n");
     } else if (key_contains_ci(key, "blur") || key_contains_ci(key, "depth_of_field")) {
-        str_buf_append_fmt(sb, "    vec4 n%u_out0 = wwal_dual_kawase(%s, (%s).xy, max(%s, 1.5));\n",
-                           nid, sampler, in0, in1);
+        ab_append_lit(sb, "wwal_dual_kawase(");
+        ab_append_n(sb, sampler, smp_len);
+        ab_append_lit(sb, ", (");
+        ab_append_n(sb, in0.s, in0.len);
+        ab_append_lit(sb, ").xy, max(");
+        ab_append_n(sb, in1.s, in1.len);
+        ab_append_lit(sb, ", 1.5));\n");
     } else if (key_contains_ci(key, "chromatic") || key_contains_ci(key, "vhs")) {
-        str_buf_append_fmt(sb,
-                           "    vec4 n%u_out0 = wwal_chromatic_aberration(%s, (%s).xy, max(abs(%s) "
-                           "* 0.02, 0.006));\n",
-                           nid, sampler, in0, in1);
+        ab_append_lit(sb, "wwal_chromatic_aberration(");
+        ab_append_n(sb, sampler, smp_len);
+        ab_append_lit(sb, ", (");
+        ab_append_n(sb, in0.s, in0.len);
+        ab_append_lit(sb, ").xy, max(abs(");
+        ab_append_n(sb, in1.s, in1.len);
+        ab_append_lit(sb, ") * 0.02, 0.006));\n");
     } else if (key_contains_ci(key, "sharpen") || key_contains_ci(key, "edge") ||
                key_contains_ci(key, "outline")) {
-        str_buf_append_fmt(sb, "    vec4 n%u_out0 = wwal_effect_cas_sharpen(%s, (%s).xy, %s);\n",
-                           nid, sampler, in0, in1);
+        ab_append_lit(sb, "wwal_effect_cas_sharpen(");
+        ab_append_n(sb, sampler, smp_len);
+        ab_append_lit(sb, ", (");
+        ab_append_n(sb, in0.s, in0.len);
+        ab_append_lit(sb, ").xy, ");
+        ab_append_n(sb, in1.s, in1.len);
+        ab_append_lit(sb, ");\n");
     } else if (key_contains_ci(key, "vignette") || key_contains_ci(key, "iris")) {
-        str_buf_append_fmt(sb, "    vec4 n%u_out0 = wwal_effect_vignette(%s, (%s).xy, %s, %s);\n",
-                           nid, sampler, in0, in1, in2);
+        ab_append_lit(sb, "wwal_effect_vignette(");
+        ab_append_n(sb, sampler, smp_len);
+        ab_append_lit(sb, ", (");
+        ab_append_n(sb, in0.s, in0.len);
+        ab_append_lit(sb, ").xy, ");
+        ab_append_n(sb, in1.s, in1.len);
+        ab_append_lit(sb, ", ");
+        ab_append_n(sb, in2.s, in2.len);
+        ab_append_lit(sb, ");\n");
     } else if (key_contains_ci(key, "crt") || key_contains_ci(key, "pixelate") ||
                key_contains_ci(key, "halftone")) {
-        str_buf_append_fmt(sb,
-                           "    vec4 n%u_out0 = wwal_effect_crt_pixelate(%s, (%s).xy, %s, %s);\n",
-                           nid, sampler, in0, in1, in2);
+        ab_append_lit(sb, "wwal_effect_crt_pixelate(");
+        ab_append_n(sb, sampler, smp_len);
+        ab_append_lit(sb, ", (");
+        ab_append_n(sb, in0.s, in0.len);
+        ab_append_lit(sb, ").xy, ");
+        ab_append_n(sb, in1.s, in1.len);
+        ab_append_lit(sb, ", ");
+        ab_append_n(sb, in2.s, in2.len);
+        ab_append_lit(sb, ");\n");
     } else if (key_contains_ci(key, "twirl") || key_contains_ci(key, "fisheye") ||
                key_contains_ci(key, "pendulum") || key_contains_ci(key, "perspective")) {
-        str_buf_append_fmt(sb,
-                           "    vec4 n%u_out0 = texture(%s, clamp(wwal_uv_twirl((%s).xy, "
-                           "vec2(0.5), %s, max(%s, 0.45)), vec2(0.0), vec2(1.0)));\n",
-                           nid, sampler, in0, in1, in2);
+        ab_append_lit(sb, "texture(");
+        ab_append_n(sb, sampler, smp_len);
+        ab_append_lit(sb, ", clamp(wwal_uv_twirl((");
+        ab_append_n(sb, in0.s, in0.len);
+        ab_append_lit(sb, ").xy, vec2(0.5), ");
+        ab_append_n(sb, in1.s, in1.len);
+        ab_append_lit(sb, ", max(");
+        ab_append_n(sb, in2.s, in2.len);
+        ab_append_lit(sb, ", 0.45)), vec2(0.0), vec2(1.0)));\n");
     } else if (key_contains_ci(key, "foliage") || key_contains_ci(key, "scroll") ||
                key_contains_ci(key, "shake") || key_contains_ci(key, "skew")) {
-        str_buf_append_fmt(sb,
-                           "    vec4 n%u_out0 = texture(%s, clamp((%s).xy + vec2(sin(u_Time * (%s) "
-                           "+ (%s).y * (%s)) * (%s), 0.0), vec2(0.0), vec2(1.0)));\n",
-                           nid, sampler, in0, in1, in0, in3, in2);
+        ab_append_lit(sb, "texture(");
+        ab_append_n(sb, sampler, smp_len);
+        ab_append_lit(sb, ", clamp((");
+        ab_append_n(sb, in0.s, in0.len);
+        ab_append_lit(sb, ").xy + vec2(sin(u_Time * (");
+        ab_append_n(sb, in1.s, in1.len);
+        ab_append_lit(sb, ") + (");
+        ab_append_n(sb, in0.s, in0.len);
+        ab_append_lit(sb, ").y * (");
+        ab_append_n(sb, in3.s, in3.len);
+        ab_append_lit(sb, ")) * (");
+        ab_append_n(sb, in2.s, in2.len);
+        ab_append_lit(sb, "), 0.0), vec2(0.0), vec2(1.0)));\n");
     } else if (key_contains_ci(key, "pulse")) {
-        str_buf_append_fmt(
-            sb,
-            "    vec4 n%u_out0 = texture(%s, clamp(vec2(0.5) + ((%s).xy - vec2(0.5)) / (1.0 + "
-            "u_AudioBands[0].x * max(%s, 0.15)), vec2(0.0), vec2(1.0)));\n",
-            nid, sampler, in0, in1);
+        ab_append_lit(sb, "texture(");
+        ab_append_n(sb, sampler, smp_len);
+        ab_append_lit(sb, ", clamp(vec2(0.5) + ((");
+        ab_append_n(sb, in0.s, in0.len);
+        ab_append_lit(sb, ").xy - vec2(0.5)) / (1.0 + u_AudioBands[0].x * max(");
+        ab_append_n(sb, in1.s, in1.len);
+        ab_append_lit(sb, ", 0.15)), vec2(0.0), vec2(1.0)));\n");
     } else if (key_contains_ci(key, "hsv") || key_contains_ci(key, "tint") ||
                key_contains_ci(key, "colorgrading")) {
-        str_buf_append_fmt(sb, "    vec4 n%u_out0 = wwal_hue_shift(texture(%s, (%s).xy), %s);\n",
-                           nid, sampler, in0, in1);
+        ab_append_lit(sb, "wwal_hue_shift(texture(");
+        ab_append_n(sb, sampler, smp_len);
+        ab_append_lit(sb, ", (");
+        ab_append_n(sb, in0.s, in0.len);
+        ab_append_lit(sb, ").xy), ");
+        ab_append_n(sb, in1.s, in1.len);
+        ab_append_lit(sb, ");\n");
     } else if (key_contains_ci(key, "contrast")) {
-        str_buf_append_fmt(sb,
-                           "    vec4 n%u_out0 = wwal_contrast_saturation(texture(%s, (%s).xy), "
-                           "max(%s, 0.1), max(%s, 0.0));\n",
-                           nid, sampler, in0, in1, in2);
+        ab_append_lit(sb, "wwal_contrast_saturation(texture(");
+        ab_append_n(sb, sampler, smp_len);
+        ab_append_lit(sb, ", (");
+        ab_append_n(sb, in0.s, in0.len);
+        ab_append_lit(sb, ").xy), max(");
+        ab_append_n(sb, in1.s, in1.len);
+        ab_append_lit(sb, ", 0.1), max(");
+        ab_append_n(sb, in2.s, in2.len);
+        ab_append_lit(sb, ", 0.0));\n");
     } else if (key_contains_ci(key, "godrays") || key_contains_ci(key, "lightshafts") ||
                key_contains_ci(key, "aurora") || key_contains_ci(key, "fire") ||
                key_contains_ci(key, "nitro") || key_contains_ci(key, "cloud")) {
-        str_buf_append_fmt(sb, "    vec4 n%u_out0 = wwal_effect_godrays(%s, (%s).xy, %s, %s);\n",
-                           nid, sampler, in0, in1, in2);
+        ab_append_lit(sb, "wwal_effect_godrays(");
+        ab_append_n(sb, sampler, smp_len);
+        ab_append_lit(sb, ", (");
+        ab_append_n(sb, in0.s, in0.len);
+        ab_append_lit(sb, ").xy, ");
+        ab_append_n(sb, in1.s, in1.len);
+        ab_append_lit(sb, ", ");
+        ab_append_n(sb, in2.s, in2.len);
+        ab_append_lit(sb, ");\n");
     } else {
-        str_buf_append_fmt(sb,
-                           "    vec4 n%u_out0 = wwal_effect_waterwaves(%s, (%s).xy, %s, %s, %s);\n",
-                           nid, sampler, in0, in1, in2, in3);
+        ab_append_lit(sb, "wwal_effect_waterwaves(");
+        ab_append_n(sb, sampler, smp_len);
+        ab_append_lit(sb, ", (");
+        ab_append_n(sb, in0.s, in0.len);
+        ab_append_lit(sb, ").xy, ");
+        ab_append_n(sb, in1.s, in1.len);
+        ab_append_lit(sb, ", ");
+        ab_append_n(sb, in2.s, in2.len);
+        ab_append_lit(sb, ", ");
+        ab_append_n(sb, in3.s, in3.len);
+        ab_append_lit(sb, ");\n");
+    }
+}
+
+/* Pure ALU/procedural opcodes safe for intra-pass SSA Global Value Numbering. */
+static inline bool is_pure_gvn_op(uint32_t opcode)
+{
+    if (opcode == WAYWAL_NODE_IN_UV || opcode == WAYWAL_NODE_IN_TIME ||
+        opcode == WAYWAL_NODE_IN_RESOLUTION || opcode == WAYWAL_NODE_IN_POINTER ||
+        opcode == WAYWAL_NODE_IN_AUDIO_FFT) {
+        return true;
+    }
+    if (opcode >= WAYWAL_NODE_MATH_ADD && opcode <= WAYWAL_NODE_COLOR_CONTRAST_SAT) {
+        return true;
+    }
+    return (opcode == WAYWAL_NODE_LIGHT_BLINN_PHONG);
+}
+
+typedef struct {
+    uint32_t opcode;
+    uint32_t max_ops;
+    uint32_t kind[5];
+    uint32_t w0[5];
+    uint32_t w1[5];
+    uint32_t w2[5];
+    uint32_t w3[5];
+} gvn_key_t;
+
+typedef struct {
+    uint64_t hash;
+    uint16_t node_idx;
+    bool occupied;
+} gvn_slot_t;
+
+static inline uint32_t f32_norm_bits(float f)
+{
+    float v = finite_or_zero(f);
+    if (v == 0.0f) {
+        v = 0.0f; /* Canonicalize -0.0f to +0.0f */
+    }
+    uint32_t u = 0;
+    memcpy(&u, &v, sizeof(u));
+    return u;
+}
+
+static inline uint64_t gvn_hash_key(const gvn_key_t *k)
+{
+    uint64_t h = 14695981039346656037ULL;
+    const uint32_t *words = (const uint32_t *)k;
+    size_t n = sizeof(*k) / sizeof(uint32_t);
+    for (size_t i = 0; i < n; ++i) {
+        h ^= (uint64_t)words[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static void gvn_build_key(const waywal_shader_graph_t *graph, const graph_adj_t *adj,
+                          const uint32_t *node_pass, const bool *emitted_in_pass,
+                          const uint16_t *canon_idx, uint32_t idx, uint32_t pass, gvn_key_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    const waywal_graph_node_t *node = &graph->nodes[idx];
+    uint32_t max_ops = (node->input_pin_count < 5u) ? node->input_pin_count : 5u;
+    out->opcode = node->opcode;
+    out->max_ops = max_ops;
+
+    for (uint32_t p = 0; p < max_ops; ++p) {
+        const waywal_graph_pin_t *pin = &node->inputs[p];
+        int16_t e_idx = adj->pin_in_edge[idx][p];
+        int16_t s_idx = (e_idx >= 0) ? adj->edge_src_idx[e_idx] : -1;
+        if (e_idx >= 0 && s_idx >= 0 &&
+            graph->edges[e_idx].src_pin_index < graph->nodes[s_idx].output_pin_count) {
+            const waywal_graph_edge_t *edge = &graph->edges[e_idx];
+            if (node_pass[s_idx] == pass && emitted_in_pass[s_idx]) {
+                out->kind[p] = 1u;
+                out->w0[p] = (uint32_t)canon_idx[s_idx];
+                out->w1[p] = edge->src_pin_index;
+                out->w2[p] = edge->swizzle_mask;
+                out->w3[p] = pin->pin_type;
+            } else {
+                out->kind[p] = 2u;
+                out->w0[p] = (uint32_t)s_idx;
+                out->w1[p] = node_pass[s_idx];
+                out->w2[p] = edge->swizzle_mask;
+                out->w3[p] = pin->pin_type;
+            }
+        } else if (pin->pin_type == WAYWAL_PIN_VEC2 && strcasecmp(pin->name, "uv") == 0) {
+            out->kind[p] = 3u;
+            out->w0[p] = pin->pin_type;
+        } else {
+            out->kind[p] = 4u;
+            out->w0[p] = f32_norm_bits(pin->default_val[0]);
+            out->w1[p] = f32_norm_bits(pin->default_val[1]);
+            out->w2[p] = f32_norm_bits(pin->default_val[2]);
+            out->w3[p] = f32_norm_bits(pin->default_val[3]);
+        }
+    }
+
+    if ((node->opcode == WAYWAL_NODE_MATH_ADD || node->opcode == WAYWAL_NODE_MATH_MUL ||
+         node->opcode == WAYWAL_NODE_MATH_DOT) &&
+        max_ops >= 2u) {
+        uint32_t a[5] = {out->kind[0], out->w0[0], out->w1[0], out->w2[0], out->w3[0]};
+        uint32_t b[5] = {out->kind[1], out->w0[1], out->w1[1], out->w2[1], out->w3[1]};
+        bool swap = false;
+        for (int c = 0; c < 5; ++c) {
+            if (a[c] != b[c]) {
+                swap = (b[c] < a[c]);
+                break;
+            }
+        }
+        if (swap) {
+            out->kind[0] = b[0];
+            out->w0[0] = b[1];
+            out->w1[0] = b[2];
+            out->w2[0] = b[3];
+            out->w3[0] = b[4];
+            out->kind[1] = a[0];
+            out->w0[1] = a[1];
+            out->w1[1] = a[2];
+            out->w2[1] = a[3];
+            out->w3[1] = a[4];
+        }
     }
 }
 
@@ -2572,8 +3706,20 @@ char *waywal_shader_graph_compile_glsl(const waywal_shader_graph_t *graph,
     uint32_t node_pass[WAYWAL_GRAPH_MAX_NODES];
     compute_node_passes_readonly(graph, &adj, reachable, node_pass, NULL);
 
-    str_buf_t sb;
-    if (!str_buf_init(&sb, 16384)) {
+    wwal_bump_arena_t arena;
+    wwal_bump_arena_init_compile(&arena);
+
+    gvn_slot_t *gvn_table = (gvn_slot_t *)wwal_bump_alloc(&arena, 512u * sizeof(gvn_slot_t), 16u);
+    gvn_key_t *gvn_keys =
+        (gvn_key_t *)wwal_bump_alloc(&arena, WAYWAL_GRAPH_MAX_NODES * sizeof(gvn_key_t), 16u);
+
+    arena_str_t sb;
+    size_t est_cap = (size_t)ncnt * 144u + 4096u;
+    if (est_cap < 16384u) {
+        est_cap = 16384u;
+    }
+    if (!gvn_table || !gvn_keys || !ab_init(&sb, &arena, est_cap)) {
+        wwal_bump_arena_free(&arena);
         if (out_glsl_len)
             *out_glsl_len = 0;
         return NULL;
@@ -2582,6 +3728,11 @@ char *waywal_shader_graph_compile_glsl(const waywal_shader_graph_t *graph,
     uint32_t active_mask = schedule->active_pass_mask;
     if (active_mask == 0) {
         active_mask = (1u << 4);
+    }
+
+    uint16_t canon_idx[WAYWAL_GRAPH_MAX_NODES];
+    for (uint32_t i = 0; i < ncnt; ++i) {
+        canon_idx[i] = (uint16_t)i;
     }
 
     for (uint32_t pass = 0; pass < WAYWAL_GRAPH_MAX_PASSES; ++pass) {
@@ -2595,11 +3746,14 @@ char *waywal_shader_graph_compile_glsl(const waywal_shader_graph_t *graph,
                                 : (pass == 3) ? "BUFFER_D"
                                               : "IMAGE_PASS";
 
-        str_buf_append_fmt(
+        ab_append_lit(
             &sb,
             "// =============================================================================\n"
-            "#pragma Pass %s\n"
-            "// =============================================================================\n"
+            "#pragma Pass ");
+        ab_append_cstr(&sb, pass_name);
+        ab_append_lit(
+            &sb,
+            "\n// =============================================================================\n"
             "#version 310 es\n"
             "precision highp float;\n"
             "precision highp int;\n\n"
@@ -2615,315 +3769,612 @@ char *waywal_shader_graph_compile_glsl(const waywal_shader_graph_t *graph,
             "uniform sampler2D u_BufferC;\n"
             "uniform sampler2D u_BufferD;\n"
             "uniform sampler2D u_DepthMap;\n\n"
-            "// Promoted GraphConstants uniforms (144 Hz zero-recompile scrubbing)\n",
-            pass_name);
+            "// Promoted GraphConstants uniforms (144 Hz zero-recompile scrubbing)\n");
 
         uint32_t helper_mask = 0u;
         for (uint32_t k = 0; k < sorted_cnt; ++k) {
             uint32_t idx = schedule->sorted_node_indices[k];
-            if (idx >= ncnt || node_pass[idx] != pass)
+            if (idx >= ncnt || !reachable[idx] || node_pass[idx] != pass)
                 continue;
             const waywal_graph_node_t *node = &graph->nodes[idx];
             helper_mask |= helper_mask_for_node(graph, &adj, node_pass, idx);
             if (!(node->flags & WAYWAL_NODE_FLAG_MUTED_BYPASS) &&
                 (node->opcode == WAYWAL_NODE_IN_CONSTANT ||
                  node->opcode == WAYWAL_NODE_IN_USER_PROP)) {
-                str_buf_append_fmt(&sb, "uniform vec4 u_Node%u_Const;\n", node->node_id);
+                ab_append_lit(&sb, "uniform vec4 u_Node");
+                ab_append_u32(&sb, node->node_id);
+                ab_append_lit(&sb, "_Const;\n");
             }
         }
-        str_buf_append(&sb, "\n");
+        ab_append_lit(&sb, "\n");
 
         emit_glsl_helpers(&sb, helper_mask);
 
-        str_buf_append(&sb, "void main() {\n");
+        ab_append_lit(&sb, "void main() {\n");
 
+        memset(gvn_table, 0, 512u * sizeof(gvn_slot_t));
         bool emitted_in_pass[WAYWAL_GRAPH_MAX_NODES] = {false};
         int32_t final_node_idx = -1;
         bool has_pass_sink = false;
 
         for (uint32_t k = 0; k < sorted_cnt; ++k) {
             uint32_t idx = schedule->sorted_node_indices[k];
-            if (idx >= ncnt || node_pass[idx] != pass) {
+            if (idx >= ncnt || !reachable[idx] || node_pass[idx] != pass) {
                 continue;
             }
             const waywal_graph_node_t *node = &graph->nodes[idx];
 
             if ((node->flags & WAYWAL_NODE_FLAG_MUTED_BYPASS) && node->output_pin_count > 0) {
-                emit_muted_bypass_node(&sb, graph, &adj, node_pass, emitted_in_pass, idx);
+                emit_muted_bypass_node(&sb, graph, &adj, node_pass, emitted_in_pass, canon_idx,
+                                       idx);
                 emitted_in_pass[idx] = true;
+                canon_idx[idx] = (uint16_t)idx;
                 final_node_idx = (int32_t)idx;
                 continue;
             }
 
-            char ops[5][128];
-            uint32_t max_ops = (node->input_pin_count < 5) ? node->input_pin_count : 5;
-            for (uint32_t p = 0; p < max_ops; ++p) {
-                format_operand_adj(graph, &adj, node_pass, emitted_in_pass, idx, p, ops[p],
-                                   sizeof(ops[p]));
+            if (is_pure_gvn_op(node->opcode)) {
+                gvn_key_t key;
+                gvn_build_key(graph, &adj, node_pass, emitted_in_pass, canon_idx, idx, pass, &key);
+                uint64_t h = gvn_hash_key(&key);
+                uint32_t slot = (uint32_t)h & 511u;
+                bool gvn_hit = false;
+                while (gvn_table[slot].occupied) {
+                    if (gvn_table[slot].hash == h &&
+                        memcmp(&gvn_keys[gvn_table[slot].node_idx], &key, sizeof(key)) == 0) {
+                        uint16_t match_idx = gvn_table[slot].node_idx;
+                        canon_idx[idx] = match_idx;
+                        emitted_in_pass[idx] = true;
+                        if (node->output_pin_count > 0u) {
+                            final_node_idx = (int32_t)match_idx;
+                        }
+                        gvn_hit = true;
+                        break;
+                    }
+                    slot = (slot + 1u) & 511u;
+                }
+                if (gvn_hit) {
+                    continue;
+                }
+                gvn_keys[idx] = key;
+                gvn_table[slot].hash = h;
+                gvn_table[slot].node_idx = (uint16_t)idx;
+                gvn_table[slot].occupied = true;
             }
-            for (uint32_t p = max_ops; p < 5; ++p) {
+
+            char ops[5][160];
+            op_view_t ov[5];
+            uint32_t max_ops = (node->input_pin_count < 5u) ? node->input_pin_count : 5u;
+            for (uint32_t p = 0; p < max_ops; ++p) {
+                ov[p].len = format_operand_fast(graph, &adj, node_pass, emitted_in_pass, canon_idx,
+                                                idx, p, ops[p], sizeof(ops[p]));
+                ov[p].s = ops[p];
+            }
+            for (uint32_t p = max_ops; p < 5u; ++p) {
                 ops[p][0] = '0';
                 ops[p][1] = '.';
                 ops[p][2] = '0';
                 ops[p][3] = '\0';
+                ov[p].s = ops[p];
+                ov[p].len = 3u;
             }
 
-            const char *in0 = ops[0];
-            const char *in1 = ops[1];
-            const char *in2 = ops[2];
-            const char *in3 = ops[3];
-            const char *in4 = ops[4];
             uint32_t nid = node->node_id;
 
             switch (node->opcode) {
             case WAYWAL_NODE_IN_UV:
-                str_buf_append_fmt(&sb, "    vec2 n%u_out0 = v_TexCoord;\n", nid);
+                ab_append_lit(&sb, "    vec2 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = v_TexCoord;\n");
                 break;
             case WAYWAL_NODE_IN_TIME:
-                str_buf_append_fmt(&sb, "    float n%u_out0 = u_Time;\n", nid);
+                ab_append_lit(&sb, "    float n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = u_Time;\n");
                 break;
             case WAYWAL_NODE_IN_RESOLUTION:
-                str_buf_append_fmt(&sb, "    vec2 n%u_out0 = u_Resolution;\n", nid);
+                ab_append_lit(&sb, "    vec2 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = u_Resolution;\n");
                 break;
             case WAYWAL_NODE_IN_POINTER:
-                str_buf_append_fmt(&sb, "    vec2 n%u_out0 = u_Pointer;\n", nid);
+                ab_append_lit(&sb, "    vec2 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = u_Pointer;\n");
                 break;
             case WAYWAL_NODE_IN_AUDIO_FFT:
-                str_buf_append_fmt(&sb, "    vec4 n%u_out0 = u_AudioBands[clamp(int(%s), 0, 3)];\n",
-                                   nid, in0);
-                str_buf_append_fmt(&sb, "    float n%u_out1 = n%u_out0.x;\n", nid, nid);
+                ab_append_lit(&sb, "    vec4 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = u_AudioBands[clamp(int(");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, "), 0, 3)];\n    float n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out1 = n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0.x;\n");
                 break;
-            case WAYWAL_NODE_IN_TEXTURE2D: {
-                const char *smp = resolve_pass_buffer_sampler(node->prop_or_asset_key, 0);
-                str_buf_append_fmt(&sb, "    vec4 n%u_out0 = texture(%s, %s);\n", nid, smp, in0);
-                break;
-            }
+            case WAYWAL_NODE_IN_TEXTURE2D:
             case WAYWAL_NODE_IN_PASS_BUFFER: {
                 const char *smp = resolve_pass_buffer_sampler(node->prop_or_asset_key, 0);
-                str_buf_append_fmt(&sb, "    vec4 n%u_out0 = texture(%s, %s);\n", nid, smp, in0);
+                ab_append_lit(&sb, "    vec4 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = texture(");
+                ab_append_cstr(&sb, smp);
+                ab_append_lit(&sb, ", ");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ");\n");
                 break;
             }
             case WAYWAL_NODE_IN_DEPTH_MAP:
-                str_buf_append_fmt(&sb, "    float n%u_out0 = texture(u_DepthMap, %s).r;\n", nid,
-                                   in0);
+                ab_append_lit(&sb, "    float n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = texture(u_DepthMap, ");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ").r;\n");
                 break;
             case WAYWAL_NODE_IN_CONSTANT:
             case WAYWAL_NODE_IN_USER_PROP:
-                str_buf_append_fmt(&sb, "    vec4 n%u_out0 = u_Node%u_Const;\n", nid, nid);
+                ab_append_lit(&sb, "    vec4 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = u_Node");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_Const;\n");
                 break;
             case WAYWAL_NODE_MATH_ADD:
-                str_buf_append_fmt(&sb, "    vec4 n%u_out0 = (%s + %s);\n", nid, in0, in1);
-                break;
             case WAYWAL_NODE_MATH_SUB:
-                str_buf_append_fmt(&sb, "    vec4 n%u_out0 = (%s - %s);\n", nid, in0, in1);
+            case WAYWAL_NODE_MATH_MUL: {
+                const char *op_sym = (node->opcode == WAYWAL_NODE_MATH_ADD)   ? " + "
+                                     : (node->opcode == WAYWAL_NODE_MATH_SUB) ? " - "
+                                                                              : " * ";
+                ab_append_lit(&sb, "    vec4 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = (");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_n(&sb, op_sym, 3u);
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ");\n");
                 break;
-            case WAYWAL_NODE_MATH_MUL:
-                str_buf_append_fmt(&sb, "    vec4 n%u_out0 = (%s * %s);\n", nid, in0, in1);
-                break;
+            }
             case WAYWAL_NODE_MATH_DIV:
-                str_buf_append_fmt(
-                    &sb,
-                    "    vec4 n%u_out0 = (%s / mix(vec4(1e-6), %s, notEqual(%s, vec4(0.0))));\n",
-                    nid, in0, in1, in1);
+                ab_append_lit(&sb, "    vec4 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = (");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, " / mix(vec4(1e-6), ");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ", notEqual(");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ", vec4(0.0))));\n");
                 break;
             case WAYWAL_NODE_MATH_FMA:
-                str_buf_append_fmt(&sb, "    vec4 n%u_out0 = (%s * %s + %s);\n", nid, in0, in1,
-                                   in2);
+                ab_append_lit(&sb, "    vec4 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = (");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, " * ");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, " + ");
+                ab_append_n(&sb, ov[2].s, ov[2].len);
+                ab_append_lit(&sb, ");\n");
                 break;
             case WAYWAL_NODE_MATH_MIX:
-                str_buf_append_fmt(&sb, "    vec4 n%u_out0 = mix(%s, %s, %s);\n", nid, in0, in1,
-                                   in2);
+                ab_append_lit(&sb, "    vec4 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = mix(");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ", ");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ", ");
+                ab_append_n(&sb, ov[2].s, ov[2].len);
+                ab_append_lit(&sb, ");\n");
                 break;
             case WAYWAL_NODE_MATH_SMOOTHSTEP:
                 /* GLSL ES 3.10 §8.3 leaves smoothstep(edge0, edge1, x) undefined when
                  * edge0 >= edge1; order the bounds and invert when reversed. */
-                str_buf_append_fmt(
-                    &sb,
-                    "    float n%u_e0 = %s;\n"
-                    "    float n%u_e1 = %s;\n"
-                    "    float n%u_lo = min(n%u_e0, n%u_e1);\n"
-                    "    float n%u_hi = max(max(n%u_e0, n%u_e1), n%u_lo + 1e-5);\n"
-                    "    float n%u_s = smoothstep(n%u_lo, n%u_hi, %s);\n"
-                    "    float n%u_out0 = (n%u_e0 <= n%u_e1) ? n%u_s : (1.0 - n%u_s);\n",
-                    nid, in0, nid, in1, nid, nid, nid, nid, nid, nid, nid, nid, nid, nid, in2, nid,
-                    nid, nid, nid, nid);
+                ab_append_lit(&sb, "    float n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_e0 = ");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ";\n    float n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_e1 = ");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ";\n    float n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_lo = min(n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_e0, n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_e1);\n    float n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_hi = max(max(n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_e0, n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_e1), n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_lo + 1e-5);\n    float n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_s = smoothstep(n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_lo, n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_hi, ");
+                ab_append_n(&sb, ov[2].s, ov[2].len);
+                ab_append_lit(&sb, ");\n    float n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = (n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_e0 <= n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_e1) ? n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_s : (1.0 - n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_s);\n");
                 break;
             case WAYWAL_NODE_MATH_CLAMP:
-                str_buf_append_fmt(&sb, "    vec4 n%u_out0 = clamp(%s, %s, %s);\n", nid, in0, in1,
-                                   in2);
+                ab_append_lit(&sb, "    vec4 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = clamp(");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ", ");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ", ");
+                ab_append_n(&sb, ov[2].s, ov[2].len);
+                ab_append_lit(&sb, ");\n");
                 break;
             case WAYWAL_NODE_MATH_SIN:
-                str_buf_append_fmt(&sb, "    vec4 n%u_out0 = sin(%s);\n", nid, in0);
-                break;
             case WAYWAL_NODE_MATH_COS:
-                str_buf_append_fmt(&sb, "    vec4 n%u_out0 = cos(%s);\n", nid, in0);
+            case WAYWAL_NODE_MATH_FRACT:
+            case WAYWAL_NODE_MATH_FLOOR:
+            case WAYWAL_NODE_MATH_ABS: {
+                const char *fn_name = (node->opcode == WAYWAL_NODE_MATH_SIN)     ? "sin("
+                                      : (node->opcode == WAYWAL_NODE_MATH_COS)   ? "cos("
+                                      : (node->opcode == WAYWAL_NODE_MATH_FRACT) ? "fract("
+                                      : (node->opcode == WAYWAL_NODE_MATH_FLOOR) ? "floor("
+                                                                                 : "abs(";
+                ab_append_lit(&sb, "    vec4 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = ");
+                ab_append_cstr(&sb, fn_name);
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ");\n");
                 break;
+            }
             case WAYWAL_NODE_MATH_POW:
-                str_buf_append_fmt(&sb, "    vec4 n%u_out0 = pow(max(%s, vec4(0.0)), vec4(%s));\n",
-                                   nid, in0, in1);
+                ab_append_lit(&sb, "    vec4 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = wwal_safe_pow(");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ", vec4(");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, "));\n");
                 break;
             case WAYWAL_NODE_MATH_DOT:
-                str_buf_append_fmt(&sb, "    float n%u_out0 = dot(%s, %s);\n", nid, in0, in1);
+                ab_append_lit(&sb, "    float n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = dot(");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ", ");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ");\n");
                 break;
             case WAYWAL_NODE_MATH_CROSS:
-                str_buf_append_fmt(&sb, "    vec3 n%u_out0 = cross((%s).xyz, (%s).xyz);\n", nid,
-                                   in0, in1);
+                ab_append_lit(&sb, "    vec3 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = cross((");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ").xyz, (");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ").xyz);\n");
                 break;
             case WAYWAL_NODE_MATH_NORMALIZE:
-                str_buf_append_fmt(
-                    &sb, "    vec4 n%u_out0 = (length(%s) > 1e-6 ? normalize(%s) : %s);\n", nid,
-                    in0, in0, in0);
+                ab_append_lit(&sb, "    vec4 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = (length(");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ") > 1e-6 ? normalize(");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ") : ");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ");\n");
                 break;
             case WAYWAL_NODE_MATH_LENGTH:
-                str_buf_append_fmt(&sb, "    float n%u_out0 = length(%s);\n", nid, in0);
+                ab_append_lit(&sb, "    float n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = length(");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ");\n");
                 break;
             case WAYWAL_NODE_MATH_DISTANCE:
-                str_buf_append_fmt(&sb, "    float n%u_out0 = distance((%s).xy, (%s).xy);\n", nid,
-                                   in0, in1);
-                break;
-            case WAYWAL_NODE_MATH_FRACT:
-                str_buf_append_fmt(&sb, "    vec4 n%u_out0 = fract(%s);\n", nid, in0);
-                break;
-            case WAYWAL_NODE_MATH_FLOOR:
-                str_buf_append_fmt(&sb, "    vec4 n%u_out0 = floor(%s);\n", nid, in0);
-                break;
-            case WAYWAL_NODE_MATH_ABS:
-                str_buf_append_fmt(&sb, "    vec4 n%u_out0 = abs(%s);\n", nid, in0);
+                ab_append_lit(&sb, "    float n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = distance((");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ").xy, (");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ").xy);\n");
                 break;
             case WAYWAL_NODE_VEC_SWIZZLE_COMBINE:
-                str_buf_append_fmt(&sb, "    vec2 n%u_out0 = vec2(%s, %s);\n", nid, in0, in1);
-                str_buf_append_fmt(&sb, "    vec3 n%u_out1 = vec3(%s, %s, %s);\n", nid, in0, in1,
-                                   in2);
-                str_buf_append_fmt(&sb, "    vec4 n%u_out2 = vec4(%s, %s, %s, %s);\n", nid, in0,
-                                   in1, in2, in3);
+                ab_append_lit(&sb, "    vec2 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = vec2(");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ", ");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ");\n    vec3 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out1 = vec3(");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ", ");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ", ");
+                ab_append_n(&sb, ov[2].s, ov[2].len);
+                ab_append_lit(&sb, ");\n    vec4 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out2 = vec4(");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ", ");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ", ");
+                ab_append_n(&sb, ov[2].s, ov[2].len);
+                ab_append_lit(&sb, ", ");
+                ab_append_n(&sb, ov[3].s, ov[3].len);
+                ab_append_lit(&sb, ");\n");
                 break;
             case WAYWAL_NODE_NOISE_SIMPLEX2D:
-                str_buf_append_fmt(&sb, "    float n%u_out0 = wwal_simplex2d((%s).xy * (%s));\n",
-                                   nid, in0, in1);
+                ab_append_lit(&sb, "    float n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = wwal_simplex2d((");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ").xy * (");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, "));\n");
                 break;
             case WAYWAL_NODE_NOISE_CURL2D:
-                str_buf_append_fmt(&sb, "    vec2 n%u_out0 = wwal_curl2d((%s).xy * (%s), %s);\n",
-                                   nid, in0, in2, in1);
+                ab_append_lit(&sb, "    vec2 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = wwal_curl2d((");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ").xy * (");
+                ab_append_n(&sb, ov[2].s, ov[2].len);
+                ab_append_lit(&sb, "), ");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ");\n");
                 break;
             case WAYWAL_NODE_NOISE_VORONOI2D:
-                str_buf_append_fmt(&sb, "    vec2 n%u_voro = wwal_voronoi2d((%s).xy * (%s));\n",
-                                   nid, in0, in1);
-                str_buf_append_fmt(&sb, "    float n%u_out0 = n%u_voro.x;\n", nid, nid);
-                str_buf_append_fmt(&sb, "    vec2  n%u_out1 = n%u_voro;\n", nid, nid);
+                ab_append_lit(&sb, "    vec2 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_voro = wwal_voronoi2d((");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ").xy * (");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, "));\n    float n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_voro.x;\n    vec2  n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out1 = n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_voro;\n");
                 break;
             case WAYWAL_NODE_NOISE_FBM2D:
-                str_buf_append_fmt(&sb, "    float n%u_out0 = wwal_fbm2d((%s).xy, int(%s), %s);\n",
-                                   nid, in0, in1, in2);
+                ab_append_lit(&sb, "    float n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = wwal_fbm2d((");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ").xy, int(");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, "), ");
+                ab_append_n(&sb, ov[2].s, ov[2].len);
+                ab_append_lit(&sb, ");\n");
                 break;
             case WAYWAL_NODE_SDF_CIRCLE:
-                str_buf_append_fmt(&sb, "    float n%u_out0 = length((%s).xy) - (%s);\n", nid, in0,
-                                   in1);
+                ab_append_lit(&sb, "    float n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = length((");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ").xy) - (");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ");\n");
                 break;
             case WAYWAL_NODE_SDF_BOX:
-                str_buf_append_fmt(&sb, "    float n%u_out0 = wwal_sdf_box((%s).xy, (%s).xy);\n",
-                                   nid, in0, in1);
+                ab_append_lit(&sb, "    float n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = wwal_sdf_box((");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ").xy, (");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ").xy);\n");
                 break;
             case WAYWAL_NODE_SDF_RING:
-                str_buf_append_fmt(&sb,
-                                   "    float n%u_out0 = abs(length((%s).xy) - (%s)) - (%s);\n",
-                                   nid, in0, in1, in2);
+                ab_append_lit(&sb, "    float n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = abs(length((");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ").xy) - (");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ")) - (");
+                ab_append_n(&sb, ov[2].s, ov[2].len);
+                ab_append_lit(&sb, ");\n");
                 break;
             case WAYWAL_NODE_UV_POLAR:
-                str_buf_append_fmt(&sb, "    vec2 n%u_out0 = wwal_uv_polar((%s).xy, (%s).xy);\n",
-                                   nid, in0, in1);
+                ab_append_lit(&sb, "    vec2 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = wwal_uv_polar((");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ").xy, (");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ").xy);\n");
                 break;
             case WAYWAL_NODE_UV_TWIRL:
-                str_buf_append_fmt(&sb,
-                                   "    vec2 n%u_out0 = wwal_uv_twirl((%s).xy, (%s).xy, %s, %s);\n",
-                                   nid, in0, in1, in2, in3);
+                ab_append_lit(&sb, "    vec2 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = wwal_uv_twirl((");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ").xy, (");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ").xy, ");
+                ab_append_n(&sb, ov[2].s, ov[2].len);
+                ab_append_lit(&sb, ", ");
+                ab_append_n(&sb, ov[3].s, ov[3].len);
+                ab_append_lit(&sb, ");\n");
                 break;
             case WAYWAL_NODE_UV_TILE:
-                str_buf_append_fmt(&sb, "    vec2 n%u_out0 = fract((%s).xy * (%s).xy);\n", nid, in0,
-                                   in1);
+                ab_append_lit(&sb, "    vec2 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = fract((");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ").xy * (");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ").xy);\n");
                 break;
             case WAYWAL_NODE_COLOR_OKLCH_TO_SRGB:
-                str_buf_append_fmt(&sb, "    vec4 n%u_out0 = vec4(wwal_oklch_to_srgb(%s), 1.0);\n",
-                                   nid, in0);
+                ab_append_lit(&sb, "    vec4 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = vec4(wwal_oklch_to_srgb(");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, "), 1.0);\n");
                 break;
             case WAYWAL_NODE_COLOR_SRGB_TO_OKLCH:
-                str_buf_append_fmt(&sb, "    vec4 n%u_out0 = vec4(wwal_srgb_to_oklch(%s), 1.0);\n",
-                                   nid, in0);
+                ab_append_lit(&sb, "    vec4 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = vec4(wwal_srgb_to_oklch(");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, "), 1.0);\n");
                 break;
             case WAYWAL_NODE_COLOR_HUE_SHIFT:
-                str_buf_append_fmt(&sb, "    vec4 n%u_out0 = wwal_hue_shift(%s, %s);\n", nid, in0,
-                                   in1);
+                ab_append_lit(&sb, "    vec4 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = wwal_hue_shift(");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ", ");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ");\n");
                 break;
             case WAYWAL_NODE_COLOR_CONTRAST_SAT:
-                str_buf_append_fmt(&sb,
-                                   "    vec4 n%u_out0 = wwal_contrast_saturation(%s, %s, %s);\n",
-                                   nid, in0, in1, in2);
+                ab_append_lit(&sb, "    vec4 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = wwal_contrast_saturation(");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ", ");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ", ");
+                ab_append_n(&sb, ov[2].s, ov[2].len);
+                ab_append_lit(&sb, ");\n");
                 break;
             case WAYWAL_NODE_FILTER_DUAL_KAWASE: {
                 bool has_smp = false;
                 const char *smp = resolve_spatial_sampler(graph, &adj, node_pass, idx, 0, &has_smp);
+                ab_append_lit(&sb, "    vec4 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = ");
                 if (has_smp && key_contains_ci(node->prop_or_asset_key, "bloom")) {
                     float c1 = finite_or_zero(node->const_val[1]);
                     float glow = (c1 > 0.0f) ? c1 : 0.65f;
-                    str_buf_append_fmt(&sb,
-                                       "    vec4 n%u_out0 = texture(%s, (%s).xy) + "
-                                       "wwal_dual_kawase(%s, (%s).xy, %s) * %.4f;\n",
-                                       nid, smp, in1, smp, in1, in2, glow);
+                    ab_append_lit(&sb, "texture(");
+                    ab_append_cstr(&sb, smp);
+                    ab_append_lit(&sb, ", (");
+                    ab_append_n(&sb, ov[1].s, ov[1].len);
+                    ab_append_lit(&sb, ").xy) + wwal_dual_kawase(");
+                    ab_append_cstr(&sb, smp);
+                    ab_append_lit(&sb, ", (");
+                    ab_append_n(&sb, ov[1].s, ov[1].len);
+                    ab_append_lit(&sb, ").xy, ");
+                    ab_append_n(&sb, ov[2].s, ov[2].len);
+                    ab_append_lit(&sb, ") * ");
+                    ab_append_f32(&sb, glow);
+                    ab_append_lit(&sb, ";\n");
                 } else if (has_smp) {
-                    str_buf_append_fmt(&sb,
-                                       "    vec4 n%u_out0 = wwal_dual_kawase(%s, (%s).xy, %s);\n",
-                                       nid, smp, in1, in2);
+                    ab_append_lit(&sb, "wwal_dual_kawase(");
+                    ab_append_cstr(&sb, smp);
+                    ab_append_lit(&sb, ", (");
+                    ab_append_n(&sb, ov[1].s, ov[1].len);
+                    ab_append_lit(&sb, ").xy, ");
+                    ab_append_n(&sb, ov[2].s, ov[2].len);
+                    ab_append_lit(&sb, ");\n");
                 } else {
-                    str_buf_append_fmt(&sb, "    vec4 n%u_out0 = %s;\n", nid, in0);
+                    ab_append_n(&sb, ov[0].s, ov[0].len);
+                    ab_append_lit(&sb, ";\n");
                 }
                 break;
             }
             case WAYWAL_NODE_FILTER_CHROMATIC_ABERR: {
                 bool has_smp = false;
                 const char *smp = resolve_spatial_sampler(graph, &adj, node_pass, idx, 0, &has_smp);
+                ab_append_lit(&sb, "    vec4 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = ");
                 if (has_smp) {
-                    str_buf_append_fmt(
-                        &sb, "    vec4 n%u_out0 = wwal_chromatic_aberration(%s, (%s).xy, %s);\n",
-                        nid, smp, in1, in2);
+                    ab_append_lit(&sb, "wwal_chromatic_aberration(");
+                    ab_append_cstr(&sb, smp);
+                    ab_append_lit(&sb, ", (");
+                    ab_append_n(&sb, ov[1].s, ov[1].len);
+                    ab_append_lit(&sb, ").xy, ");
+                    ab_append_n(&sb, ov[2].s, ov[2].len);
+                    ab_append_lit(&sb, ");\n");
                 } else {
-                    str_buf_append_fmt(&sb, "    vec4 n%u_out0 = %s;\n", nid, in0);
+                    ab_append_n(&sb, ov[0].s, ov[0].len);
+                    ab_append_lit(&sb, ";\n");
                 }
                 break;
             }
             case WAYWAL_NODE_LIGHT_NORMAL_FROM_HEIGHT: {
                 bool has_smp = false;
                 const char *smp = resolve_spatial_sampler(graph, &adj, node_pass, idx, 0, &has_smp);
+                ab_append_lit(&sb, "    vec3 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = ");
                 if (adj.pin_in_edge[idx][0] >= 0 && has_smp) {
-                    str_buf_append_fmt(
-                        &sb, "    vec3 n%u_out0 = wwal_normal_from_height_tex(%s, (%s).xy, %s);\n",
-                        nid, smp, in1, in2);
+                    ab_append_lit(&sb, "wwal_normal_from_height_tex(");
+                    ab_append_cstr(&sb, smp);
                 } else {
-                    str_buf_append_fmt(
-                        &sb, "    vec3 n%u_out0 = wwal_normal_from_height(%s, (%s).xy, %s);\n", nid,
-                        in0, in1, in2);
+                    ab_append_lit(&sb, "wwal_normal_from_height(");
+                    ab_append_n(&sb, ov[0].s, ov[0].len);
                 }
+                ab_append_lit(&sb, ", (");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ").xy, ");
+                ab_append_n(&sb, ov[2].s, ov[2].len);
+                ab_append_lit(&sb, ");\n");
                 break;
             }
             case WAYWAL_NODE_LIGHT_BLINN_PHONG:
-                str_buf_append_fmt(
-                    &sb,
-                    "    vec4 n%u_out0 = wwal_blinn_phong((%s).xyz, (%s).xyz, (%s).xyz, %s, %s);\n",
-                    nid, in0, in1, in2, in3, in4);
+                ab_append_lit(&sb, "    vec4 n");
+                ab_append_u32(&sb, nid);
+                ab_append_lit(&sb, "_out0 = wwal_blinn_phong((");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ").xyz, (");
+                ab_append_n(&sb, ov[1].s, ov[1].len);
+                ab_append_lit(&sb, ").xyz, (");
+                ab_append_n(&sb, ov[2].s, ov[2].len);
+                ab_append_lit(&sb, ").xyz, ");
+                ab_append_n(&sb, ov[3].s, ov[3].len);
+                ab_append_lit(&sb, ", ");
+                ab_append_n(&sb, ov[4].s, ov[4].len);
+                ab_append_lit(&sb, ");\n");
                 break;
             case WAYWAL_NODE_BUILTIN_EFFECT: {
                 bool has_smp = false;
                 const char *smp = resolve_spatial_sampler(graph, &adj, node_pass, idx, 0, &has_smp);
                 (void)has_smp;
-                emit_builtin_effect_node(&sb, node, smp, in0, in1, in2, in3);
+                emit_builtin_effect_node(&sb, node, smp, ov[0], ov[1], ov[2], ov[3]);
                 break;
             }
             case WAYWAL_NODE_OUT_BUFFER_PASS:
-                str_buf_append_fmt(&sb, "    outColor = %s;\n", in0);
+                ab_append_lit(&sb, "    outColor = ");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ";\n");
                 has_pass_sink = true;
                 break;
             case WAYWAL_NODE_OUT_IMAGE_PASS:
                 /* Invariant 2: IMAGE_PASS must force opaque alpha so Wayland surfaces never turn
                  * black/transparent. */
-                str_buf_append_fmt(&sb, "    outColor = vec4((%s).rgb, 1.0);\n", in0);
+                ab_append_lit(&sb, "    outColor = vec4((");
+                ab_append_n(&sb, ov[0].s, ov[0].len);
+                ab_append_lit(&sb, ").rgb, 1.0);\n");
                 has_pass_sink = true;
                 break;
             default:
@@ -2931,6 +4382,7 @@ char *waywal_shader_graph_compile_glsl(const waywal_shader_graph_t *graph,
             }
 
             emitted_in_pass[idx] = true;
+            canon_idx[idx] = (uint16_t)idx;
             if (node->output_pin_count > 0) {
                 final_node_idx = (int32_t)idx;
             }
@@ -2942,39 +4394,60 @@ char *waywal_shader_graph_compile_glsl(const waywal_shader_graph_t *graph,
                 uint32_t fn_id = fn->node_id;
                 uint32_t ftype = fn->outputs[0].pin_type;
                 if (ftype == WAYWAL_PIN_FLOAT) {
-                    str_buf_append_fmt(&sb, "    outColor = vec4(vec3(n%u_out0), 1.0);\n", fn_id);
+                    ab_append_lit(&sb, "    outColor = vec4(vec3(n");
+                    ab_append_u32(&sb, fn_id);
+                    ab_append_lit(&sb, "_out0), 1.0);\n");
                 } else if (ftype == WAYWAL_PIN_VEC2) {
-                    str_buf_append_fmt(&sb, "    outColor = vec4(n%u_out0, 0.0, 1.0);\n", fn_id);
+                    ab_append_lit(&sb, "    outColor = vec4(n");
+                    ab_append_u32(&sb, fn_id);
+                    ab_append_lit(&sb, "_out0, 0.0, 1.0);\n");
                 } else if (ftype == WAYWAL_PIN_VEC3) {
-                    str_buf_append_fmt(&sb, "    outColor = vec4(n%u_out0, 1.0);\n", fn_id);
+                    ab_append_lit(&sb, "    outColor = vec4(n");
+                    ab_append_u32(&sb, fn_id);
+                    ab_append_lit(&sb, "_out0, 1.0);\n");
                 } else if (ftype == WAYWAL_PIN_INT || ftype == WAYWAL_PIN_BOOL) {
-                    str_buf_append_fmt(&sb, "    outColor = vec4(vec3(float(n%u_out0)), 1.0);\n",
-                                       fn_id);
+                    ab_append_lit(&sb, "    outColor = vec4(vec3(float(n");
+                    ab_append_u32(&sb, fn_id);
+                    ab_append_lit(&sb, "_out0)), 1.0);\n");
                 } else if (pass == 4) {
-                    str_buf_append_fmt(&sb, "    outColor = vec4(n%u_out0.rgb, 1.0);\n", fn_id);
+                    ab_append_lit(&sb, "    outColor = vec4(n");
+                    ab_append_u32(&sb, fn_id);
+                    ab_append_lit(&sb, "_out0.rgb, 1.0);\n");
                 } else {
-                    str_buf_append_fmt(&sb, "    outColor = n%u_out0;\n", fn_id);
+                    ab_append_lit(&sb, "    outColor = n");
+                    ab_append_u32(&sb, fn_id);
+                    ab_append_lit(&sb, "_out0;\n");
                 }
             } else {
-                str_buf_append(&sb, (pass == 4) ? "    outColor = vec4(1.0, 1.0, 1.0, 1.0);\n"
+                ab_append_cstr(&sb, (pass == 4) ? "    outColor = vec4(1.0, 1.0, 1.0, 1.0);\n"
                                                 : "    outColor = vec4(0.0, 0.0, 0.0, 1.0);\n");
             }
         }
 
-        str_buf_append(&sb, "}\n\n");
+        ab_append_lit(&sb, "}\n\n");
     }
 
     if (sb.oom) {
-        str_buf_free(&sb);
+        wwal_bump_arena_free(&arena);
         if (out_glsl_len)
             *out_glsl_len = 0;
         return NULL;
     }
 
+    char *result = (char *)malloc(sb.len + 1u);
+    if (!result) {
+        wwal_bump_arena_free(&arena);
+        if (out_glsl_len)
+            *out_glsl_len = 0;
+        return NULL;
+    }
+    memcpy(result, sb.data, sb.len);
+    result[sb.len] = '\0';
     if (out_glsl_len) {
         *out_glsl_len = sb.len;
     }
-    return sb.data;
+    wwal_bump_arena_free(&arena);
+    return result;
 }
 
 /* ========================================================================= */
@@ -3090,9 +4563,10 @@ static int hex_digit_val(char c)
     return -1;
 }
 
-static void utf8_append_codepoint(uint32_t cp, char *out, size_t cap, size_t *io_len)
+static void utf8_append_codepoint(uint32_t cp, char *out, size_t cap, size_t *io_len,
+                                  bool *truncated)
 {
-    if (!out || cap <= 1u)
+    if (!out || cap <= 1u || (truncated && *truncated))
         return;
     char enc[4];
     size_t enc_len = 0;
@@ -3120,6 +4594,8 @@ static void utf8_append_codepoint(uint32_t cp, char *out, size_t cap, size_t *io
     if (*io_len + enc_len < cap) {
         memcpy(out + *io_len, enc, enc_len);
         *io_len += enc_len;
+    } else if (truncated) {
+        *truncated = true;
     }
 }
 
@@ -3131,17 +4607,25 @@ static bool json_parse_string(const char **p, const char *end, char *out, size_t
     const char *cur = *p + 1;
 
     size_t out_len = 0;
+    bool truncated = false;
     while (cur < end) {
         while ((size_t)(end - cur) >= 8u) {
             uint64_t chunk;
             memcpy(&chunk, cur, 8u);
             if (swar_has_json_special(chunk))
                 break;
-            if (out && cap > 1u && out_len + 1u < cap) {
-                size_t avail = cap - 1u - out_len;
-                size_t to_copy = (avail < 8u) ? avail : 8u;
-                memcpy(out + out_len, cur, to_copy);
-                out_len += to_copy;
+            if (out && !truncated && cap > 1u) {
+                if (out_len + 1u < cap) {
+                    size_t avail = cap - 1u - out_len;
+                    size_t to_copy = (avail < 8u) ? avail : 8u;
+                    memcpy(out + out_len, cur, to_copy);
+                    out_len += to_copy;
+                    if (avail < 8u) {
+                        truncated = true;
+                    }
+                } else {
+                    truncated = true;
+                }
             }
             cur += 8u;
         }
@@ -3152,7 +4636,11 @@ static bool json_parse_string(const char **p, const char *end, char *out, size_t
         if (c == '"') {
             *p = cur + 1;
             if (out && cap > 0u) {
-                out[(out_len < cap) ? out_len : (cap - 1u)] = '\0';
+                size_t final_len = (out_len < cap) ? out_len : (cap - 1u);
+                if (truncated) {
+                    final_len = utf8_clamp_boundary(out, final_len);
+                }
+                out[final_len] = '\0';
             }
             return true;
         }
@@ -3222,19 +4710,27 @@ static bool json_parse_string(const char **p, const char *end, char *out, size_t
                 } else if (cp >= 0xDC00u && cp <= 0xDFFFu) {
                     cp = 0xFFFDu;
                 }
-                utf8_append_codepoint(cp, out, cap, &out_len);
+                utf8_append_codepoint(cp, out, cap, &out_len, &truncated);
                 continue;
             }
             default:
                 return false;
             }
-            if (single_byte && out && cap > 1u && out_len + 1u < cap) {
-                out[out_len++] = decoded;
+            if (single_byte && out && !truncated && cap > 1u) {
+                if (out_len + 1u < cap) {
+                    out[out_len++] = decoded;
+                } else {
+                    truncated = true;
+                }
             }
             cur++;
         } else {
-            if (out && cap > 1u && out_len + 1u < cap) {
-                out[out_len++] = (char)c;
+            if (out && !truncated && cap > 1u) {
+                if (out_len + 1u < cap) {
+                    out[out_len++] = (char)c;
+                } else {
+                    truncated = true;
+                }
             }
             cur++;
         }
@@ -3297,6 +4793,8 @@ static bool json_parse_uint(const char **p, const char *end, uint32_t *out_val)
     return true;
 }
 
+#define JSON_SKIP_MAX_DEPTH 128u
+
 static bool json_skip_value(const char **p, const char *end)
 {
     json_skip_ws(p, end);
@@ -3307,28 +4805,31 @@ static bool json_skip_value(const char **p, const char *end)
         return json_parse_string(p, end, NULL, 0);
     }
     if (**p == '{' || **p == '[') {
-        char open_c = **p;
-        char close_c = (open_c == '{') ? '}' : ']';
+        char close_stack[JSON_SKIP_MAX_DEPTH];
+        size_t sp = 0u;
+        close_stack[sp++] = (**p == '{') ? '}' : ']';
         (*p)++;
-        int depth = 1;
-        while (*p < end && depth > 0) {
-            if (**p == open_c) {
-                depth++;
-                (*p)++;
-            } else if (**p == close_c) {
-                depth--;
-                (*p)++;
-            } else if (**p == '"') {
+
+        while (*p < end && sp > 0u) {
+            char c = **p;
+            if (c == '"') {
                 if (!json_parse_string(p, end, NULL, 0))
                     return false;
-            } else if (**p == '{' || **p == '[') {
-                if (!json_skip_value(p, end))
+            } else if (c == '{' || c == '[') {
+                if (sp >= JSON_SKIP_MAX_DEPTH)
                     return false;
+                close_stack[sp++] = (c == '{') ? '}' : ']';
+                (*p)++;
+            } else if (c == '}' || c == ']') {
+                if (c != close_stack[sp - 1u])
+                    return false;
+                sp--;
+                (*p)++;
             } else {
                 (*p)++;
             }
         }
-        return (depth == 0);
+        return (sp == 0u);
     }
     if ((size_t)(end - *p) >= 4u && memcmp(*p, "true", 4u) == 0) {
         *p += 4;

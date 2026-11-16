@@ -213,6 +213,10 @@ bool waywal_pin_types_compatible(uint32_t src_type, uint32_t dst_type);
 /* Tarjan's O(|V| + |E|) SCC cycle detector */
 bool waywal_shader_graph_has_cycle(const waywal_shader_graph_t *graph, uint32_t *out_cycle_node_id);
 
+/* Checks whether connecting src_node_id -> dst_node_id would create an unlatched cycle */
+bool waywal_shader_graph_would_create_cycle(const waywal_shader_graph_t *graph,
+                                            uint32_t src_node_id, uint32_t dst_node_id);
+
 /* Spatial convolution barrier detection & multi-pass Kahn/Sethi-Ullman scheduling */
 bool waywal_shader_graph_analyze(const waywal_shader_graph_t *graph,
                                  waywal_graph_schedule_t *out_schedule);

@@ -6,7 +6,9 @@
 #include "waywal/shader_parser.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -365,6 +367,79 @@ static void apply_fps(waywal_shader_meta_t *meta, int target_pass, uint32_t fps)
     }
 }
 
+/* Copy into a bounded NUL-terminated buffer so strtof never reads past end on non-NUL slices. */
+static bool parse_bounded_f32(const char *s, const char *end, float *out_val, const char **out_next,
+                              bool *out_non_finite)
+{
+    if (out_non_finite) {
+        *out_non_finite = false;
+    }
+    if (!s || !end || s >= end) {
+        return false;
+    }
+    char buf[64];
+    size_t rem = (size_t)(end - s);
+    size_t n = (rem < sizeof(buf) - 1u) ? rem : (sizeof(buf) - 1u);
+    memcpy(buf, s, n);
+    buf[n] = '\0';
+
+    char *endptr = NULL;
+    float val = strtof(buf, &endptr);
+    if (endptr == buf) {
+        return false;
+    }
+    if (out_next) {
+        *out_next = s + (size_t)(endptr - buf);
+    }
+    if (!isfinite(val)) {
+        if (out_non_finite) {
+            *out_non_finite = true;
+        }
+        return false;
+    }
+    *out_val = val;
+    return true;
+}
+
+static uint32_t parse_bounded_u32(const char *s, const char *end)
+{
+    if (!s || !end || s >= end) {
+        return 0u;
+    }
+    char buf[32];
+    size_t rem = (size_t)(end - s);
+    size_t n = (rem < sizeof(buf) - 1u) ? rem : (sizeof(buf) - 1u);
+    memcpy(buf, s, n);
+    buf[n] = '\0';
+    unsigned long v = strtoul(buf, NULL, 10);
+    return (v > UINT32_MAX) ? UINT32_MAX : (uint32_t)v;
+}
+
+static void commit_block_uniform(waywal_shader_meta_t *meta, waywal_shader_uniform_def_t *u)
+{
+    if (!u || u->name[0] == '\0') {
+        return;
+    }
+    if (u->num_components == 0u) {
+        u->num_components = 1u;
+    }
+    if (u->has_range) {
+        uint32_t comps = (u->num_components <= 4u) ? u->num_components : 4u;
+        for (uint32_t c = 0; c < comps; ++c) {
+            if (u->min_val[c] > u->max_val[c]) {
+                float tmp = u->min_val[c];
+                u->min_val[c] = u->max_val[c];
+                u->max_val[c] = tmp;
+            }
+        }
+    }
+    waywal_shader_uniform_def_t *dest = find_or_add_uniform(meta, u->name);
+    if (dest) {
+        *dest = *u;
+    }
+    memset(u, 0, sizeof(*u));
+}
+
 static bool parse_floats(const char *str, const char *end, float *out, uint32_t max_count,
                          uint32_t *out_count)
 {
@@ -376,9 +451,15 @@ static bool parse_floats(const char *str, const char *end, float *out, uint32_t 
         if (p >= end || *p == ']' || *p == ')' || *p == ';') {
             break;
         }
-        char *endptr = NULL;
-        float val = strtof(p, &endptr);
-        if (endptr == p) {
+        float val = 0.0f;
+        const char *next = p;
+        bool non_finite = false;
+        if (!parse_bounded_f32(p, end, &val, &next, &non_finite)) {
+            if (non_finite) {
+                memset(out, 0, sizeof(float) * max_count);
+                *out_count = 0;
+                return false;
+            }
             /* Try skipping non-numeric characters like vec3( or commas */
             if (*p == ',' || *p == '(' || *p == '[' || *p == '=') {
                 p++;
@@ -387,7 +468,7 @@ static bool parse_floats(const char *str, const char *end, float *out, uint32_t 
             break;
         }
         out[count++] = val;
-        p = endptr;
+        p = next;
         p = skip_ws(p, end);
         if (p < end && *p == ',') {
             p++;
@@ -512,8 +593,10 @@ static void parse_uniform_line(waywal_shader_meta_t *meta, const char *s, const 
                 u->default_val[0] = 0.0f;
                 s += 5;
             } else {
-                char *endp = NULL;
-                u->default_val[0] = strtof(s, &endp) != 0.0f ? 1.0f : 0.0f;
+                float bval = 0.0f;
+                const char *endp = s;
+                bool ok = parse_bounded_f32(s, end, &bval, &endp, NULL);
+                u->default_val[0] = (ok && bval != 0.0f) ? 1.0f : 0.0f;
                 s = endp;
             }
         } else {
@@ -545,12 +628,14 @@ static void parse_uniform_line(waywal_shader_meta_t *meta, const char *s, const 
         float bounds[4] = {0};
         uint32_t bcount = 0;
         if (parse_floats(s, end, bounds, 3, &bcount) && bcount >= 2) {
+            float lo = (bounds[0] <= bounds[1]) ? bounds[0] : bounds[1];
+            float hi = (bounds[0] <= bounds[1]) ? bounds[1] : bounds[0];
             u->has_range = true;
             for (uint32_t c = 0; c < components; ++c) {
-                u->min_val[c] = bounds[0];
-                u->max_val[c] = bounds[1];
+                u->min_val[c] = lo;
+                u->max_val[c] = hi;
             }
-            if (bcount >= 3) {
+            if (bcount >= 3 && bounds[2] >= 0.0f) {
                 u->step = bounds[2];
             }
         }
@@ -567,10 +652,20 @@ static void parse_uniform_line(waywal_shader_meta_t *meta, const char *s, const 
     if (!u->has_range) {
         if (type == WAYWAL_UNIFORM_TYPE_FLOAT) {
             u->min_val[0] = 0.0f;
-            u->max_val[0] = (u->default_val[0] > 1.0f) ? u->default_val[0] * 2.0f : 1.0f;
+            if (u->default_val[0] > 1.0f) {
+                double scaled = (double)u->default_val[0] * 2.0;
+                u->max_val[0] = (scaled <= (double)FLT_MAX) ? (float)scaled : FLT_MAX;
+            } else {
+                u->max_val[0] = 1.0f;
+            }
         } else if (type == WAYWAL_UNIFORM_TYPE_INT) {
             u->min_val[0] = 0.0f;
-            u->max_val[0] = (u->default_val[0] > 10.0f) ? u->default_val[0] * 2.0f : 10.0f;
+            if (u->default_val[0] > 10.0f) {
+                double scaled = (double)u->default_val[0] * 2.0;
+                u->max_val[0] = (scaled <= (double)FLT_MAX) ? (float)scaled : FLT_MAX;
+            } else {
+                u->max_val[0] = 10.0f;
+            }
         } else if (type == WAYWAL_UNIFORM_TYPE_BOOL) {
             u->min_val[0] = 0.0f;
             u->max_val[0] = 1.0f;
@@ -652,14 +747,7 @@ bool waywal_shader_parse_meta(const char *src, size_t len, waywal_shader_meta_t 
 
             if (clen >= 9 && strncasecmp(c, "[UNIFORM]", 9) == 0) {
                 in_uniform_block = true;
-                if (active_block_uniform.name[0] != '\0') {
-                    waywal_shader_uniform_def_t *dest =
-                        find_or_add_uniform(out_meta, active_block_uniform.name);
-                    if (dest) {
-                        *dest = active_block_uniform;
-                    }
-                    memset(&active_block_uniform, 0, sizeof(active_block_uniform));
-                }
+                commit_block_uniform(out_meta, &active_block_uniform);
             } else if (in_uniform_block) {
                 /* Key-value attributes in [UNIFORM] block */
                 if (clen > 5 && strncasecmp(c, "type:", 5) == 0) {
@@ -707,16 +795,21 @@ bool waywal_shader_parse_meta(const char *src, size_t len, waywal_shader_meta_t 
                 } else if (clen > 4 && strncasecmp(c, "min:", 4) == 0) {
                     const char *v = skip_ws(c + 4, send);
                     uint32_t cnt = 0;
-                    parse_floats(v, send, active_block_uniform.min_val, 4, &cnt);
-                    active_block_uniform.has_range = true;
+                    if (parse_floats(v, send, active_block_uniform.min_val, 4, &cnt)) {
+                        active_block_uniform.has_range = true;
+                    }
                 } else if (clen > 4 && strncasecmp(c, "max:", 4) == 0) {
                     const char *v = skip_ws(c + 4, send);
                     uint32_t cnt = 0;
-                    parse_floats(v, send, active_block_uniform.max_val, 4, &cnt);
-                    active_block_uniform.has_range = true;
+                    if (parse_floats(v, send, active_block_uniform.max_val, 4, &cnt)) {
+                        active_block_uniform.has_range = true;
+                    }
                 } else if (clen > 5 && strncasecmp(c, "step:", 5) == 0) {
                     const char *v = skip_ws(c + 5, send);
-                    active_block_uniform.step = strtof(v, NULL);
+                    float step_val = 0.0f;
+                    if (parse_bounded_f32(v, send, &step_val, NULL, NULL) && step_val >= 0.0f) {
+                        active_block_uniform.step = step_val;
+                    }
                 }
             }
 
@@ -776,19 +869,25 @@ bool waywal_shader_parse_meta(const char *src, size_t len, waywal_shader_meta_t 
             } else if (clen > 6 && strncasecmp(c, "@scale", 6) == 0 &&
                        (c[6] == ':' || c[6] == '=' || c[6] == ' ' || c[6] == '\t')) {
                 const char *v = skip_ws(c + 7, send);
-                apply_scale(out_meta, cur_pass, strtof(v, NULL));
+                float sc = 0.0f;
+                if (parse_bounded_f32(v, send, &sc, NULL, NULL)) {
+                    apply_scale(out_meta, cur_pass, sc);
+                }
             } else if (clen > 11 && strncasecmp(c, "@wwal_scale", 11) == 0 &&
                        (c[11] == ':' || c[11] == '=' || c[11] == ' ' || c[11] == '\t')) {
                 const char *v = skip_ws(c + 12, send);
-                apply_scale(out_meta, cur_pass, strtof(v, NULL));
+                float sc = 0.0f;
+                if (parse_bounded_f32(v, send, &sc, NULL, NULL)) {
+                    apply_scale(out_meta, cur_pass, sc);
+                }
             } else if (clen > 4 && strncasecmp(c, "@fps", 4) == 0 &&
                        (c[4] == ':' || c[4] == '=' || c[4] == ' ' || c[4] == '\t')) {
                 const char *v = skip_ws(c + 5, send);
-                apply_fps(out_meta, cur_pass, (uint32_t)strtoul(v, NULL, 10));
+                apply_fps(out_meta, cur_pass, parse_bounded_u32(v, send));
             } else if (clen > 9 && strncasecmp(c, "@wwal_fps", 9) == 0 &&
                        (c[9] == ':' || c[9] == '=' || c[9] == ' ' || c[9] == '\t')) {
                 const char *v = skip_ws(c + 10, send);
-                apply_fps(out_meta, cur_pass, (uint32_t)strtoul(v, NULL, 10));
+                apply_fps(out_meta, cur_pass, parse_bounded_u32(v, send));
             } else {
                 /* Check for channel directives like // iChannel0: audio or // [CHANNEL0] audio */
                 int ch = -1;
@@ -880,13 +979,16 @@ bool waywal_shader_parse_meta(const char *src, size_t len, waywal_shader_meta_t 
                 if (v < send && (*v == '=' || *v == ':')) {
                     v = skip_ws(v + 1, send);
                 }
-                apply_scale(out_meta, target_pass, strtof(v, NULL));
+                float sc = 0.0f;
+                if (parse_bounded_f32(v, send, &sc, NULL, NULL)) {
+                    apply_scale(out_meta, target_pass, sc);
+                }
             } else if (clen >= 3 && strncasecmp(c, "fps", 3) == 0) {
                 const char *v = skip_ws(c + 3, send);
                 if (v < send && (*v == '=' || *v == ':')) {
                     v = skip_ws(v + 1, send);
                 }
-                apply_fps(out_meta, target_pass, (uint32_t)strtoul(v, NULL, 10));
+                apply_fps(out_meta, target_pass, parse_bounded_u32(v, send));
             }
         }
 
@@ -896,12 +998,8 @@ bool waywal_shader_parse_meta(const char *src, size_t len, waywal_shader_meta_t 
         p = nl + 1;
     }
 
-    if (in_uniform_block && active_block_uniform.name[0] != '\0') {
-        waywal_shader_uniform_def_t *dest =
-            find_or_add_uniform(out_meta, active_block_uniform.name);
-        if (dest) {
-            *dest = active_block_uniform;
-        }
+    if (in_uniform_block) {
+        commit_block_uniform(out_meta, &active_block_uniform);
     }
 
     return true;
@@ -936,6 +1034,9 @@ bool waywal_shader_parse_file(const char *filepath, waywal_shader_meta_t *out_me
     while (read_bytes < size) {
         ssize_t n = read(fd, buf + read_bytes, size - read_bytes);
         if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
             free(buf);
             close(fd);
             return false;
