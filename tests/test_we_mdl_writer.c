@@ -792,7 +792,7 @@ static void test_scene_writer_puppet_and_sidecar_roundtrip(void)
     size_t entry_sz = 0u;
     assert(we_pkg_find(pkg, "models/hero_character_42.mdl", &entry_sz) != NULL);
     assert(we_pkg_find(pkg, "materials/hero_character_42.json", &entry_sz) != NULL);
-    assert(we_pkg_find(pkg, "models/hero_character_42.json", &entry_sz) != NULL);
+    assert(we_pkg_find(pkg, "models/hero_character_42.json", &entry_sz) == NULL);
     assert(we_pkg_find(pkg, "studio_rig_42.json", &entry_sz) == NULL);
     we_pkg_close(pkg);
 
@@ -823,6 +823,126 @@ static void test_scene_writer_puppet_and_sidecar_roundtrip(void)
     rm_rf_tmp(dir_pkg);
 }
 
+static void test_aud130_aud291_writer_safety_and_utf8(void)
+{
+    /* 1. AUD-291: Extreme gravity_scale clamps finite JSON without "inf" */
+    we_bone_sim_config_t sim_cfg = {
+        .bone_index = 0u,
+        .flags = WE_BONE_PHYS_ENABLED,
+        .compliance_bend = 0.01f,
+        .damping_ratio = 0.25f,
+        .mass_kg = 1.0f,
+        .gravity_scale = 1e38f,
+        .wind_drag_coeff = 0.1f,
+        .angle_limit_min_rad = -1.0f,
+        .angle_limit_max_rad = 1.0f,
+        .collision_radius_px = 10.0f,
+        .rest_length_px = 20.0f,
+        .audio_drag_coeff = 0.2f,
+    };
+    char sjson[256] = {0};
+    assert(we_physics_format_simulation_json(&sim_cfg, sjson));
+    assert(strstr(sjson, "inf") == NULL && strstr(sjson, "nan") == NULL &&
+           strstr(sjson, "Inf") == NULL && strstr(sjson, "NaN") == NULL);
+    we_bone_sim_config_t parsed_cfg = {0};
+    assert(we_physics_parse_simulation_json(sjson, &parsed_cfg));
+    assert(isfinite(parsed_cfg.gravity_scale));
+
+    /* 2. AUD-291: UTF-8 multi-byte round-trip & UTF-8 boundary-safe truncation */
+    we_mdl_vertex_t verts[4];
+    uint16_t indices[6];
+    we_mdl_bone_t bones[3];
+    we_mdl_anim_t anims[3];
+    we_mdl_bone_track_t tracks[3][3];
+    we_mdl_keyframe_t kfs[3][3][4];
+    we_puppet_t p;
+    build_test_puppet(&p, verts, indices, bones, anims, tracks, kfs);
+
+    /* Valid UTF-8 round-trip (sanitize_ascii_strings = false) */
+    snprintf(bones[0].name, sizeof(bones[0].name), "bone_\xce\xb1\xce\xb2\xf0\x9f\x9a\x80");
+    char valid_long_utf8[128];
+    for (int i = 0; i < 31; i++) {
+        memcpy(valid_long_utf8 + i * 4, "\xf0\x9f\x9a\x80", 4);
+    }
+    valid_long_utf8[124] = 'a';
+    valid_long_utf8[125] = 'b';
+    valid_long_utf8[126] = '\0';
+    snprintf(bones[1].name, sizeof(bones[1].name), "%s", valid_long_utf8);
+
+    we_mdl_write_opts_t opts;
+    we_mdl_write_opts_default(&opts);
+    opts.sanitize_ascii_strings = false;
+
+    uint8_t *mdl_buf = NULL;
+    size_t mdl_sz = 0u;
+    assert(we_mdl_write_mem(&p, &opts, &mdl_buf, &mdl_sz));
+    we_puppet_t *loaded = we_puppet_parse_cpu(mdl_buf, mdl_sz);
+    assert(loaded != NULL);
+    assert(strcmp(loaded->bones[0].name, "bone_\xce\xb1\xce\xb2\xf0\x9f\x9a\x80") == 0);
+    assert(strcmp(loaded->bones[1].name, valid_long_utf8) == 0);
+    we_puppet_destroy(loaded);
+    we_mdl_write_free(mdl_buf);
+
+    /* Truncated incomplete UTF-8 input rejected when !sanitize_ascii_strings, sanitized cleanly
+     * when sanitize_ascii_strings = true. */
+    char trunc_utf8[128] = {0};
+    for (int i = 0; i < 32; i++) {
+        if (i * 4 < 127) {
+            memcpy(trunc_utf8 + i * 4, "\xf0\x9f\x9a\x80",
+                   (size_t)((i * 4 + 4 <= 127) ? 4 : (127 - i * 4)));
+        }
+    }
+    trunc_utf8[127] = '\0';
+    memcpy(bones[1].name, trunc_utf8, sizeof(bones[1].name));
+    assert(!we_mdl_write_mem(&p, &opts, &mdl_buf, &mdl_sz));
+
+    opts.sanitize_ascii_strings = true;
+    assert(we_mdl_write_mem(&p, &opts, &mdl_buf, &mdl_sz));
+    loaded = we_puppet_parse_cpu(mdl_buf, mdl_sz);
+    assert(loaded != NULL);
+    const unsigned char *u1 = (const unsigned char *)loaded->bones[1].name;
+    size_t u1_len = strlen(loaded->bones[1].name);
+    for (size_t k = 0; k < u1_len;) {
+        assert((u1[k] & 0xC0u) != 0x80u);
+        if (u1[k] < 0x80u) {
+            k += 1u;
+        } else if ((u1[k] & 0xE0u) == 0xC0u) {
+            assert(k + 2u <= u1_len);
+            k += 2u;
+        } else if ((u1[k] & 0xF0u) == 0xE0u) {
+            assert(k + 3u <= u1_len);
+            k += 3u;
+        } else {
+            assert((u1[k] & 0xF8u) == 0xF0u && k + 4u <= u1_len);
+            k += 4u;
+        }
+    }
+    we_puppet_destroy(loaded);
+    we_mdl_write_free(mdl_buf);
+    snprintf(bones[1].name, sizeof(bones[1].name), "%s", valid_long_utf8);
+    opts.sanitize_ascii_strings = false;
+
+    /* 3. AUD-130: open_parent_dir_beneath() symlinked parent rejection & allowlisted /tmp write */
+    char tmpl[] = "/tmp/we_mdl_openat2_XXXXXX";
+    char *tdir = mkdtemp(tmpl);
+    assert(tdir != NULL);
+    char real_sub[256], sym_sub[256], sym_out[280], ok_out[280];
+    snprintf(real_sub, sizeof(real_sub), "%s/real_sub", tdir);
+    snprintf(sym_sub, sizeof(sym_sub), "%s/sym_sub", tdir);
+    assert(mkdir(real_sub, 0755) == 0);
+    assert(symlink(real_sub, sym_sub) == 0);
+
+    snprintf(sym_out, sizeof(sym_out), "%s/evil.mdl", sym_sub);
+    assert(!we_mdl_write_file(&p, &opts, sym_out));
+
+    snprintf(ok_out, sizeof(ok_out), "%s/clean.mdl", real_sub);
+    assert(we_mdl_write_file(&p, &opts, ok_out));
+    unlink(ok_out);
+    unlink(sym_sub);
+    rmdir(real_sub);
+    rmdir(tdir);
+}
+
 int main(void)
 {
     test_roundtrip_mesh_skeleton_and_animations();
@@ -830,6 +950,7 @@ int main(void)
     test_options_flags_and_sanitization();
     test_invalid_inputs_and_fuzz_rejection();
     test_write_file_atomic_and_symlink_rejection();
+    test_aud130_aud291_writer_safety_and_utf8();
     test_scene_writer_puppet_and_sidecar_roundtrip();
     printf("All we_mdl_writer tests passed.\n");
     return 0;

@@ -12,6 +12,7 @@
 #include <limits.h>
 #include <locale.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +21,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "waywal/os_compat.h"
 #include "waywal/we_asset_writer.h"
 #include "waywal/we_puppet.h"
 
@@ -105,9 +107,41 @@ static void write_magic9(mdl_cursor_t *c, const char magic8[8])
     c->pos += WE_MDL_MAGIC_SIZE;
 }
 
-static bool is_valid_mdl_char(unsigned char ch)
+static size_t valid_utf8_seq_len(const uint8_t *p, size_t rem)
 {
-    return (ch >= 0x20u && ch <= 0x7Eu) || ch == '\t' || ch == '\n' || ch == '\r';
+    if (rem == 0u) {
+        return 0u;
+    }
+    uint8_t c = p[0];
+    if (c < 0x80u) {
+        return ((c >= 0x20u && c <= 0x7Eu) || c == '\t' || c == '\n' || c == '\r') ? 1u : 0u;
+    }
+    if (c >= 0xC2u && c <= 0xDFu) {
+        if (rem < 2u || (p[1] & 0xC0u) != 0x80u || (c == 0xC2u && p[1] < 0xA0u)) {
+            return 0u;
+        }
+        return 2u;
+    }
+    if (c >= 0xE0u && c <= 0xEFu) {
+        if (rem < 3u || (p[1] & 0xC0u) != 0x80u || (p[2] & 0xC0u) != 0x80u) {
+            return 0u;
+        }
+        if ((c == 0xE0u && p[1] < 0xA0u) || (c == 0xEDu && p[1] > 0x9Fu)) {
+            return 0u;
+        }
+        return 3u;
+    }
+    if (c >= 0xF0u && c <= 0xF4u) {
+        if (rem < 4u || (p[1] & 0xC0u) != 0x80u || (p[2] & 0xC0u) != 0x80u ||
+            (p[3] & 0xC0u) != 0x80u) {
+            return 0u;
+        }
+        if ((c == 0xF0u && p[1] < 0x90u) || (c == 0xF4u && p[1] > 0x8Fu)) {
+            return 0u;
+        }
+        return 4u;
+    }
+    return 0u;
 }
 
 static bool prepare_mdl_string(const char *src, size_t max_chars, bool sanitize, char *out,
@@ -117,27 +151,38 @@ static bool prepare_mdl_string(const char *src, size_t max_chars, bool sanitize,
         return false;
     }
 
-    size_t n = strnlen(src, max_chars + 1u);
-    if (n > max_chars) {
-        if (!sanitize) {
-            return false;
+    size_t i = 0u;
+    size_t out_pos = 0u;
+    while (src[i] != '\0') {
+        size_t rem = 0u;
+        while (rem < 4u && src[i + rem] != '\0') {
+            rem++;
         }
-        n = max_chars;
-    }
-
-    for (size_t i = 0u; i < n; ++i) {
-        unsigned char ch = (unsigned char)src[i];
-        if (!is_valid_mdl_char(ch)) {
+        size_t seq = valid_utf8_seq_len((const uint8_t *)(src + i), rem);
+        if (seq == 0u) {
             if (!sanitize) {
                 return false;
             }
-            out[i] = '_';
+            if (out_pos + 1u > max_chars) {
+                break;
+            }
+            out[out_pos++] = '_';
+            i += 1u;
         } else {
-            out[i] = (char)ch;
+            /* Stop at codepoint boundaries when truncating so UTF-8 stays valid. */
+            if (out_pos + seq > max_chars) {
+                if (!sanitize) {
+                    return false;
+                }
+                break;
+            }
+            memcpy(out + out_pos, src + i, seq);
+            out_pos += seq;
+            i += seq;
         }
     }
-    out[n] = '\0';
-    *out_len_with_nul = (uint32_t)(n + 1u);
+    out[out_pos] = '\0';
+    *out_len_with_nul = (uint32_t)(out_pos + 1u);
     return true;
 }
 
@@ -218,42 +263,68 @@ static bool validate_skeleton_topology_and_matrices(const we_puppet_t *puppet)
     return true;
 }
 
-static bool path_has_symlink_component(const char *path)
+static bool normalize_dir_slashes(const char *src, size_t len, char *dst, size_t dst_cap)
 {
-    if (!path || path[0] == '\0') {
-        return true;
+    if (!src || !dst || dst_cap == 0u || len >= dst_cap) {
+        return false;
     }
-    size_t len = strnlen(path, PATH_MAX);
-    if (len == 0u || len >= PATH_MAX || path[len - 1u] == '/') {
-        return true;
-    }
-
-    struct stat st;
-    if (lstat(path, &st) == 0 && (S_ISLNK(st.st_mode) || S_ISDIR(st.st_mode))) {
-        return true;
-    }
-
-    char walk[PATH_MAX];
-    memcpy(walk, path, len + 1u);
-    for (size_t i = 1u; i < len; ++i) {
-        if (walk[i] != '/') {
+    size_t out = 0u;
+    for (size_t i = 0u; i < len; ++i) {
+        if (src[i] == '/' && out > 0u && dst[out - 1u] == '/') {
             continue;
         }
-        walk[i] = '\0';
-        if (lstat(walk, &st) == 0) {
-            if (S_ISLNK(st.st_mode) || !S_ISDIR(st.st_mode)) {
-                return true;
-            }
-        } else if (errno != ENOENT) {
-            return true;
+        if (out + 1u >= dst_cap) {
+            return false;
         }
-        walk[i] = '/';
+        dst[out++] = src[i];
     }
-    return false;
+    while (out > 1u && dst[out - 1u] == '/') {
+        --out;
+    }
+    dst[out] = '\0';
+    return true;
 }
 
-/* Walks every parent directory component with O_DIRECTORY | O_NOFOLLOW to prevent TOCTOU. */
-static int open_parent_dir_nofollow(const char *path, char *out_leaf, size_t leaf_cap)
+static void add_root_candidate(char roots[][PATH_MAX], size_t lens[], size_t *count,
+                               size_t max_roots, const char *raw)
+{
+    if (!raw || raw[0] != '/' || *count >= max_roots) {
+        return;
+    }
+    char norm[PATH_MAX];
+    if (!normalize_dir_slashes(raw, strnlen(raw, PATH_MAX - 1u), norm, sizeof(norm))) {
+        return;
+    }
+    size_t nlen = strlen(norm);
+    /* Never anchor at filesystem root "/" (blocked by Landlock ABI v11). */
+    if (nlen <= 1u) {
+        return;
+    }
+    for (size_t i = 0u; i < *count; ++i) {
+        if (lens[i] == nlen && strcmp(roots[i], norm) == 0) {
+            return;
+        }
+    }
+    memcpy(roots[*count], norm, nlen + 1u);
+    lens[*count] = nlen;
+    (*count)++;
+}
+
+static void add_joined_root_candidate(char roots[][PATH_MAX], size_t lens[], size_t *count,
+                                      size_t max_roots, const char *base, const char *suffix)
+{
+    if (!base || base[0] != '/' || !suffix || suffix[0] == '\0') {
+        return;
+    }
+    char joined[PATH_MAX];
+    int n = snprintf(joined, sizeof(joined), "%s/%s", base, suffix);
+    if (n > 0 && (size_t)n < sizeof(joined)) {
+        add_root_candidate(roots, lens, count, max_roots, joined);
+    }
+}
+
+/* Resolves parent directory via wwal_openat2_beneath() anchored at deepest allowlisted ancestor. */
+static int open_parent_dir_beneath(const char *path, char *out_leaf, size_t leaf_cap)
 {
     if (!path || path[0] == '\0' || !out_leaf || leaf_cap == 0u) {
         return -1;
@@ -272,59 +343,111 @@ static int open_parent_dir_nofollow(const char *path, char *out_leaf, size_t lea
     }
     memcpy(out_leaf, leaf, leaf_len + 1u);
 
-    int cur_fd = -1;
-    size_t pos = 0u;
-    size_t prefix_end = 0u;
-    if (last_slash) {
-        prefix_end = (size_t)(last_slash - path);
-        if (path[0] == '/') {
-            cur_fd = open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-            pos = 1u;
+    int dir_fd = -1;
+    if (!last_slash) {
+        dir_fd = open(".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    } else if (path[0] != '/') {
+        char rel_dir[PATH_MAX];
+        if (!normalize_dir_slashes(path, (size_t)(last_slash - path), rel_dir, sizeof(rel_dir))) {
+            return -1;
+        }
+        int anchor_fd = open(".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (anchor_fd < 0) {
+            return -1;
+        }
+        if (rel_dir[0] == '\0') {
+            dir_fd = anchor_fd;
         } else {
-            cur_fd = open(".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            dir_fd = wwal_openat2_beneath(anchor_fd, rel_dir, O_RDONLY | O_DIRECTORY, 0);
+            close(anchor_fd);
         }
     } else {
-        cur_fd = open(".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    }
-    if (cur_fd < 0) {
-        return -1;
-    }
-
-    while (pos < prefix_end) {
-        while (pos < prefix_end && path[pos] == '/') {
-            ++pos;
+        size_t prefix_len = (size_t)(last_slash - path);
+        if (prefix_len == 0u) {
+            return -1;
         }
-        if (pos >= prefix_end) {
+        char abs_dir[PATH_MAX];
+        if (!normalize_dir_slashes(path, prefix_len, abs_dir, sizeof(abs_dir))) {
+            return -1;
+        }
+
+        char roots[10][PATH_MAX];
+        size_t rlens[10] = {0};
+        size_t rcount = 0u;
+        const char *xdg_data = getenv("XDG_DATA_HOME");
+        const char *xdg_rt = getenv("XDG_RUNTIME_DIR");
+        const char *xdg_cache = getenv("XDG_CACHE_HOME");
+        const char *xdg_cfg = getenv("XDG_CONFIG_HOME");
+        const char *home = getenv("HOME");
+        add_joined_root_candidate(roots, rlens, &rcount, 10u, xdg_data, "wwal");
+        add_root_candidate(roots, rlens, &rcount, 10u, xdg_data);
+        add_root_candidate(roots, rlens, &rcount, 10u, xdg_rt);
+        add_root_candidate(roots, rlens, &rcount, 10u, xdg_cache);
+        add_root_candidate(roots, rlens, &rcount, 10u, xdg_cfg);
+        add_joined_root_candidate(roots, rlens, &rcount, 10u, home, ".local/share/wwal");
+        add_joined_root_candidate(roots, rlens, &rcount, 10u, home, ".local/share");
+        add_root_candidate(roots, rlens, &rcount, 10u, home);
+        add_root_candidate(roots, rlens, &rcount, 10u, "/tmp");
+
+        /* Sort matching ancestors from deepest to shallowest before opening anchor. */
+        size_t order[10];
+        size_t mcount = 0u;
+        for (size_t i = 0u; i < rcount; ++i) {
+            size_t rl = rlens[i];
+            if (strncmp(abs_dir, roots[i], rl) == 0 &&
+                (abs_dir[rl] == '\0' || abs_dir[rl] == '/')) {
+                order[mcount++] = i;
+            }
+        }
+        for (size_t i = 1u; i < mcount; ++i) {
+            size_t key = order[i];
+            size_t j = i;
+            while (j > 0u && rlens[order[j - 1u]] < rlens[key]) {
+                order[j] = order[j - 1u];
+                --j;
+            }
+            order[j] = key;
+        }
+
+        for (size_t m = 0u; m < mcount; ++m) {
+            size_t idx = order[m];
+            int anchor_fd = open(roots[idx], O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (anchor_fd < 0) {
+                continue;
+            }
+            const char *rel = abs_dir + rlens[idx];
+            while (*rel == '/') {
+                ++rel;
+            }
+            if (*rel == '\0') {
+                dir_fd = anchor_fd;
+            } else {
+                dir_fd = wwal_openat2_beneath(anchor_fd, rel, O_RDONLY | O_DIRECTORY, 0);
+                close(anchor_fd);
+            }
             break;
         }
-        size_t start = pos;
-        while (pos < prefix_end && path[pos] != '/') {
-            ++pos;
-        }
-        size_t comp_len = pos - start;
-        if (comp_len == 0u || comp_len > NAME_MAX) {
-            close(cur_fd);
-            return -1;
-        }
-        char comp[NAME_MAX + 1u];
-        memcpy(comp, path + start, comp_len);
-        comp[comp_len] = '\0';
+    }
 
-        int next_fd = openat(cur_fd, comp, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-        close(cur_fd);
-        if (next_fd < 0) {
-            return -1;
-        }
-        cur_fd = next_fd;
+    if (dir_fd < 0) {
+        return -1;
     }
 
     struct stat leaf_st;
-    if (fstatat(cur_fd, out_leaf, &leaf_st, AT_SYMLINK_NOFOLLOW) == 0 &&
+    if (fstatat(dir_fd, out_leaf, &leaf_st, AT_SYMLINK_NOFOLLOW) == 0 &&
         (S_ISLNK(leaf_st.st_mode) || S_ISDIR(leaf_st.st_mode))) {
-        close(cur_fd);
+        close(dir_fd);
         return -1;
     }
-    return cur_fd;
+    return dir_fd;
+}
+
+static pthread_once_t g_mdl_c_locale_once = PTHREAD_ONCE_INIT;
+static locale_t g_mdl_c_locale = (locale_t)0;
+
+static void init_mdl_c_locale(void)
+{
+    g_mdl_c_locale = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
 }
 
 static bool write_all_fd(int fd, const uint8_t *data, size_t size)
@@ -378,19 +501,23 @@ bool we_physics_format_simulation_json(const we_bone_sim_config_t *cfg, char out
     float ratio = fminf(fmaxf(cfg->compliance_bend / 0.05f, 0.0f), 1.0f);
     float stiffness = fminf(fmaxf(1.0f - cbrtf(ratio), 0.0f), 1.0f);
     float damping = fmaxf(cfg->damping_ratio, 0.0f);
-    /* Parser divides gravity values > 2.0 by 9.8, assuming pixel-space acceleration units. */
-    float gravity =
-        (fabsf(cfg->gravity_scale) > 2.0f) ? (cfg->gravity_scale * 9.8f) : cfg->gravity_scale;
+    /* Compute scaled gravity in float64 and clamp within float32 range so JSON never emits "inf".
+     */
+    double gravity_raw = (fabs((double)cfg->gravity_scale) > 2.0)
+                             ? ((double)cfg->gravity_scale * 9.8)
+                             : (double)cfg->gravity_scale;
+    const double max_gravity = 3.4e38;
+    double gravity = fmin(fmax(gravity_raw, -max_gravity), max_gravity);
     float mass = fmaxf(cfg->mass_kg, 0.01f);
     float length = fmaxf(cfg->rest_length_px, 1.0f);
     float wind = fmaxf(cfg->wind_drag_coeff, 0.0f);
     float audio = fmaxf(cfg->audio_drag_coeff, 0.0f);
 
-    locale_t cloc = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
-    if (!cloc) {
+    (void)pthread_once(&g_mdl_c_locale_once, init_mdl_c_locale);
+    if (g_mdl_c_locale == (locale_t)0) {
         return false;
     }
-    locale_t prev = uselocale(cloc);
+    locale_t prev = uselocale(g_mdl_c_locale);
 
     char extra[96];
     extra[0] = '\0';
@@ -422,12 +549,11 @@ bool we_physics_format_simulation_json(const we_bone_sim_config_t *cfg, char out
         n = snprintf(out_json, 256u,
                      "{\"stiffness\":%.6g,\"damping\":%.6g,\"gravity\":%.6g,\"mass\":%.6g,"
                      "\"length\":%.6g,\"wind\":%.6g,\"audio\":%.6g%s}",
-                     (double)stiffness, (double)damping, (double)gravity, (double)mass,
-                     (double)length, (double)wind, (double)audio, extra);
+                     (double)stiffness, (double)damping, gravity, (double)mass, (double)length,
+                     (double)wind, (double)audio, extra);
     }
 
     uselocale(prev);
-    freelocale(cloc);
 
     if (!ok || n <= 0 || (size_t)n >= 256u) {
         out_json[0] = '\0';
@@ -753,12 +879,9 @@ bool we_mdl_write_file(const we_puppet_t *puppet, const we_mdl_write_opts_t *opt
     if (!puppet || !path || path[0] == '\0') {
         return false;
     }
-    if (path_has_symlink_component(path)) {
-        return false;
-    }
 
     char leaf[NAME_MAX + 1u];
-    int dir_fd = open_parent_dir_nofollow(path, leaf, sizeof(leaf));
+    int dir_fd = open_parent_dir_beneath(path, leaf, sizeof(leaf));
     if (dir_fd < 0) {
         return false;
     }
@@ -785,7 +908,7 @@ bool we_mdl_write_file(const we_puppet_t *puppet, const we_mdl_write_opts_t *opt
         }
     }
 
-    int fd = openat(dir_fd, tmp_name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+    int fd = wwal_openat2_beneath(dir_fd, tmp_name, O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (fd < 0) {
         we_mdl_write_free(bytes);
         close(dir_fd);
@@ -802,6 +925,9 @@ bool we_mdl_write_file(const we_puppet_t *puppet, const we_mdl_write_opts_t *opt
         ok = false;
     }
     if (ok && renameat(dir_fd, tmp_name, dir_fd, leaf) < 0) {
+        ok = false;
+    }
+    if (ok && fsync(dir_fd) < 0 && errno != EINVAL && errno != EROFS && errno != EBADF) {
         ok = false;
     }
     if (!ok) {

@@ -5,7 +5,14 @@
 
 #include <EGL/egl.h>
 #include <GLES3/gl31.h>
+#ifdef HAVE_OPENMP
+#include <omp.h>
+#endif
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(WWAL_DISABLE_SIMD)
+#include <immintrin.h>
+#endif
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -15,13 +22,31 @@
 #include <strings.h>
 #include <time.h>
 
-#define WE_RIG_PI         3.14159265358979323846
-#define WE_RIG_TWO_PI_F   6.28318530717958647692f
-#define WE_RIG_PI_F       3.14159265358979323846f
-#define WE_RIG_DDA_GRID_N 64u
-#define WE_RIG_COW_WORDS  ((WE_MDL_MAX_VERTICES / WE_RIG_COW_BLOCK_VERTS + 63u) / 64u)
-#define WE_RIG_RHS_BATCH  8u
-#define WE_RIG_EMPTY_EDGE UINT32_MAX
+#define WE_RIG_PI          3.14159265358979323846
+#define WE_RIG_TWO_PI_F    6.28318530717958647692f
+#define WE_RIG_PI_F        3.14159265358979323846f
+#define WE_RIG_DDA_GRID_N  64u
+#define WE_RIG_COW_WORDS   ((WE_MDL_MAX_VERTICES / WE_RIG_COW_BLOCK_VERTS + 63u) / 64u)
+#define WE_RIG_RHS_BATCH   8u
+#define WE_RIG_SOLVE_BATCH 4u
+#define WE_RIG_SN_MAX_W    24u
+#define WE_RIG_EMPTY_EDGE  UINT32_MAX
+
+static inline bool rig_cpu_has_avx2_fma(void)
+{
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(WWAL_DISABLE_SIMD)
+    static atomic_int s_has_avx2_fma = -1;
+    int v = atomic_load_explicit(&s_has_avx2_fma, memory_order_relaxed);
+    if (v >= 0) {
+        return v != 0;
+    }
+    int has = (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) ? 1 : 0;
+    atomic_store_explicit(&s_has_avx2_fma, has, memory_order_relaxed);
+    return has != 0;
+#else
+    return false;
+#endif
+}
 
 static double monotonic_ms(void)
 {
@@ -301,11 +326,9 @@ typedef struct {
 } boundary_edge_t;
 
 typedef struct {
-    uint32_t key_lo;
-    uint32_t key_hi;
-    uint32_t he0;
-    uint32_t count;
-} edge_hash_slot_t;
+    uint32_t hi;
+    uint32_t he;
+} edge_bucket_item_t;
 
 typedef struct {
     double ax, ay;
@@ -329,117 +352,174 @@ typedef struct {
     double *diag_L;
 } laplacian_csr_t;
 
-static inline uint32_t hash_u32_pair(uint32_t a, uint32_t b)
-{
-    uint64_t x = ((uint64_t)a << 32u) | (uint64_t)b;
-    x ^= x >> 33u;
-    x *= 0xff51afd7ed558ccdULL;
-    x ^= x >> 33u;
-    x *= 0xc4ceb9fe1a85ec53ULL;
-    x ^= x >> 33u;
-    return (uint32_t)x;
-}
-
-static inline uint32_t next_pow2_u32(uint32_t v)
-{
-    uint32_t p = 1u;
-    while (p < v && p < (1u << 30u)) {
-        p <<= 1u;
-    }
-    return p;
-}
-
 static bool build_intrinsic_mesh_and_boundaries(const we_puppet_t *puppet, uint32_t *tri_verts,
                                                 uint32_t *opp_he, double *he_len2,
                                                 boundary_edge_t **out_b_edges,
                                                 uint32_t *out_b_count)
 {
+    uint32_t V = puppet->vertex_count;
     uint32_t T = puppet->triangle_count;
     uint32_t he_count = T * 3u;
-    uint32_t cap = next_pow2_u32(he_count * 2u + 16u);
-    edge_hash_slot_t *ht = calloc(cap, sizeof(edge_hash_slot_t));
-    if (!ht) {
+    if (he_count == 0u || V == 0u) {
+        *out_b_edges = NULL;
+        *out_b_count = 0u;
+        return true;
+    }
+
+    uint32_t *off = calloc((size_t)V + 1u, sizeof(uint32_t));
+    uint32_t *cur = malloc((size_t)V * sizeof(uint32_t));
+    if (!off || !cur) {
+        free(off);
+        free(cur);
         return false;
     }
-    uint32_t mask = cap - 1u;
 
-    for (uint32_t h = 0; h < he_count; h++) {
-        opp_he[h] = WE_RIG_EMPTY_EDGE;
-    }
-
+    const we_mdl_vertex_t *verts = puppet->vertices;
+    const uint16_t *idx = puppet->indices;
     for (uint32_t t = 0; t < T; t++) {
-        uint32_t i0 = puppet->indices[t * 3u + 0u];
-        uint32_t i1 = puppet->indices[t * 3u + 1u];
-        uint32_t i2 = puppet->indices[t * 3u + 2u];
+        uint32_t i0 = idx[t * 3u + 0u];
+        uint32_t i1 = idx[t * 3u + 1u];
+        uint32_t i2 = idx[t * 3u + 2u];
         tri_verts[t * 3u + 0u] = i0;
         tri_verts[t * 3u + 1u] = i1;
         tri_verts[t * 3u + 2u] = i2;
 
+        uint32_t tv[3] = {i0, i1, i2};
         for (uint32_t c = 0; c < 3u; c++) {
             uint32_t h = t * 3u + c;
-            uint32_t a = tri_verts[t * 3u + c];
-            uint32_t b = tri_verts[t * 3u + ((c + 1u) % 3u)];
-            double dx = (double)puppet->vertices[b].pos[0] - (double)puppet->vertices[a].pos[0];
-            double dy = (double)puppet->vertices[b].pos[1] - (double)puppet->vertices[a].pos[1];
-            double dz = (double)puppet->vertices[b].pos[2] - (double)puppet->vertices[a].pos[2];
-            he_len2[h] = dx * dx + dy * dy + dz * dz;
-
-            uint32_t lo = a < b ? a : b;
-            uint32_t hi = a < b ? b : a;
-            if (lo == hi) {
+            opp_he[h] = WE_RIG_EMPTY_EDGE;
+            uint32_t a = tv[c];
+            uint32_t b = tv[(c + 1u < 3u) ? (c + 1u) : 0u];
+            if (a >= V || b >= V) {
+                he_len2[h] = 0.0;
                 continue;
             }
-            uint32_t slot = hash_u32_pair(lo, hi) & mask;
-            while (ht[slot].count != 0u && (ht[slot].key_lo != lo || ht[slot].key_hi != hi)) {
-                slot = (slot + 1u) & mask;
-            }
-            if (ht[slot].count == 0u) {
-                ht[slot].key_lo = lo;
-                ht[slot].key_hi = hi;
-                ht[slot].he0 = h;
-                ht[slot].count = 1u;
-            } else if (ht[slot].count == 1u) {
-                uint32_t h0 = ht[slot].he0;
-                opp_he[h0] = h;
-                opp_he[h] = h0;
-                ht[slot].count = 2u;
-            } else {
-                /* Non-manifold edge: unlink so iDT never flips across >2 faces */
-                uint32_t h0 = ht[slot].he0;
-                if (opp_he[h0] != WE_RIG_EMPTY_EDGE) {
-                    opp_he[opp_he[h0]] = WE_RIG_EMPTY_EDGE;
-                    opp_he[h0] = WE_RIG_EMPTY_EDGE;
-                }
-                opp_he[h] = WE_RIG_EMPTY_EDGE;
-                ht[slot].count++;
+            double dx = (double)verts[b].pos[0] - (double)verts[a].pos[0];
+            double dy = (double)verts[b].pos[1] - (double)verts[a].pos[1];
+            double dz = (double)verts[b].pos[2] - (double)verts[a].pos[2];
+            he_len2[h] = dx * dx + dy * dy + dz * dz;
+            if (a != b) {
+                uint32_t lo = a < b ? a : b;
+                off[lo + 1u]++;
             }
         }
     }
+
+    for (uint32_t v = 0; v < V; v++) {
+        cur[v] = off[v];
+        off[v + 1u] += off[v];
+    }
+
+    uint32_t total = off[V];
+    uint32_t b_cap_alloc = (total < 2048u) ? total : 2048u;
+    edge_bucket_item_t *items =
+        total > 0u ? malloc((size_t)total * sizeof(edge_bucket_item_t)) : NULL;
+    boundary_edge_t *b_edges =
+        b_cap_alloc > 0u ? malloc((size_t)b_cap_alloc * sizeof(boundary_edge_t)) : NULL;
+    if (total > 0u && (!items || !b_edges)) {
+        free(items);
+        free(b_edges);
+        free(off);
+        free(cur);
+        return false;
+    }
+
+    for (uint32_t t = 0; t < T; t++) {
+        uint32_t tv[3] = {tri_verts[t * 3u + 0u], tri_verts[t * 3u + 1u], tri_verts[t * 3u + 2u]};
+        for (uint32_t c = 0; c < 3u; c++) {
+            uint32_t a = tv[c];
+            uint32_t b = tv[(c + 1u < 3u) ? (c + 1u) : 0u];
+            if (a < V && b < V && a != b) {
+                uint32_t lo = a < b ? a : b;
+                uint32_t hi = a < b ? b : a;
+                uint32_t pos = cur[lo]++;
+                items[pos].hi = hi;
+                items[pos].he = t * 3u + c;
+            }
+        }
+    }
+    free(cur);
 
     uint32_t b_cap = 0u;
-    for (uint32_t s = 0; s < cap; s++) {
-        if (ht[s].count == 1u) {
-            b_cap++;
+    for (uint32_t v = 0; v < V; v++) {
+        uint32_t p0 = off[v];
+        uint32_t p1 = off[v + 1u];
+        uint32_t cnt = p1 - p0;
+        if (cnt == 0u) {
+            continue;
         }
-    }
-    boundary_edge_t *b_edges = NULL;
-    if (b_cap > 0u) {
-        b_edges = malloc((size_t)b_cap * sizeof(boundary_edge_t));
-        if (!b_edges) {
-            free(ht);
-            return false;
-        }
-        uint32_t w = 0u;
-        for (uint32_t s = 0; s < cap; s++) {
-            if (ht[s].count == 1u) {
-                b_edges[w].u = ht[s].key_lo;
-                b_edges[w].v = ht[s].key_hi;
-                w++;
+        if (cnt <= 16u) {
+            for (uint32_t a = p0 + 1u; a < p1; a++) {
+                edge_bucket_item_t key = items[a];
+                uint32_t j = a;
+                while (j > p0 && items[j - 1u].hi > key.hi) {
+                    items[j] = items[j - 1u];
+                    j--;
+                }
+                items[j] = key;
             }
+        } else {
+            for (uint32_t gap = cnt / 2u; gap > 0u; gap /= 2u) {
+                for (uint32_t a = p0 + gap; a < p1; a++) {
+                    edge_bucket_item_t key = items[a];
+                    uint32_t j = a;
+                    while (j >= p0 + gap && items[j - gap].hi > key.hi) {
+                        items[j] = items[j - gap];
+                        j -= gap;
+                    }
+                    items[j] = key;
+                }
+            }
+        }
+
+        uint32_t q = p0;
+        while (q < p1) {
+            uint32_t hi = items[q].hi;
+            uint32_t r = q + 1u;
+            while (r < p1 && items[r].hi == hi) {
+                r++;
+            }
+            uint32_t mult = r - q;
+            if (mult == 1u) {
+                if (b_cap == b_cap_alloc) {
+                    uint32_t nc = b_cap_alloc * 2u;
+                    boundary_edge_t *grown = realloc(b_edges, (size_t)nc * sizeof(boundary_edge_t));
+                    if (!grown) {
+                        free(b_edges);
+                        free(items);
+                        free(off);
+                        return false;
+                    }
+                    b_edges = grown;
+                    b_cap_alloc = nc;
+                }
+                b_edges[b_cap].u = v;
+                b_edges[b_cap].v = hi;
+                b_cap++;
+            } else if (mult == 2u) {
+                uint32_t h0 = items[q].he;
+                uint32_t h1 = items[q + 1u].he;
+                opp_he[h0] = h1;
+                opp_he[h1] = h0;
+            }
+            /* Non-manifold edges (mult >= 3) remain WE_RIG_EMPTY_EDGE so iDT never flips them */
+            q = r;
         }
     }
 
-    free(ht);
+    free(items);
+    free(off);
+
+    if (b_cap == 0u) {
+        free(b_edges);
+        b_edges = NULL;
+    } else if (b_cap < b_cap_alloc) {
+        boundary_edge_t *shrunk = realloc(b_edges, (size_t)b_cap * sizeof(boundary_edge_t));
+        if (shrunk) {
+            b_edges = shrunk;
+        }
+    }
+
     *out_b_edges = b_edges;
     *out_b_count = b_cap;
     return true;
@@ -478,6 +558,14 @@ static uint32_t apply_idt_flips(uint32_t T, uint32_t *tri_verts, uint32_t *opp_h
     for (uint32_t h = 0; h < he_count; h++) {
         uint32_t h2 = opp_he[h];
         if (h2 != WE_RIG_EMPTY_EDGE && h < h2) {
+            uint32_t h_next, h_prev, h2_next, h2_prev;
+            he_neighbors(h, &h_next, &h_prev);
+            he_neighbors(h2, &h2_next, &h2_prev);
+            double l_ab2 = he_len2[h];
+            if (he_len2[h_prev] + he_len2[h_next] - l_ab2 >= 0.0 &&
+                he_len2[h2_next] + he_len2[h2_prev] - l_ab2 >= 0.0) {
+                continue;
+            }
             queue[q_tail++] = h;
             in_q[h] = 1u;
         }
@@ -486,8 +574,10 @@ static uint32_t apply_idt_flips(uint32_t T, uint32_t *tri_verts, uint32_t *opp_h
     uint32_t flips = 0u;
     uint32_t max_flips = T * 10u + 64u;
     while (q_head != q_tail && flips < max_flips) {
-        uint32_t h = queue[q_head];
-        q_head = (q_head + 1u) % he_count;
+        uint32_t h = queue[q_head++];
+        if (q_head == he_count) {
+            q_head = 0u;
+        }
         in_q[h] = 0u;
 
         uint32_t h2 = opp_he[h];
@@ -511,6 +601,13 @@ static uint32_t apply_idt_flips(uint32_t T, uint32_t *tri_verts, uint32_t *opp_h
         double l_ca2 = he_len2[h_prev];
         double l_ad2 = he_len2[h2_next];
         double l_db2 = he_len2[h2_prev];
+
+        /* Both opposite angles <= 90 deg guarantees cot_a + cot_b >= 0 without sqrt/area work */
+        double d_a = l_ca2 + l_bc2 - l_ab2;
+        double d_b = l_ad2 + l_db2 - l_ab2;
+        if (d_a >= 0.0 && d_b >= 0.0) {
+            continue;
+        }
 
         double a1_16 = heron_area_sq16(l_ab2, l_bc2, l_ca2);
         double a2_16 = heron_area_sq16(l_ab2, l_ad2, l_db2);
@@ -1217,113 +1314,856 @@ static uint32_t find_mesh_components(uint32_t V, const laplacian_csr_t *L, uint3
     return comp_count;
 }
 
-/* Reverse Cuthill-McKee ordering minimizes fill-in of the 2D planar stiffness matrix */
-static bool compute_rcm_permutation(uint32_t n, const uint32_t *row_ptr, const uint32_t *col_idx,
+enum {
+    AMD_VAR_ABSORBED = -1,
+    AMD_ELEM_ALIVE = -2,
+    AMD_ELEM_DEAD = -3,
+};
+
+static size_t amd_compress_iw(int32_t n, int32_t *Iw, int32_t *pe, int32_t *len, int32_t *cap_i,
+                              const int32_t *nv, const int32_t *elen, size_t pfree)
+{
+    int32_t *src_save = malloc((size_t)n * sizeof(int32_t));
+    if (!src_save) {
+        return pfree;
+    }
+    /* Negative marker -1 - node in Iw[pe[node]] tracks slot owners during linear scan */
+    for (int32_t i = 0; i < n; i++) {
+        if ((nv[i] > 0 || elen[i] == AMD_ELEM_ALIVE) && len[i] > 0 && pe[i] >= 0) {
+            src_save[i] = Iw[pe[i]];
+            Iw[pe[i]] = -1 - i;
+        } else {
+            src_save[i] = 0;
+        }
+    }
+    size_t wp = 0u;
+    size_t rp = 0u;
+    while (rp < pfree) {
+        int32_t val = Iw[rp];
+        if (val >= 0) {
+            rp++;
+            continue;
+        }
+        int32_t node = -1 - val;
+        if (node < 0 || node >= n) {
+            rp++;
+            continue;
+        }
+        int32_t l = len[node];
+        Iw[rp] = src_save[node];
+        if (rp != wp) {
+            memmove(&Iw[wp], &Iw[rp], (size_t)l * sizeof(int32_t));
+        }
+        pe[node] = (int32_t)wp;
+        if (nv[node] > 0) {
+            cap_i[node] = l;
+        }
+        wp += (size_t)l;
+        rp += (size_t)l;
+    }
+    free(src_save);
+    return wp;
+}
+
+/* Quotient-graph Approximate Minimum Degree (Davis 2004) + assembly-tree postorder */
+static bool compute_amd_permutation(uint32_t n_u, const uint32_t *row_ptr, const uint32_t *col_idx,
                                     uint32_t *out_perm, uint32_t *out_inv_perm)
+{
+    if (n_u == 0u) {
+        return true;
+    }
+    if (n_u <= 2u || n_u > (uint32_t)INT32_MAX / 2u) {
+        for (uint32_t i = 0; i < n_u; i++) {
+            out_perm[i] = i;
+            out_inv_perm[i] = i;
+        }
+        return true;
+    }
+
+    int32_t n = (int32_t)n_u;
+    uint32_t nnz = row_ptr[n_u];
+    size_t iw_cap = (size_t)nnz * 2u + (size_t)n * 4u + 128u;
+
+    int32_t *Iw = malloc(iw_cap * sizeof(int32_t));
+    int32_t *pe = malloc((size_t)n * sizeof(int32_t));
+    int32_t *len = malloc((size_t)n * sizeof(int32_t));
+    int32_t *cap_i = malloc((size_t)n * sizeof(int32_t));
+    int32_t *elen = calloc((size_t)n, sizeof(int32_t));
+    int32_t *nv = malloc((size_t)n * sizeof(int32_t));
+    int32_t *orig_nv = calloc((size_t)n, sizeof(int32_t));
+    int32_t *degree = malloc((size_t)n * sizeof(int32_t));
+    int32_t *head = malloc((size_t)n * sizeof(int32_t));
+    int32_t *next = malloc((size_t)n * sizeof(int32_t));
+    int32_t *last = malloc((size_t)n * sizeof(int32_t));
+    int32_t *tree_parent = malloc((size_t)n * sizeof(int32_t));
+    int32_t *twin_next = malloc((size_t)n * sizeof(int32_t));
+    int32_t *twin_tail = malloc((size_t)n * sizeof(int32_t));
+    int32_t *lp_buf = malloc((size_t)n * sizeof(int32_t));
+    int32_t *tmp_list = malloc((size_t)n * sizeof(int32_t));
+    int32_t *var_mark = calloc((size_t)n, sizeof(int32_t));
+    int32_t *elem_seen = calloc((size_t)n, sizeof(int32_t));
+    int32_t *elem_diff = calloc((size_t)n, sizeof(int32_t));
+    uint32_t *hash_val = calloc((size_t)n, sizeof(uint32_t));
+    int32_t *hhead = malloc((size_t)n * sizeof(int32_t));
+    int32_t *hnext = malloc((size_t)n * sizeof(int32_t));
+    int32_t *twin_mark = calloc((size_t)n, sizeof(int32_t));
+
+    if (!Iw || !pe || !len || !cap_i || !elen || !nv || !orig_nv || !degree || !head || !next ||
+        !last || !tree_parent || !twin_next || !twin_tail || !lp_buf || !tmp_list || !var_mark ||
+        !elem_seen || !elem_diff || !hash_val || !hhead || !hnext || !twin_mark) {
+        free(Iw);
+        free(pe);
+        free(len);
+        free(cap_i);
+        free(elen);
+        free(nv);
+        free(orig_nv);
+        free(degree);
+        free(head);
+        free(next);
+        free(last);
+        free(tree_parent);
+        free(twin_next);
+        free(twin_tail);
+        free(lp_buf);
+        free(tmp_list);
+        free(var_mark);
+        free(elem_seen);
+        free(elem_diff);
+        free(hash_val);
+        free(hhead);
+        free(hnext);
+        free(twin_mark);
+        return false;
+    }
+
+    for (int32_t i = 0; i < n; i++) {
+        head[i] = -1;
+        hhead[i] = -1;
+        tree_parent[i] = -1;
+        twin_next[i] = -1;
+        twin_tail[i] = i;
+        nv[i] = 1;
+    }
+
+    size_t pfree = 0u;
+    for (int32_t i = 0; i < n; i++) {
+        pe[i] = (int32_t)pfree;
+        int32_t cnt = 0;
+        for (uint32_t p = row_ptr[i]; p < row_ptr[i + 1u]; p++) {
+            int32_t j = (int32_t)col_idx[p];
+            if (j >= 0 && j < n && j != i) {
+                Iw[pfree++] = j;
+                cnt++;
+            }
+        }
+        len[i] = cnt;
+        cap_i[i] = cnt;
+        int32_t deg = cnt < n - 1 ? cnt : n - 1;
+        degree[i] = deg;
+        next[i] = head[deg];
+        last[i] = -1;
+        if (head[deg] >= 0) {
+            last[head[deg]] = i;
+        }
+        head[deg] = i;
+    }
+
+    int32_t nel = 0;
+    int32_t mindeg = 0;
+    int32_t lp_mark = 1;
+    int32_t twin_tag = 1;
+
+    while (nel < n) {
+        while (mindeg < n && head[mindeg] < 0) {
+            mindeg++;
+        }
+        if (mindeg >= n) {
+            break;
+        }
+        int32_t p = head[mindeg];
+        int32_t nxt = next[p];
+        head[mindeg] = nxt;
+        if (nxt >= 0) {
+            last[nxt] = -1;
+        }
+
+        int32_t p_nv = nv[p];
+        orig_nv[p] = p_nv;
+        nel += p_nv;
+
+        /* 1. Build L_p from direct variables in p and live elements absorbed into p */
+        lp_mark++;
+        var_mark[p] = lp_mark;
+        int32_t lp_len = 0;
+        int32_t lp_nv_sum = 0;
+
+        int32_t p_elen = elen[p];
+        int32_t p_len = len[p];
+        int32_t p_pe = pe[p];
+        for (int32_t k = 0; k < p_elen; k++) {
+            int32_t e = Iw[p_pe + k];
+            if (e < 0 || e >= n || elen[e] != AMD_ELEM_ALIVE) {
+                continue;
+            }
+            int32_t e_pe = pe[e];
+            int32_t e_end = e_pe + len[e];
+            for (int32_t q = e_pe; q < e_end; q++) {
+                int32_t j = Iw[q];
+                if (nv[j] > 0 && var_mark[j] != lp_mark) {
+                    var_mark[j] = lp_mark;
+                    lp_buf[lp_len++] = j;
+                    lp_nv_sum += nv[j];
+                }
+            }
+            elen[e] = AMD_ELEM_DEAD;
+            tree_parent[e] = p;
+            len[e] = 0;
+        }
+        for (int32_t k = p_elen; k < p_len; k++) {
+            int32_t j = Iw[p_pe + k];
+            if (nv[j] > 0 && var_mark[j] != lp_mark) {
+                var_mark[j] = lp_mark;
+                lp_buf[lp_len++] = j;
+                lp_nv_sum += nv[j];
+            }
+        }
+
+        nv[p] = 0;
+        if (nel >= n) {
+            elen[p] = AMD_ELEM_ALIVE;
+            len[p] = 0;
+            pe[p] = -1;
+            break;
+        }
+
+        /* 2. Exact external degree weights |L_e \ L_p| and aggressive absorption */
+        for (int32_t idx = 0; idx < lp_len; idx++) {
+            int32_t i = lp_buf[idx];
+            int32_t i_pe = pe[i];
+            int32_t i_elen = elen[i];
+            for (int32_t k = 0; k < i_elen; k++) {
+                int32_t e = Iw[i_pe + k];
+                if (elen[e] != AMD_ELEM_ALIVE) {
+                    continue;
+                }
+                if (elem_seen[e] != lp_mark) {
+                    int32_t wsum = 0;
+                    int32_t e_pe = pe[e];
+                    int32_t e_end = e_pe + len[e];
+                    for (int32_t q = e_pe; q < e_end; q++) {
+                        int32_t v = Iw[q];
+                        if (nv[v] > 0) {
+                            wsum += nv[v];
+                        }
+                    }
+                    elem_seen[e] = lp_mark;
+                    elem_diff[e] = wsum;
+                }
+                elem_diff[e] -= nv[i];
+            }
+        }
+        for (int32_t idx = 0; idx < lp_len; idx++) {
+            int32_t i = lp_buf[idx];
+            int32_t i_pe = pe[i];
+            int32_t i_elen = elen[i];
+            for (int32_t k = 0; k < i_elen; k++) {
+                int32_t e = Iw[i_pe + k];
+                if (elen[e] == AMD_ELEM_ALIVE && elem_seen[e] == lp_mark && elem_diff[e] <= 0) {
+                    elen[e] = AMD_ELEM_DEAD;
+                    tree_parent[e] = p;
+                    len[e] = 0;
+                }
+            }
+        }
+
+        /* Make p an alive element tentatively with current lp_len for size reservation */
+        elen[p] = AMD_ELEM_ALIVE;
+        len[p] = 0;
+        pe[p] = -1;
+
+        /* 3. Compact adjacency of each i in L_p, add element p, update approximate degree */
+        for (int32_t idx = 0; idx < lp_len; idx++) {
+            int32_t i = lp_buf[idx];
+            /* Unlink i from its current degree bucket */
+            int32_t old_deg = degree[i];
+            int32_t prev_i = last[i];
+            int32_t next_i = next[i];
+            if (prev_i >= 0) {
+                next[prev_i] = next_i;
+            } else {
+                head[old_deg] = next_i;
+            }
+            if (next_i >= 0) {
+                last[next_i] = prev_i;
+            }
+
+            int32_t new_elen = 0;
+            int32_t sum_diff = 0;
+            uint32_t h = (uint32_t)p;
+            int32_t i_pe = pe[i];
+            int32_t i_elen = elen[i];
+            int32_t i_len = len[i];
+
+            for (int32_t k = 0; k < i_elen; k++) {
+                int32_t e = Iw[i_pe + k];
+                if (elen[e] == AMD_ELEM_ALIVE) {
+                    tmp_list[new_elen++] = e;
+                    sum_diff += elem_diff[e];
+                    h += (uint32_t)e;
+                }
+            }
+            tmp_list[new_elen++] = p;
+
+            int32_t new_len = new_elen;
+            int32_t deg_vars = 0;
+            for (int32_t k = i_elen; k < i_len; k++) {
+                int32_t j = Iw[i_pe + k];
+                if (nv[j] > 0 && var_mark[j] != lp_mark && j != i) {
+                    tmp_list[new_len++] = j;
+                    deg_vars += nv[j];
+                    h += (uint32_t)j;
+                }
+            }
+
+            if (new_len <= cap_i[i] && i_pe >= 0) {
+                memcpy(&Iw[i_pe], tmp_list, (size_t)new_len * sizeof(int32_t));
+            } else {
+                if (pfree + (size_t)new_len > iw_cap) {
+                    pfree = amd_compress_iw(n, Iw, pe, len, cap_i, nv, elen, pfree);
+                    if (pfree + (size_t)new_len > iw_cap) {
+                        size_t new_cap = (pfree + (size_t)new_len) * 2u + 64u;
+                        int32_t *new_iw = realloc(Iw, new_cap * sizeof(int32_t));
+                        if (!new_iw) {
+                            free(Iw);
+                            free(pe);
+                            free(len);
+                            free(cap_i);
+                            free(elen);
+                            free(nv);
+                            free(orig_nv);
+                            free(degree);
+                            free(head);
+                            free(next);
+                            free(last);
+                            free(tree_parent);
+                            free(twin_next);
+                            free(twin_tail);
+                            free(lp_buf);
+                            free(tmp_list);
+                            free(var_mark);
+                            free(elem_seen);
+                            free(elem_diff);
+                            free(hash_val);
+                            free(hhead);
+                            free(hnext);
+                            free(twin_mark);
+                            return false;
+                        }
+                        Iw = new_iw;
+                        iw_cap = new_cap;
+                    }
+                }
+                pe[i] = (int32_t)pfree;
+                cap_i[i] = new_len;
+                memcpy(&Iw[pfree], tmp_list, (size_t)new_len * sizeof(int32_t));
+                pfree += (size_t)new_len;
+            }
+            elen[i] = new_elen;
+            len[i] = new_len;
+
+            int32_t d_new = deg_vars + sum_diff + (lp_nv_sum - nv[i]);
+            int32_t d_old = old_deg + (lp_nv_sum - nv[i]);
+            int32_t rem = n - 1 - nel;
+            int32_t d_est = d_new < d_old ? d_new : d_old;
+            if (d_est > rem) {
+                d_est = rem;
+            }
+            if (d_est < 0) {
+                d_est = 0;
+            }
+            degree[i] = d_est;
+            hash_val[i] = (h * 2654435761u) % (uint32_t)n;
+        }
+
+        /* 4. Supervariable (twin) absorption within L_p using hash buckets */
+        for (int32_t idx = 0; idx < lp_len; idx++) {
+            int32_t i = lp_buf[idx];
+            if (nv[i] == 0) {
+                continue;
+            }
+            uint32_t hb = hash_val[i];
+            int32_t match = -1;
+            for (int32_t k = hhead[hb]; k >= 0; k = hnext[k]) {
+                if (elen[k] != elen[i] || len[k] != len[i]) {
+                    continue;
+                }
+                int32_t ke_cnt = elen[k];
+                int32_t kl = len[k];
+                int32_t kpe = pe[k];
+                int32_t ipe = pe[i];
+                twin_tag++;
+                for (int32_t q = 0; q < ke_cnt; q++) {
+                    twin_mark[Iw[kpe + q]] = twin_tag;
+                }
+                bool same = true;
+                for (int32_t q = 0; q < ke_cnt; q++) {
+                    if (twin_mark[Iw[ipe + q]] != twin_tag) {
+                        same = false;
+                        break;
+                    }
+                }
+                if (!same) {
+                    continue;
+                }
+                twin_tag++;
+                for (int32_t q = ke_cnt; q < kl; q++) {
+                    twin_mark[Iw[kpe + q]] = twin_tag;
+                }
+                for (int32_t q = ke_cnt; q < kl; q++) {
+                    if (twin_mark[Iw[ipe + q]] != twin_tag) {
+                        same = false;
+                        break;
+                    }
+                }
+                if (same) {
+                    match = k;
+                    break;
+                }
+            }
+            if (match >= 0) {
+                degree[match] -= nv[i];
+                if (degree[match] < 0) {
+                    degree[match] = 0;
+                }
+                nv[match] += nv[i];
+                nv[i] = 0;
+                elen[i] = AMD_VAR_ABSORBED;
+                len[i] = 0;
+                twin_next[twin_tail[match]] = i;
+                twin_tail[match] = twin_tail[i];
+            } else {
+                hnext[i] = hhead[hb];
+                hhead[hb] = i;
+            }
+        }
+        for (int32_t idx = 0; idx < lp_len; idx++) {
+            hhead[hash_val[lp_buf[idx]]] = -1;
+        }
+
+        /* 5. Reinsert surviving principal variables and record compacted element p */
+        int32_t surv_cnt = 0;
+        for (int32_t idx = 0; idx < lp_len; idx++) {
+            int32_t i = lp_buf[idx];
+            if (nv[i] > 0) {
+                lp_buf[surv_cnt++] = i;
+                int32_t d = degree[i];
+                next[i] = head[d];
+                last[i] = -1;
+                if (head[d] >= 0) {
+                    last[head[d]] = i;
+                }
+                head[d] = i;
+                if (d < mindeg) {
+                    mindeg = d;
+                }
+            }
+        }
+        if (surv_cnt > 0) {
+            if (pfree + (size_t)surv_cnt > iw_cap) {
+                pfree = amd_compress_iw(n, Iw, pe, len, cap_i, nv, elen, pfree);
+                if (pfree + (size_t)surv_cnt > iw_cap) {
+                    size_t new_cap = (pfree + (size_t)surv_cnt) * 2u + 64u;
+                    int32_t *new_iw = realloc(Iw, new_cap * sizeof(int32_t));
+                    if (!new_iw) {
+                        free(Iw);
+                        free(pe);
+                        free(len);
+                        free(cap_i);
+                        free(elen);
+                        free(nv);
+                        free(orig_nv);
+                        free(degree);
+                        free(head);
+                        free(next);
+                        free(last);
+                        free(tree_parent);
+                        free(twin_next);
+                        free(twin_tail);
+                        free(lp_buf);
+                        free(tmp_list);
+                        free(var_mark);
+                        free(elem_seen);
+                        free(elem_diff);
+                        free(hash_val);
+                        free(hhead);
+                        free(hnext);
+                        free(twin_mark);
+                        return false;
+                    }
+                    Iw = new_iw;
+                    iw_cap = new_cap;
+                }
+            }
+            pe[p] = (int32_t)pfree;
+            len[p] = surv_cnt;
+            memcpy(&Iw[pfree], lp_buf, (size_t)surv_cnt * sizeof(int32_t));
+            pfree += (size_t)surv_cnt;
+        }
+    }
+
+    /* 6. Postorder DFS over the assembly forest to emit supernodes contiguously */
+    int32_t *child_head = Iw; /* Reuse Iw / hhead / hnext */
+    int32_t *child_next = lp_buf;
+    int32_t *dfs_stack = tmp_list;
+    uint8_t *dfs_state = (uint8_t *)var_mark;
+    for (int32_t i = 0; i < n; i++) {
+        child_head[i] = -1;
+        dfs_state[i] = 0u;
+    }
+    int32_t root_head = -1;
+    int32_t *roots = hhead;
+    int32_t n_roots = 0;
+    for (int32_t i = n - 1; i >= 0; i--) {
+        if (orig_nv[i] > 0) {
+            int32_t par = tree_parent[i];
+            if (par >= 0 && par < n && orig_nv[par] > 0) {
+                child_next[i] = child_head[par];
+                child_head[par] = i;
+            } else {
+                roots[n_roots++] = i;
+            }
+        }
+    }
+
+    uint32_t out_pos = 0u;
+    for (int32_t r = n_roots - 1; r >= 0; r--) {
+        int32_t top = 0;
+        dfs_stack[top++] = roots[r];
+        while (top > 0) {
+            int32_t u = dfs_stack[top - 1];
+            if (dfs_state[u] == 0u) {
+                dfs_state[u] = 1u;
+                for (int32_t c = child_head[u]; c >= 0; c = child_next[c]) {
+                    dfs_stack[top++] = c;
+                }
+            } else {
+                top--;
+                out_perm[out_pos++] = (uint32_t)u;
+                for (int32_t tw = twin_next[u]; tw >= 0; tw = twin_next[tw]) {
+                    out_perm[out_pos++] = (uint32_t)tw;
+                }
+            }
+        }
+    }
+    (void)root_head;
+
+    if (out_pos != n_u) {
+        for (uint32_t i = 0; i < n_u; i++) {
+            out_perm[i] = i;
+        }
+    }
+    for (uint32_t i = 0; i < n_u; i++) {
+        out_inv_perm[out_perm[i]] = i;
+    }
+
+    free(Iw);
+    free(pe);
+    free(len);
+    free(cap_i);
+    free(elen);
+    free(nv);
+    free(orig_nv);
+    free(degree);
+    free(head);
+    free(next);
+    free(last);
+    free(tree_parent);
+    free(twin_next);
+    free(twin_tail);
+    free(lp_buf);
+    free(tmp_list);
+    free(var_mark);
+    free(elem_seen);
+    free(elem_diff);
+    free(hash_val);
+    free(hhead);
+    free(hnext);
+    free(twin_mark);
+    return true;
+}
+
+typedef struct {
+    uint32_t n;
+    const uint32_t *row_ptr;
+    const uint32_t *col_idx;
+    const float (*coords)[3];
+    uint32_t *nodes;
+    uint32_t *tmp;
+    uint8_t *tag;
+} nd_ctx_t;
+
+static void nd_recurse(nd_ctx_t *ctx, uint32_t lo, uint32_t hi, uint32_t depth)
+{
+    uint32_t cnt = hi - lo;
+    if (cnt <= 12u || depth >= 18u) {
+        return;
+    }
+
+    double min_c[3] = {1e30, 1e30, 1e30};
+    double max_c[3] = {-1e30, -1e30, -1e30};
+    for (uint32_t k = lo; k < hi; k++) {
+        const float *p = ctx->coords[ctx->nodes[k]];
+        for (int a = 0; a < 3; a++) {
+            double v = (double)p[a];
+            if (v < min_c[a])
+                min_c[a] = v;
+            if (v > max_c[a])
+                max_c[a] = v;
+        }
+    }
+
+    int ax = 0;
+    double span = max_c[0] - min_c[0];
+    if (max_c[1] - min_c[1] > span) {
+        ax = 1;
+        span = max_c[1] - min_c[1];
+    }
+    if (max_c[2] - min_c[2] > span) {
+        ax = 2;
+        span = max_c[2] - min_c[2];
+    }
+    if (span <= 1e-12) {
+        return;
+    }
+
+    /* 64-bin coordinate histogram finds median split in O(cnt) without sorting */
+    uint32_t bins[64] = {0};
+    double inv_span = 64.0 / span;
+    double cmin = min_c[ax];
+    for (uint32_t k = lo; k < hi; k++) {
+        double val = (double)ctx->coords[ctx->nodes[k]][ax];
+        int b = (int)((val - cmin) * inv_span);
+        if (b < 0)
+            b = 0;
+        if (b > 63)
+            b = 63;
+        bins[b]++;
+    }
+    uint32_t target_left = cnt / 2u;
+    uint32_t acc = 0u;
+    int split_bin = 31;
+    for (int b = 0; b < 64; b++) {
+        acc += bins[b];
+        if (acc >= target_left) {
+            split_bin = b;
+            break;
+        }
+    }
+    double split_val = cmin + ((double)split_bin + 0.5) / inv_span;
+
+    uint32_t n0 = 0u;
+    uint32_t n1 = 0u;
+    for (uint32_t k = lo; k < hi; k++) {
+        uint32_t u = ctx->nodes[k];
+        if ((double)ctx->coords[u][ax] <= split_val) {
+            ctx->tag[u] = 0u;
+            n0++;
+        } else {
+            ctx->tag[u] = 1u;
+            n1++;
+        }
+    }
+    if (n0 == 0u || n1 == 0u) {
+        /* Degenerate histogram skew fallback: split strictly by exact half of sub-array */
+        uint32_t half = cnt / 2u;
+        uint32_t mid = lo + half;
+        for (uint32_t k = lo; k < mid; k++) {
+            ctx->tag[ctx->nodes[k]] = 0u;
+        }
+        for (uint32_t k = mid; k < hi; k++) {
+            ctx->tag[ctx->nodes[k]] = 1u;
+        }
+        n0 = half;
+        n1 = cnt - half;
+    }
+
+    /* Promote side-0 endpoints touching side-1 into vertex separator S (tag = 2) */
+    uint32_t promoted = 0u;
+    for (uint32_t k = lo; k < hi; k++) {
+        uint32_t u = ctx->nodes[k];
+        if (ctx->tag[u] != 0u) {
+            continue;
+        }
+        for (uint32_t p = ctx->row_ptr[u]; p < ctx->row_ptr[u + 1u]; p++) {
+            if (ctx->tag[ctx->col_idx[p]] == 1u) {
+                ctx->tag[u] = 2u;
+                promoted++;
+                break;
+            }
+        }
+    }
+
+    uint32_t c_l = n0 - promoted;
+    uint32_t c_r = n1;
+    if (c_l == 0u || c_r == 0u) {
+        for (uint32_t k = lo; k < hi; k++) {
+            ctx->tag[ctx->nodes[k]] = 3u;
+        }
+        return;
+    }
+
+    uint32_t *ltmp = ctx->tmp + lo;
+    uint32_t p_l = 0u;
+    uint32_t p_r = c_l;
+    uint32_t p_s = c_l + c_r;
+    for (uint32_t k = lo; k < hi; k++) {
+        uint32_t u = ctx->nodes[k];
+        uint8_t t = ctx->tag[u];
+        ctx->tag[u] = 3u;
+        if (t == 0u)
+            ltmp[p_l++] = u;
+        else if (t == 1u)
+            ltmp[p_r++] = u;
+        else
+            ltmp[p_s++] = u;
+    }
+    memcpy(&ctx->nodes[lo], ltmp, (size_t)cnt * sizeof(uint32_t));
+
+    nd_recurse(ctx, lo, lo + c_l, depth + 1u);
+    nd_recurse(ctx, lo + c_l, lo + c_l + c_r, depth + 1u);
+    nd_recurse(ctx, lo + c_l + c_r, hi, depth + 1u);
+}
+
+static bool compute_nd_ordering(uint32_t n, const uint32_t *row_ptr, const uint32_t *col_idx,
+                                const float (*free_coords)[3], uint32_t *out_perm,
+                                uint32_t *out_inv_perm)
 {
     if (n == 0u) {
         return true;
     }
-    uint8_t *visited = calloc(n, sizeof(uint8_t));
-    uint32_t *queue = malloc((size_t)n * sizeof(uint32_t));
-    uint32_t *nbrs = malloc((size_t)n * sizeof(uint32_t));
-    uint32_t *dist = malloc((size_t)n * sizeof(uint32_t));
-    if (!visited || !queue || !nbrs || !dist) {
-        free(visited);
-        free(queue);
-        free(nbrs);
-        free(dist);
-        return false;
+    if (n <= 64u || !free_coords) {
+        return compute_amd_permutation(n, row_ptr, col_idx, out_perm, out_inv_perm);
     }
 
-    uint32_t cm_pos = 0u;
-    for (uint32_t seed = 0; seed < n; seed++) {
-        if (visited[seed]) {
-            continue;
-        }
-        /* Two-pass George-Liu pseudo-peripheral start node search */
-        uint32_t start = seed;
-        for (int pass = 0; pass < 2; pass++) {
-            uint32_t qh = 0u, qt = 0u;
-            queue[qt++] = start;
-            dist[start] = 1u;
-            uint32_t far_node = start;
-            uint32_t far_deg = row_ptr[start + 1u] - row_ptr[start];
-            uint32_t max_d = 1u;
-            while (qh < qt) {
-                uint32_t u = queue[qh++];
-                uint32_t d = dist[u];
-                uint32_t udeg = row_ptr[u + 1u] - row_ptr[u];
-                if (d > max_d || (d == max_d && udeg < far_deg)) {
-                    max_d = d;
-                    far_node = u;
-                    far_deg = udeg;
-                }
-                for (uint32_t p = row_ptr[u]; p < row_ptr[u + 1u]; p++) {
-                    uint32_t v = col_idx[p];
-                    if (dist[v] == 0u && !visited[v]) {
-                        dist[v] = d + 1u;
-                        queue[qt++] = v;
-                    }
-                }
-            }
-            for (uint32_t i = 0; i < qt; i++) {
-                dist[queue[i]] = 0u;
-            }
-            start = far_node;
-        }
-
-        uint32_t qh = 0u, qt = 0u;
-        queue[qt++] = start;
-        visited[start] = 1u;
-        while (qh < qt) {
-            uint32_t u = queue[qh++];
-            out_perm[cm_pos++] = u;
-
-            uint32_t n_cnt = 0u;
-            for (uint32_t p = row_ptr[u]; p < row_ptr[u + 1u]; p++) {
-                uint32_t v = col_idx[p];
-                if (!visited[v]) {
-                    visited[v] = 1u;
-                    nbrs[n_cnt++] = v;
-                }
-            }
-            /* Insertion sort neighbors by degree (degrees on planar meshes are small) */
-            for (uint32_t i = 1u; i < n_cnt; i++) {
-                uint32_t key = nbrs[i];
-                uint32_t kdeg = row_ptr[key + 1u] - row_ptr[key];
-                uint32_t j = i;
-                while (j > 0u) {
-                    uint32_t prev = nbrs[j - 1u];
-                    uint32_t pdeg = row_ptr[prev + 1u] - row_ptr[prev];
-                    if (pdeg <= kdeg) {
-                        break;
-                    }
-                    nbrs[j] = prev;
-                    j--;
-                }
-                nbrs[j] = key;
-            }
-            for (uint32_t i = 0; i < n_cnt; i++) {
-                queue[qt++] = nbrs[i];
-            }
-        }
+    uint32_t *nodes = malloc((size_t)n * sizeof(uint32_t));
+    uint32_t *tmp = malloc((size_t)n * sizeof(uint32_t));
+    uint8_t *tag = malloc((size_t)n * sizeof(uint8_t));
+    if (!nodes || !tmp || !tag) {
+        free(nodes);
+        free(tmp);
+        free(tag);
+        return compute_amd_permutation(n, row_ptr, col_idx, out_perm, out_inv_perm);
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        nodes[i] = i;
+        tag[i] = 3u;
     }
 
-    for (uint32_t i = 0; i < n / 2u; i++) {
-        uint32_t tmp = out_perm[i];
-        out_perm[i] = out_perm[n - 1u - i];
-        out_perm[n - 1u - i] = tmp;
-    }
+    nd_ctx_t ctx = {
+        .n = n,
+        .row_ptr = row_ptr,
+        .col_idx = col_idx,
+        .coords = free_coords,
+        .nodes = nodes,
+        .tmp = tmp,
+        .tag = tag,
+    };
+    nd_recurse(&ctx, 0u, n, 0u);
+
+    memcpy(out_perm, nodes, (size_t)n * sizeof(uint32_t));
     for (uint32_t i = 0; i < n; i++) {
         out_inv_perm[out_perm[i]] = i;
     }
 
-    free(visited);
-    free(queue);
-    free(nbrs);
-    free(dist);
+    free(nodes);
+    free(tmp);
+    free(tag);
     return true;
+}
+
+/* Refine permutation with an exact etree postordering to maximize supernode runs */
+static void apply_etree_postorder(uint32_t n, const uint32_t *f_row_ptr, const uint32_t *f_col_idx,
+                                  uint32_t *perm, uint32_t *inv_perm)
+{
+    if (n <= 2u) {
+        return;
+    }
+    uint32_t *ws = malloc((size_t)n * 7u * sizeof(uint32_t));
+    if (!ws) {
+        return;
+    }
+    uint32_t *parent = ws;
+    uint32_t *ancestor = ws + n;
+    uint32_t *child_head = ws + 2u * (size_t)n;
+    uint32_t *sibling = ws + 3u * (size_t)n;
+    uint32_t *stack = ws + 4u * (size_t)n;
+    uint32_t *post = ws + 5u * (size_t)n;
+    uint32_t *new_perm = ws + 6u * (size_t)n;
+
+    for (uint32_t k = 0; k < n; k++) {
+        parent[k] = UINT32_MAX;
+        ancestor[k] = UINT32_MAX;
+        uint32_t fk = perm[k];
+        for (uint32_t p = f_row_ptr[fk]; p < f_row_ptr[fk + 1u]; p++) {
+            uint32_t i = inv_perm[f_col_idx[p]];
+            if (i >= k) {
+                continue;
+            }
+            while (i < k) {
+                uint32_t inext = ancestor[i];
+                ancestor[i] = k;
+                if (inext == UINT32_MAX) {
+                    parent[i] = k;
+                    break;
+                }
+                i = inext;
+            }
+        }
+        child_head[k] = UINT32_MAX;
+        sibling[k] = UINT32_MAX;
+    }
+
+    for (uint32_t j = n; j > 0u; j--) {
+        uint32_t k = j - 1u;
+        uint32_t par = parent[k];
+        if (par != UINT32_MAX) {
+            sibling[k] = child_head[par];
+            child_head[par] = k;
+        }
+    }
+
+    uint32_t k_out = 0u;
+    for (uint32_t root = 0; root < n; root++) {
+        if (parent[root] != UINT32_MAX) {
+            continue;
+        }
+        uint32_t top = 0u;
+        stack[top++] = root;
+        while (top > 0u) {
+            uint32_t u = stack[top - 1u];
+            uint32_t c = child_head[u];
+            if (c == UINT32_MAX) {
+                top--;
+                post[k_out++] = u;
+            } else {
+                child_head[u] = sibling[c];
+                stack[top++] = c;
+            }
+        }
+    }
+
+    if (k_out == n) {
+        for (uint32_t i = 0; i < n; i++) {
+            new_perm[i] = perm[post[i]];
+        }
+        memcpy(perm, new_perm, (size_t)n * sizeof(uint32_t));
+        for (uint32_t i = 0; i < n; i++) {
+            inv_perm[perm[i]] = i;
+        }
+    }
+
+    free(ws);
 }
 
 /* Solves A * W = R for all B columns in 8-wide batches using IC(0)-preconditioned CG */
@@ -1585,11 +2425,578 @@ static bool solve_ic0_pcg_batched(uint32_t n, const uint32_t *row_ptr, const uin
     return true;
 }
 
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(WWAL_DISABLE_SIMD)
+__attribute__((target("avx2,fma"))) static void
+sn_update_panel_full_avx2(double *restrict panel, uint32_t wd_s, uint32_t w_d,
+                          const double *restrict bs, uint32_t w_s, uint32_t p0, uint32_t h_s,
+                          const uint32_t *restrict row_map, const double *restrict d_s)
+{
+    double ut[WE_RIG_SN_MAX_W * WE_RIG_SN_MAX_W];
+    for (uint32_t j = 0; j < w_s; j++) {
+        double dj = d_s[j];
+        for (uint32_t c = 0; c < w_d; c++) {
+            ut[j * wd_s + c] = dj * bs[(size_t)(p0 + c) * w_s + j];
+        }
+        for (uint32_t c = w_d; c < wd_s; c++) {
+            ut[j * wd_s + c] = 0.0;
+        }
+    }
+
+    uint32_t nr = h_s - p0;
+    for (uint32_t q = 0; q < nr; q++) {
+        const double *brow = &bs[(size_t)(p0 + q) * w_s];
+        double *prow = &panel[(size_t)row_map[q] * wd_s];
+        for (uint32_t c = 0; c < wd_s; c += 4u) {
+            __m256d acc = _mm256_loadu_pd(prow + c);
+            for (uint32_t j = 0; j < w_s; j++) {
+                __m256d bvec = _mm256_set1_pd(brow[j]);
+                __m256d uvec = _mm256_loadu_pd(&ut[j * wd_s + c]);
+                acc = _mm256_fnmadd_pd(bvec, uvec, acc);
+            }
+            _mm256_storeu_pd(prow + c, acc);
+        }
+    }
+}
+
+__attribute__((target("avx2,fma"))) static void
+sn_update_panel_sparse_avx2(double *restrict panel, uint32_t wd_s, const double *restrict bs,
+                            uint32_t w_s, uint32_t p0, uint32_t h_s, uint32_t nc,
+                            const uint32_t *restrict col_map, const uint32_t *restrict row_map,
+                            const double *restrict d_s)
+{
+    uint32_t nr = h_s - p0;
+    if (nc == 2u) {
+        double u0[WE_RIG_SN_MAX_W], u1[WE_RIG_SN_MAX_W];
+        const double *r0 = &bs[(size_t)p0 * w_s];
+        const double *r1 = &bs[(size_t)(p0 + 1u) * w_s];
+        for (uint32_t j = 0; j < w_s; j++) {
+            double dj = d_s[j];
+            u0[j] = dj * r0[j];
+            u1[j] = dj * r1[j];
+        }
+        uint32_t c0 = col_map[0], c1 = col_map[1];
+        for (uint32_t q = 0; q < nr; q++) {
+            const double *brow = &bs[(size_t)(p0 + q) * w_s];
+            double a0 = 0.0, a1 = 0.0;
+            for (uint32_t j = 0; j < w_s; j++) {
+                double bv = brow[j];
+                a0 += bv * u0[j];
+                a1 += bv * u1[j];
+            }
+            double *prow = &panel[(size_t)row_map[q] * wd_s];
+            prow[c0] -= a0;
+            prow[c1] -= a1;
+        }
+        return;
+    }
+    if (nc == 3u) {
+        double u0[WE_RIG_SN_MAX_W], u1[WE_RIG_SN_MAX_W], u2[WE_RIG_SN_MAX_W];
+        const double *r0 = &bs[(size_t)p0 * w_s];
+        const double *r1 = &bs[(size_t)(p0 + 1u) * w_s];
+        const double *r2 = &bs[(size_t)(p0 + 2u) * w_s];
+        for (uint32_t j = 0; j < w_s; j++) {
+            double dj = d_s[j];
+            u0[j] = dj * r0[j];
+            u1[j] = dj * r1[j];
+            u2[j] = dj * r2[j];
+        }
+        uint32_t c0 = col_map[0], c1 = col_map[1], c2 = col_map[2];
+        for (uint32_t q = 0; q < nr; q++) {
+            const double *brow = &bs[(size_t)(p0 + q) * w_s];
+            double a0 = 0.0, a1 = 0.0, a2 = 0.0;
+            for (uint32_t j = 0; j < w_s; j++) {
+                double bv = brow[j];
+                a0 += bv * u0[j];
+                a1 += bv * u1[j];
+                a2 += bv * u2[j];
+            }
+            double *prow = &panel[(size_t)row_map[q] * wd_s];
+            prow[c0] -= a0;
+            prow[c1] -= a1;
+            prow[c2] -= a2;
+        }
+        return;
+    }
+
+    uint32_t nc_s = (nc + 3u) & ~3u;
+    double ut[WE_RIG_SN_MAX_W * WE_RIG_SN_MAX_W];
+    for (uint32_t j = 0; j < w_s; j++) {
+        double dj = d_s[j];
+        for (uint32_t c = 0; c < nc; c++) {
+            ut[j * nc_s + c] = dj * bs[(size_t)(p0 + c) * w_s + j];
+        }
+        for (uint32_t c = nc; c < nc_s; c++) {
+            ut[j * nc_s + c] = 0.0;
+        }
+    }
+
+    double acc_buf[WE_RIG_SN_MAX_W];
+    for (uint32_t q = 0; q < nr; q++) {
+        const double *brow = &bs[(size_t)(p0 + q) * w_s];
+        for (uint32_t c = 0; c < nc_s; c += 4u) {
+            __m256d acc = _mm256_setzero_pd();
+            for (uint32_t j = 0; j < w_s; j++) {
+                __m256d bvec = _mm256_set1_pd(brow[j]);
+                __m256d uvec = _mm256_loadu_pd(&ut[j * nc_s + c]);
+                acc = _mm256_fmadd_pd(bvec, uvec, acc);
+            }
+            _mm256_storeu_pd(acc_buf + c, acc);
+        }
+        double *prow = &panel[(size_t)row_map[q] * wd_s];
+        for (uint32_t c = 0; c < nc; c++) {
+            prow[col_map[c]] -= acc_buf[c];
+        }
+    }
+}
+
+__attribute__((target("avx2,fma"))) static void
+sn_factor_trailing_avx2(double *restrict panel, uint32_t wd_s, uint32_t w_d, uint32_t m_d,
+                        uint32_t c, double inv_d, double *restrict b_d)
+{
+    double v[WE_RIG_SN_MAX_W];
+    for (uint32_t k = 0; k < wd_s; k++) {
+        v[k] = (k > c && k < w_d) ? panel[(size_t)k * wd_s + c] : 0.0;
+    }
+    uint32_t k0 = (c + 4u) & ~3u;
+    for (uint32_t k = c + 1u; k < w_d && k < k0; k++) {
+        v[k] = panel[(size_t)k * wd_s + c];
+    }
+
+    for (uint32_t r = c + 1u; r < m_d; r++) {
+        double *prow = &panel[(size_t)r * wd_s];
+        double l_rc = prow[c] * inv_d;
+        if (r >= w_d) {
+            b_d[(size_t)(r - w_d) * w_d + c] = l_rc;
+        }
+        __m256d lvec = _mm256_set1_pd(l_rc);
+        for (uint32_t k = c + 1u; k < k0 && k < w_d; k++) {
+            prow[k] -= l_rc * v[k];
+        }
+        for (uint32_t k = k0; k < wd_s; k += 4u) {
+            __m256d pvec = _mm256_loadu_pd(prow + k);
+            __m256d vvec = _mm256_loadu_pd(v + k);
+            pvec = _mm256_fnmadd_pd(lvec, vvec, pvec);
+            _mm256_storeu_pd(prow + k, pvec);
+        }
+    }
+}
+
+__attribute__((target("avx2,fma"))) static void
+sn_solve_4rhs_avx2(uint32_t n, uint32_t num_sn, const uint32_t *restrict sn_start,
+                   const uint32_t *restrict lp, const uint32_t *restrict li,
+                   const uint32_t *restrict t_off, const uint32_t *restrict b_off,
+                   const double *restrict sn_t, const double *restrict sn_b,
+                   const double *restrict inv_d, double *restrict x)
+{
+    for (uint32_t s = 0; s < num_sn; s++) {
+        uint32_t s0 = sn_start[s];
+        uint32_t s1 = sn_start[s + 1u];
+        uint32_t w = s1 - s0;
+        const double *t_mat = &sn_t[t_off[s]];
+        const double *b_mat = &sn_b[b_off[s]];
+        const uint32_t *s_rows = &li[lp[s]];
+        uint32_t h = lp[s + 1u] - lp[s];
+
+        if (w == 1u) {
+            __m256d x0 = _mm256_loadu_pd(&x[(size_t)s0 * 4u]);
+            for (uint32_t p = 0; p < h; p++) {
+                double *xr_ptr = &x[(size_t)s_rows[p] * 4u];
+                __m256d xr = _mm256_loadu_pd(xr_ptr);
+                xr = _mm256_fnmadd_pd(_mm256_set1_pd(b_mat[p]), x0, xr);
+                _mm256_storeu_pd(xr_ptr, xr);
+            }
+            continue;
+        }
+
+        for (uint32_t j = 0; j < w; j++) {
+            __m256d xj = _mm256_loadu_pd(&x[(size_t)(s0 + j) * 4u]);
+            for (uint32_t i = j + 1u; i < w; i++) {
+                __m256d lvec = _mm256_set1_pd(t_mat[i * w + j]);
+                double *xi_ptr = &x[(size_t)(s0 + i) * 4u];
+                __m256d xi = _mm256_loadu_pd(xi_ptr);
+                xi = _mm256_fnmadd_pd(lvec, xj, xi);
+                _mm256_storeu_pd(xi_ptr, xi);
+            }
+        }
+
+        __m256d xloc[WE_RIG_SN_MAX_W];
+        for (uint32_t j = 0; j < w; j++) {
+            xloc[j] = _mm256_loadu_pd(&x[(size_t)(s0 + j) * 4u]);
+        }
+        for (uint32_t p = 0; p < h; p++) {
+            const double *brow = &b_mat[(size_t)p * w];
+            double *xr_ptr = &x[(size_t)s_rows[p] * 4u];
+            __m256d xr = _mm256_loadu_pd(xr_ptr);
+            for (uint32_t j = 0; j < w; j++) {
+                xr = _mm256_fnmadd_pd(_mm256_set1_pd(brow[j]), xloc[j], xr);
+            }
+            _mm256_storeu_pd(xr_ptr, xr);
+        }
+    }
+
+    for (uint32_t i = 0; i < n; i++) {
+        double *xi_ptr = &x[(size_t)i * 4u];
+        __m256d xi = _mm256_loadu_pd(xi_ptr);
+        xi = _mm256_mul_pd(xi, _mm256_set1_pd(inv_d[i]));
+        _mm256_storeu_pd(xi_ptr, xi);
+    }
+
+    for (uint32_t si = num_sn; si > 0u; si--) {
+        uint32_t s = si - 1u;
+        uint32_t s0 = sn_start[s];
+        uint32_t s1 = sn_start[s + 1u];
+        uint32_t w = s1 - s0;
+        const double *t_mat = &sn_t[t_off[s]];
+        const double *b_mat = &sn_b[b_off[s]];
+        const uint32_t *s_rows = &li[lp[s]];
+        uint32_t h = lp[s + 1u] - lp[s];
+
+        if (w == 1u) {
+            __m256d x0 = _mm256_loadu_pd(&x[(size_t)s0 * 4u]);
+            for (uint32_t p = 0; p < h; p++) {
+                __m256d xr = _mm256_loadu_pd(&x[(size_t)s_rows[p] * 4u]);
+                x0 = _mm256_fnmadd_pd(_mm256_set1_pd(b_mat[p]), xr, x0);
+            }
+            _mm256_storeu_pd(&x[(size_t)s0 * 4u], x0);
+            continue;
+        }
+
+        __m256d xloc[WE_RIG_SN_MAX_W];
+        for (uint32_t j = 0; j < w; j++) {
+            xloc[j] = _mm256_loadu_pd(&x[(size_t)(s0 + j) * 4u]);
+        }
+        for (uint32_t p = 0; p < h; p++) {
+            const double *brow = &b_mat[(size_t)p * w];
+            __m256d xr = _mm256_loadu_pd(&x[(size_t)s_rows[p] * 4u]);
+            for (uint32_t j = 0; j < w; j++) {
+                xloc[j] = _mm256_fnmadd_pd(_mm256_set1_pd(brow[j]), xr, xloc[j]);
+            }
+        }
+        for (uint32_t j = w; j > 0u; j--) {
+            uint32_t jj = j - 1u;
+            __m256d acc = xloc[jj];
+            for (uint32_t i = jj + 1u; i < w; i++) {
+                acc = _mm256_fnmadd_pd(_mm256_set1_pd(t_mat[i * w + jj]), xloc[i], acc);
+            }
+            xloc[jj] = acc;
+            _mm256_storeu_pd(&x[(size_t)(s0 + jj) * 4u], acc);
+        }
+    }
+}
+#endif
+
+static void sn_update_panel_scalar(double *restrict panel, uint32_t wd_s, const double *restrict bs,
+                                   uint32_t w_s, uint32_t p0, uint32_t h_s, uint32_t nc,
+                                   const uint32_t *restrict col_map,
+                                   const uint32_t *restrict row_map, const double *restrict d_s)
+{
+    double ut[WE_RIG_SN_MAX_W * WE_RIG_SN_MAX_W];
+    for (uint32_t j = 0; j < w_s; j++) {
+        double dj = d_s[j];
+        for (uint32_t c = 0; c < nc; c++) {
+            ut[j * nc + c] = dj * bs[(size_t)(p0 + c) * w_s + j];
+        }
+    }
+    uint32_t nr = h_s - p0;
+    double acc[WE_RIG_SN_MAX_W];
+    for (uint32_t q = 0; q < nr; q++) {
+        const double *brow = &bs[(size_t)(p0 + q) * w_s];
+        for (uint32_t c = 0; c < nc; c++) {
+            acc[c] = 0.0;
+        }
+        for (uint32_t j = 0; j < w_s; j++) {
+            double bv = brow[j];
+            const double *urow = &ut[j * nc];
+            for (uint32_t c = 0; c < nc; c++) {
+                acc[c] += bv * urow[c];
+            }
+        }
+        double *prow = &panel[(size_t)row_map[q] * wd_s];
+        for (uint32_t c = 0; c < nc; c++) {
+            prow[col_map[c]] -= acc[c];
+        }
+    }
+}
+
+static void sn_factor_trailing_scalar(double *restrict panel, uint32_t wd_s, uint32_t w_d,
+                                      uint32_t m_d, uint32_t c, double inv_d, double *restrict b_d)
+{
+    double v[WE_RIG_SN_MAX_W];
+    for (uint32_t k = c + 1u; k < w_d; k++) {
+        v[k] = panel[(size_t)k * wd_s + c];
+    }
+    for (uint32_t r = c + 1u; r < m_d; r++) {
+        double *prow = &panel[(size_t)r * wd_s];
+        double l_rc = prow[c] * inv_d;
+        if (r >= w_d) {
+            b_d[(size_t)(r - w_d) * w_d + c] = l_rc;
+        }
+        for (uint32_t k = c + 1u; k < w_d; k++) {
+            prow[k] -= l_rc * v[k];
+        }
+    }
+}
+
+static void sn_solve_4rhs_scalar(uint32_t n, uint32_t num_sn, const uint32_t *restrict sn_start,
+                                 const uint32_t *restrict lp, const uint32_t *restrict li,
+                                 const uint32_t *restrict t_off, const uint32_t *restrict b_off,
+                                 const double *restrict sn_t, const double *restrict sn_b,
+                                 const double *restrict inv_d, double *restrict x)
+{
+    for (uint32_t s = 0; s < num_sn; s++) {
+        uint32_t s0 = sn_start[s];
+        uint32_t s1 = sn_start[s + 1u];
+        uint32_t w = s1 - s0;
+        const double *t_mat = &sn_t[t_off[s]];
+        const double *b_mat = &sn_b[b_off[s]];
+        const uint32_t *s_rows = &li[lp[s]];
+        uint32_t h = lp[s + 1u] - lp[s];
+
+        for (uint32_t j = 0; j < w; j++) {
+            const double *xj = &x[(size_t)(s0 + j) * 4u];
+            for (uint32_t i = j + 1u; i < w; i++) {
+                double lv = t_mat[i * w + j];
+                double *xi = &x[(size_t)(s0 + i) * 4u];
+                for (uint32_t b = 0; b < 4u; b++) {
+                    xi[b] -= lv * xj[b];
+                }
+            }
+        }
+        for (uint32_t p = 0; p < h; p++) {
+            const double *brow = &b_mat[(size_t)p * w];
+            double *xr = &x[(size_t)s_rows[p] * 4u];
+            for (uint32_t j = 0; j < w; j++) {
+                double lv = brow[j];
+                const double *xj = &x[(size_t)(s0 + j) * 4u];
+                for (uint32_t b = 0; b < 4u; b++) {
+                    xr[b] -= lv * xj[b];
+                }
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < n; i++) {
+        double id = inv_d[i];
+        double *xi = &x[(size_t)i * 4u];
+        for (uint32_t b = 0; b < 4u; b++) {
+            xi[b] *= id;
+        }
+    }
+
+    for (uint32_t si = num_sn; si > 0u; si--) {
+        uint32_t s = si - 1u;
+        uint32_t s0 = sn_start[s];
+        uint32_t s1 = sn_start[s + 1u];
+        uint32_t w = s1 - s0;
+        const double *t_mat = &sn_t[t_off[s]];
+        const double *b_mat = &sn_b[b_off[s]];
+        const uint32_t *s_rows = &li[lp[s]];
+        uint32_t h = lp[s + 1u] - lp[s];
+
+        for (uint32_t p = 0; p < h; p++) {
+            const double *brow = &b_mat[(size_t)p * w];
+            const double *xr = &x[(size_t)s_rows[p] * 4u];
+            for (uint32_t j = 0; j < w; j++) {
+                double lv = brow[j];
+                double *xj = &x[(size_t)(s0 + j) * 4u];
+                for (uint32_t b = 0; b < 4u; b++) {
+                    xj[b] -= lv * xr[b];
+                }
+            }
+        }
+        for (uint32_t j = w; j > 0u; j--) {
+            uint32_t jj = j - 1u;
+            double *xj = &x[(size_t)(s0 + jj) * 4u];
+            for (uint32_t i = jj + 1u; i < w; i++) {
+                double lv = t_mat[i * w + jj];
+                const double *xi = &x[(size_t)(s0 + i) * 4u];
+                for (uint32_t b = 0; b < 4u; b++) {
+                    xj[b] -= lv * xi[b];
+                }
+            }
+        }
+    }
+}
+
+static void factor_one_supernode(uint32_t d, const uint32_t *restrict sn_start,
+                                 const uint32_t *restrict sn_of, const uint32_t *restrict Lp,
+                                 const uint32_t *restrict Li, const uint32_t *restrict perm_row_ptr,
+                                 const uint32_t *restrict perm_col_idx,
+                                 const double *restrict perm_val, const double *restrict perm_diag,
+                                 const uint32_t *restrict t_off, const uint32_t *restrict b_off,
+                                 double *restrict sn_T, double *restrict sn_B, double *restrict D,
+                                 double *restrict inv_D, uint32_t *restrict head_sn,
+                                 uint32_t *restrict link_sn, uint32_t *restrict next_ptr,
+                                 const uint8_t *restrict tier, uint8_t cur_tier,
+                                 uint8_t *restrict unlinked, bool use_avx2, double *restrict panel,
+                                 uint32_t *restrict row_map)
+{
+    uint32_t d0 = sn_start[d];
+    uint32_t d1 = sn_start[d + 1u];
+    uint32_t w_d = d1 - d0;
+    uint32_t wd_s = (w_d + 3u) & ~3u;
+    const uint32_t *d_rows = &Li[Lp[d]];
+    uint32_t h_d = Lp[d + 1u] - Lp[d];
+    uint32_t m_d = w_d + h_d;
+
+    memset(panel, 0, (size_t)m_d * wd_s * sizeof(double));
+
+    for (uint32_t k = d0; k < d1; k++) {
+        uint32_t lc = k - d0;
+        panel[(size_t)lc * wd_s + lc] = perm_diag[k];
+        uint32_t ptr_d = 0u;
+        for (uint32_t p = perm_row_ptr[k]; p < perm_row_ptr[k + 1u]; p++) {
+            uint32_t r = perm_col_idx[p];
+            if (r <= k) {
+                continue;
+            }
+            if (r < d1) {
+                panel[(size_t)(r - d0) * wd_s + lc] = perm_val[p];
+            } else {
+                while (ptr_d < h_d && d_rows[ptr_d] < r) {
+                    ptr_d++;
+                }
+                if (ptr_d < h_d && d_rows[ptr_d] == r) {
+                    panel[(size_t)(w_d + ptr_d) * wd_s + lc] = perm_val[p];
+                }
+            }
+        }
+    }
+
+    uint32_t s = head_sn[d];
+    head_sn[d] = UINT32_MAX;
+    while (s != UINT32_MAX) {
+        uint32_t nxt = link_sn[s];
+        uint32_t c0 = sn_start[s];
+        uint32_t c1 = sn_start[s + 1u];
+        uint32_t w_s = c1 - c0;
+        const uint32_t *s_rows = &Li[Lp[s]];
+        uint32_t h_s = Lp[s + 1u] - Lp[s];
+        uint32_t p0 = next_ptr[s];
+        uint32_t p1 = p0;
+        while (p1 < h_s && s_rows[p1] < d1) {
+            p1++;
+        }
+        uint32_t nc = p1 - p0;
+        if (nc > 0u) {
+            uint32_t col_map[WE_RIG_SN_MAX_W];
+            for (uint32_t c = 0; c < nc; c++) {
+                col_map[c] = s_rows[p0 + c] - d0;
+                row_map[c] = col_map[c];
+            }
+            uint32_t ptr_d = 0u;
+            for (uint32_t q = p1; q < h_s; q++) {
+                uint32_t rg = s_rows[q];
+                while (ptr_d < h_d && d_rows[ptr_d] < rg) {
+                    ptr_d++;
+                }
+                row_map[q - p0] = (ptr_d < h_d && d_rows[ptr_d] == rg) ? (w_d + ptr_d) : 0u;
+            }
+
+            const double *bs = &sn_B[b_off[s]];
+            uint32_t nr = h_s - p0;
+            if (w_s == 1u && nc == 1u) {
+                double u0 = bs[p0] * D[c0];
+                uint32_t lc = col_map[0];
+                for (uint32_t q = 0; q < nr; q++) {
+                    panel[(size_t)row_map[q] * wd_s + lc] -= bs[p0 + q] * u0;
+                }
+            } else if (w_s == 1u) {
+                double u1[WE_RIG_SN_MAX_W];
+                double d0v = D[c0];
+                for (uint32_t c = 0; c < nc; c++) {
+                    u1[c] = bs[p0 + c] * d0v;
+                }
+                for (uint32_t q = 0; q < nr; q++) {
+                    double bv = bs[p0 + q];
+                    double *prow = &panel[(size_t)row_map[q] * wd_s];
+                    for (uint32_t c = 0; c < nc; c++) {
+                        prow[col_map[c]] -= bv * u1[c];
+                    }
+                }
+            } else if (nc == 1u) {
+                double u1[WE_RIG_SN_MAX_W];
+                const double *b0r = &bs[(size_t)p0 * w_s];
+                for (uint32_t j = 0; j < w_s; j++) {
+                    u1[j] = D[c0 + j] * b0r[j];
+                }
+                uint32_t lc = col_map[0];
+                for (uint32_t q = 0; q < nr; q++) {
+                    const double *brow = &bs[(size_t)(p0 + q) * w_s];
+                    double dot = 0.0;
+                    for (uint32_t j = 0; j < w_s; j++) {
+                        dot += brow[j] * u1[j];
+                    }
+                    panel[(size_t)row_map[q] * wd_s + lc] -= dot;
+                }
+            } else
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(WWAL_DISABLE_SIMD)
+                if (use_avx2) {
+                if (nc == w_d && wd_s >= 4u) {
+                    sn_update_panel_full_avx2(panel, wd_s, w_d, bs, w_s, p0, h_s, row_map, &D[c0]);
+                } else {
+                    sn_update_panel_sparse_avx2(panel, wd_s, bs, w_s, p0, h_s, nc, col_map, row_map,
+                                                &D[c0]);
+                }
+            } else
+#endif
+            {
+                sn_update_panel_scalar(panel, wd_s, bs, w_s, p0, h_s, nc, col_map, row_map, &D[c0]);
+            }
+        }
+
+        next_ptr[s] = p1;
+        if (p1 < h_s) {
+            uint32_t next_target = sn_of[s_rows[p1]];
+            if (cur_tier < 3u && tier[next_target] > cur_tier) {
+                unlinked[s] = 1u;
+            } else {
+                link_sn[s] = head_sn[next_target];
+                head_sn[next_target] = s;
+            }
+        }
+        s = nxt;
+    }
+
+    double *t_d = &sn_T[t_off[d]];
+    double *b_d = (h_d > 0u) ? &sn_B[b_off[d]] : NULL;
+    for (uint32_t c = 0; c < w_d; c++) {
+        double piv = panel[(size_t)c * wd_s + c];
+        double scale_floor = fmax(1e-15 * fabs(perm_diag[d0 + c]), 1e-18);
+        double d_val = (isfinite(piv) && piv > scale_floor) ? piv : scale_floor;
+        D[d0 + c] = d_val;
+        double inv_d = 1.0 / d_val;
+        inv_D[d0 + c] = inv_d;
+
+        for (uint32_t r = c + 1u; r < w_d; r++) {
+            t_d[r * w_d + c] = panel[(size_t)r * wd_s + c] * inv_d;
+        }
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(WWAL_DISABLE_SIMD)
+        if (use_avx2 && wd_s >= 4u) {
+            sn_factor_trailing_avx2(panel, wd_s, w_d, m_d, c, inv_d, b_d);
+        } else
+#endif
+        {
+            sn_factor_trailing_scalar(panel, wd_s, w_d, m_d, c, inv_d, b_d);
+        }
+    }
+
+    if (h_d > 0u) {
+        next_ptr[d] = 0u;
+        uint32_t first_target = sn_of[d_rows[0]];
+        if (cur_tier < 3u && tier[first_target] > cur_tier) {
+            unlinked[d] = 1u;
+        } else {
+            link_sn[d] = head_sn[first_target];
+            head_sn[first_target] = d;
+        }
+    }
+}
+
 static bool solve_sparse_ldlt_or_ic0(uint32_t n, const uint32_t *perm_row_ptr,
                                      const uint32_t *perm_col_idx, const double *perm_val,
-                                     const double *perm_diag, uint32_t B, const double *perm_rhs,
-                                     double *out_perm_sol, uint32_t *out_factor_nnz,
-                                     bool *out_used_ic0)
+                                     const double *perm_diag, uint32_t B, double *perm_rhs_inout,
+                                     uint32_t *out_factor_nnz, bool *out_used_ic0)
 {
     *out_factor_nnz = 0u;
     *out_used_ic0 = false;
@@ -1597,79 +3004,31 @@ static bool solve_sparse_ldlt_or_ic0(uint32_t n, const uint32_t *perm_row_ptr,
         return true;
     }
 
-    /* Build upper-triangular CSC (row <= k for column k) from symmetric CSR */
-    uint32_t *Ap = calloc((size_t)n + 1u, sizeof(uint32_t));
     uint32_t *parent = malloc((size_t)n * sizeof(uint32_t));
     uint32_t *ancestor = malloc((size_t)n * sizeof(uint32_t));
     uint32_t *flag = malloc((size_t)n * sizeof(uint32_t));
-    uint32_t *pattern = malloc((size_t)n * sizeof(uint32_t));
-    uint32_t *tmp_stack = malloc((size_t)n * sizeof(uint32_t));
     uint32_t *col_nnz = calloc(n, sizeof(uint32_t));
-    if (!Ap || !parent || !ancestor || !flag || !pattern || !tmp_stack || !col_nnz) {
-        free(Ap);
+    uint32_t *n_children = calloc(n, sizeof(uint32_t));
+    uint32_t *subtree_sz = malloc((size_t)n * sizeof(uint32_t));
+    if (!parent || !ancestor || !flag || !col_nnz || !n_children || !subtree_sz) {
         free(parent);
         free(ancestor);
         free(flag);
-        free(pattern);
-        free(tmp_stack);
         free(col_nnz);
+        free(n_children);
+        free(subtree_sz);
         return false;
     }
 
-    for (uint32_t i = 0; i < n; i++) {
-        Ap[i + 1u]++; /* diagonal */
-        for (uint32_t p = perm_row_ptr[i]; p < perm_row_ptr[i + 1u]; p++) {
-            uint32_t j = perm_col_idx[p];
-            if (i < j) {
-                Ap[j + 1u]++;
-            }
-        }
-    }
-    for (uint32_t i = 0; i < n; i++) {
-        Ap[i + 1u] += Ap[i];
-    }
-
-    uint32_t nnz_u = Ap[n];
-    uint32_t *Ai = malloc((size_t)nnz_u * sizeof(uint32_t));
-    double *Ax = malloc((size_t)nnz_u * sizeof(double));
-    uint32_t *ap_cur = malloc((size_t)n * sizeof(uint32_t));
-    if (!Ai || !Ax || !ap_cur) {
-        free(Ap);
-        free(parent);
-        free(ancestor);
-        free(flag);
-        free(pattern);
-        free(tmp_stack);
-        free(col_nnz);
-        free(Ai);
-        free(Ax);
-        free(ap_cur);
-        return false;
-    }
-    memcpy(ap_cur, Ap, (size_t)n * sizeof(uint32_t));
-    for (uint32_t i = 0; i < n; i++) {
-        for (uint32_t p = perm_row_ptr[i]; p < perm_row_ptr[i + 1u]; p++) {
-            uint32_t j = perm_col_idx[p];
-            if (i < j) {
-                uint32_t dst = ap_cur[j]++;
-                Ai[dst] = i;
-                Ax[dst] = perm_val[p];
-            }
-        }
-    }
-    for (uint32_t k = 0; k < n; k++) {
-        uint32_t dst = ap_cur[k]++;
-        Ai[dst] = k;
-        Ax[dst] = perm_diag[k];
-    }
-    free(ap_cur);
-
-    /* Elimination tree (CSparse cs_etree) */
+    /* Elimination tree directly from sorted symmetric CSR (upper triangle i < k) */
     for (uint32_t k = 0; k < n; k++) {
         parent[k] = UINT32_MAX;
         ancestor[k] = UINT32_MAX;
-        for (uint32_t p = Ap[k]; p < Ap[k + 1u]; p++) {
-            uint32_t i = Ai[p];
+        for (uint32_t p = perm_row_ptr[k]; p < perm_row_ptr[k + 1u]; p++) {
+            uint32_t i = perm_col_idx[p];
+            if (i >= k) {
+                break;
+            }
             while (i < k) {
                 uint32_t inext = ancestor[i];
                 ancestor[i] = k;
@@ -1681,184 +3040,550 @@ static bool solve_sparse_ldlt_or_ic0(uint32_t n, const uint32_t *perm_row_ptr,
             }
         }
     }
-
-    /* Symbolic fill-in count */
-    uint64_t fill_nnz64 = 0u;
-    for (uint32_t i = 0; i < n; i++) {
-        flag[i] = UINT32_MAX;
+    for (uint32_t k = 0; k < n; k++) {
+        if (parent[k] != UINT32_MAX) {
+            n_children[parent[k]]++;
+        }
     }
     for (uint32_t k = 0; k < n; k++) {
-        flag[k] = k;
-        for (uint32_t p = Ap[k]; p < Ap[k + 1u]; p++) {
-            uint32_t i = Ai[p];
-            while (i < k && flag[i] != k) {
-                flag[i] = k;
-                col_nnz[i]++;
-                fill_nnz64++;
-                i = parent[i];
-            }
+        subtree_sz[k] = 1u;
+    }
+    for (uint32_t k = 0; k < n; k++) {
+        if (parent[k] != UINT32_MAX) {
+            subtree_sz[parent[k]] += subtree_sz[k];
+        }
+    }
+    bool is_post = true;
+    for (uint32_t k = 0; k < n; k++) {
+        uint32_t pk = parent[k];
+        if (pk != UINT32_MAX && k < pk + 1u - subtree_sz[pk]) {
+            is_post = false;
+            break;
         }
     }
 
+    /* Symbolic fill-in column counts: O(nnz(A)) Gilbert-Ng-Peyton on postordered etree */
+    uint64_t fill_nnz64 = 0u;
+    int32_t *delta = is_post ? malloc((size_t)n * sizeof(int32_t)) : NULL;
+    uint32_t *prevleaf = is_post ? malloc((size_t)n * sizeof(uint32_t)) : NULL;
+    if (is_post && delta && prevleaf) {
+        for (uint32_t j = 0; j < n; j++) {
+            ancestor[j] = j;
+            flag[j] = UINT32_MAX;
+            prevleaf[j] = UINT32_MAX;
+            delta[j] = 1 - (int32_t)n_children[j];
+        }
+        for (uint32_t j = 0; j < n; j++) {
+            uint32_t fj = j + 1u - subtree_sz[j];
+            for (uint32_t p = perm_row_ptr[j]; p < perm_row_ptr[j + 1u]; p++) {
+                uint32_t i = perm_col_idx[p];
+                if (i <= j) {
+                    continue;
+                }
+                if (flag[i] == UINT32_MAX || fj > flag[i]) {
+                    flag[i] = fj;
+                    uint32_t jprev = prevleaf[i];
+                    prevleaf[i] = j;
+                    uint32_t q;
+                    if (jprev == UINT32_MAX) {
+                        q = i;
+                    } else {
+                        q = jprev;
+                        while (ancestor[q] != q) {
+                            q = ancestor[q];
+                        }
+                        for (uint32_t s = jprev; s != q;) {
+                            uint32_t nxt = ancestor[s];
+                            ancestor[s] = q;
+                            s = nxt;
+                        }
+                    }
+                    delta[j]++;
+                    delta[q]--;
+                }
+            }
+            if (parent[j] != UINT32_MAX) {
+                ancestor[j] = parent[j];
+            }
+        }
+        for (uint32_t j = 0; j < n; j++) {
+            if (parent[j] != UINT32_MAX) {
+                delta[parent[j]] += delta[j];
+            }
+        }
+        for (uint32_t j = 0; j < n; j++) {
+            uint32_t c = (delta[j] > 1) ? (uint32_t)(delta[j] - 1) : 0u;
+            col_nnz[j] = c;
+            fill_nnz64 += c;
+        }
+    } else {
+        for (uint32_t i = 0; i < n; i++) {
+            flag[i] = UINT32_MAX;
+        }
+        for (uint32_t k = 0; k < n; k++) {
+            flag[k] = k;
+            for (uint32_t p = perm_row_ptr[k]; p < perm_row_ptr[k + 1u]; p++) {
+                uint32_t i = perm_col_idx[p];
+                if (i >= k) {
+                    break;
+                }
+                while (i < k && flag[i] != k) {
+                    flag[i] = k;
+                    col_nnz[i]++;
+                    fill_nnz64++;
+                    i = parent[i];
+                }
+            }
+        }
+    }
+    free(delta);
+    free(prevleaf);
+
     if (fill_nnz64 > (uint64_t)WE_RIG_HEAT_MAX_FILL_NNZ) {
-        free(Ai);
-        free(Ax);
-        free(Ap);
+        free(subtree_sz);
         free(parent);
         free(ancestor);
         free(flag);
-        free(pattern);
-        free(tmp_stack);
         free(col_nnz);
+        free(n_children);
         *out_used_ic0 = true;
         *out_factor_nnz = perm_row_ptr[n];
-        return solve_ic0_pcg_batched(n, perm_row_ptr, perm_col_idx, perm_val, perm_diag, B,
-                                     perm_rhs, out_perm_sol);
+        double *ic_rhs = malloc((size_t)B * n * sizeof(double));
+        double *ic_sol = malloc((size_t)B * n * sizeof(double));
+        if (!ic_rhs || !ic_sol) {
+            free(ic_rhs);
+            free(ic_sol);
+            return false;
+        }
+        uint32_t n_batches = (B + WE_RIG_SOLVE_BATCH - 1u) / WE_RIG_SOLVE_BATCH;
+        for (uint32_t bi = 0; bi < n_batches; bi++) {
+            uint32_t b0 = bi * WE_RIG_SOLVE_BATCH;
+            uint32_t nb = (B - b0 < WE_RIG_SOLVE_BATCH) ? (B - b0) : WE_RIG_SOLVE_BATCH;
+            for (uint32_t i = 0; i < n; i++) {
+                const double *src = &perm_rhs_inout[((size_t)bi * n + i) * WE_RIG_SOLVE_BATCH];
+                for (uint32_t k = 0; k < nb; k++) {
+                    ic_rhs[(size_t)(b0 + k) * n + i] = src[k];
+                }
+            }
+        }
+        bool ok = solve_ic0_pcg_batched(n, perm_row_ptr, perm_col_idx, perm_val, perm_diag, B,
+                                        ic_rhs, ic_sol);
+        if (ok) {
+            for (uint32_t bi = 0; bi < n_batches; bi++) {
+                uint32_t b0 = bi * WE_RIG_SOLVE_BATCH;
+                uint32_t nb = (B - b0 < WE_RIG_SOLVE_BATCH) ? (B - b0) : WE_RIG_SOLVE_BATCH;
+                for (uint32_t i = 0; i < n; i++) {
+                    double *dst = &perm_rhs_inout[((size_t)bi * n + i) * WE_RIG_SOLVE_BATCH];
+                    for (uint32_t k = 0; k < nb; k++) {
+                        dst[k] = ic_sol[(size_t)(b0 + k) * n + i];
+                    }
+                }
+            }
+        }
+        free(ic_rhs);
+        free(ic_sol);
+        return ok;
     }
 
     uint32_t fill_nnz = (uint32_t)fill_nnz64;
     *out_factor_nnz = fill_nnz + n;
+    free(ancestor);
 
-    uint32_t *Lp = calloc((size_t)n + 1u, sizeof(uint32_t));
-    uint32_t *col_cur = malloc((size_t)n * sizeof(uint32_t));
-    uint32_t *Li = fill_nnz > 0u ? malloc((size_t)fill_nnz * sizeof(uint32_t)) : NULL;
-    double *Lx = fill_nnz > 0u ? malloc((size_t)fill_nnz * sizeof(double)) : NULL;
-    double *D = malloc((size_t)n * sizeof(double));
-    double *Y = calloc(n, sizeof(double));
-    double *X = malloc((size_t)n * WE_RIG_RHS_BATCH * sizeof(double));
-    if (!Lp || !col_cur || !D || !Y || !X || (fill_nnz > 0u && (!Li || !Lx))) {
-        free(Lp);
-        free(col_cur);
-        free(Li);
-        free(Lx);
-        free(D);
-        free(Y);
-        free(X);
-        free(Ai);
-        free(Ax);
-        free(Ap);
+    uint32_t *sn_of = malloc((size_t)n * sizeof(uint32_t));
+    uint32_t *sn_start = malloc(((size_t)n + 1u) * sizeof(uint32_t));
+    /* Collapse postordered subtrees <= 8 into dense supernodes, then extend single-child chains
+     * up to WE_RIG_SN_MAX_W (24). */
+    if (!sn_of || !sn_start) {
+        free(sn_of);
+        free(sn_start);
+        free(subtree_sz);
         free(parent);
-        free(ancestor);
         free(flag);
-        free(pattern);
-        free(tmp_stack);
+        free(col_nnz);
+        free(n_children);
+        return false;
+    }
+
+    uint32_t num_sn = 0u;
+    for (uint32_t s = 0; s < n;) {
+        uint32_t r = s;
+        while (parent[r] != UINT32_MAX) {
+            uint32_t p = parent[r];
+            if (p + 1u - subtree_sz[p] != s || subtree_sz[p] > 8u) {
+                break;
+            }
+            r = p;
+        }
+        uint32_t c1 = r + 1u;
+        while (c1 < n && (c1 - s) < WE_RIG_SN_MAX_W && parent[c1 - 1u] == c1 &&
+               n_children[c1] == 1u) {
+            uint32_t nnz_prev = col_nnz[c1 - 1u];
+            uint32_t nnz_cur = col_nnz[c1];
+            uint32_t extra = (nnz_cur + 1u >= nnz_prev) ? (nnz_cur + 1u - nnz_prev) : 999u;
+            uint32_t max_extra = ((c1 - s) < 8u) ? 2u : 0u;
+            if (extra > max_extra) {
+                break;
+            }
+            c1++;
+        }
+        sn_start[num_sn] = s;
+        for (uint32_t k = s; k < c1; k++) {
+            sn_of[k] = num_sn;
+        }
+        num_sn++;
+        s = c1;
+    }
+    sn_start[num_sn] = n;
+    free(subtree_sz);
+    free(n_children);
+
+    uint32_t *Lp = malloc(((size_t)num_sn + 1u) * sizeof(uint32_t));
+    uint32_t *sn_cur = malloc((size_t)num_sn * sizeof(uint32_t));
+    uint32_t *t_off = malloc(((size_t)num_sn + 1u) * sizeof(uint32_t));
+    uint32_t *b_off = malloc(((size_t)num_sn + 1u) * sizeof(uint32_t));
+    uint32_t *head_sn = malloc((size_t)num_sn * sizeof(uint32_t));
+    uint32_t *link_sn = malloc((size_t)num_sn * sizeof(uint32_t));
+    uint32_t *next_ptr = calloc(num_sn, sizeof(uint32_t));
+    uint32_t *sn_parent = malloc((size_t)num_sn * sizeof(uint32_t));
+    uint32_t *sn_sub_cols = malloc((size_t)num_sn * sizeof(uint32_t));
+    uint32_t *sn_sub_first = malloc((size_t)num_sn * sizeof(uint32_t));
+    uint8_t *tier = calloc(num_sn, sizeof(uint8_t));
+    uint8_t *unlinked = calloc(num_sn, sizeof(uint8_t));
+    if (!Lp || !sn_cur || !t_off || !b_off || !head_sn || !link_sn || !next_ptr || !sn_parent ||
+        !sn_sub_cols || !sn_sub_first || !tier || !unlinked) {
+        free(flag);
+        free(parent);
+        free(Lp);
+        free(sn_cur);
+        free(t_off);
+        free(b_off);
+        free(head_sn);
+        free(link_sn);
+        free(next_ptr);
+        free(sn_parent);
+        free(sn_sub_cols);
+        free(sn_sub_first);
+        free(tier);
+        free(unlinked);
+        free(sn_of);
+        free(sn_start);
         free(col_nnz);
         return false;
     }
 
-    for (uint32_t i = 0; i < n; i++) {
-        Lp[i + 1u] = Lp[i] + col_nnz[i];
-        col_cur[i] = Lp[i];
-        flag[i] = UINT32_MAX;
+    uint64_t total_t64 = 0u;
+    uint64_t total_b64 = 0u;
+    uint32_t max_panel_rows = 0u;
+    uint32_t sn_h_total = 0u;
+    Lp[0] = 0u;
+    for (uint32_t s = 0; s < num_sn; s++) {
+        uint32_t w = sn_start[s + 1u] - sn_start[s];
+        uint32_t h = col_nnz[sn_start[s + 1u] - 1u];
+        sn_cur[s] = sn_h_total;
+        sn_h_total += h;
+        Lp[s + 1u] = sn_h_total;
+        flag[s] = UINT32_MAX;
+        t_off[s] = (uint32_t)total_t64;
+        b_off[s] = (uint32_t)total_b64;
+        total_t64 += (uint64_t)w * w;
+        total_b64 += (uint64_t)h * w;
+        if (w + h > max_panel_rows) {
+            max_panel_rows = w + h;
+        }
+        head_sn[s] = UINT32_MAX;
+        link_sn[s] = UINT32_MAX;
+        uint32_t p = parent[sn_start[s + 1u] - 1u];
+        sn_parent[s] = (p != UINT32_MAX) ? sn_of[p] : UINT32_MAX;
+        sn_sub_cols[s] = w;
+        sn_sub_first[s] = s;
     }
-
-    /* Numeric simplicial LDL^T factorization (CSparse cs_ldl) */
-    for (uint32_t k = 0; k < n; k++) {
-        uint32_t top = n;
-        flag[k] = k;
-        Y[k] = 0.0;
-        for (uint32_t p = Ap[k]; p < Ap[k + 1u]; p++) {
-            uint32_t i = Ai[p];
-            if (i <= k) {
-                Y[i] += Ax[p];
-                uint32_t len = 0u;
-                while (i < k && flag[i] != k) {
-                    tmp_stack[len++] = i;
-                    flag[i] = k;
-                    i = parent[i];
-                }
-                while (len > 0u) {
-                    pattern[--top] = tmp_stack[--len];
-                }
-            }
-        }
-        double d = Y[k];
-        Y[k] = 0.0;
-
-        for (uint32_t p = top; p < n; p++) {
-            uint32_t i = pattern[p];
-            double yi = Y[i];
-            Y[i] = 0.0;
-            double l_ki = yi / D[i];
-            for (uint32_t q = Lp[i]; q < col_cur[i]; q++) {
-                Y[Li[q]] -= Lx[q] * yi;
-            }
-            uint32_t dst = col_cur[i]++;
-            Li[dst] = k;
-            Lx[dst] = l_ki;
-            d -= l_ki * yi;
-        }
-        D[k] = (d > 1e-18) ? d : 1e-18;
-    }
-
-    /* 8-RHS batched forward / diagonal / backward triangular solves */
-    for (uint32_t b0 = 0; b0 < B; b0 += WE_RIG_RHS_BATCH) {
-        uint32_t nb = (B - b0 < WE_RIG_RHS_BATCH) ? (B - b0) : WE_RIG_RHS_BATCH;
-        for (uint32_t i = 0; i < n; i++) {
-            double *xi = &X[(size_t)i * WE_RIG_RHS_BATCH];
-            for (uint32_t k = 0; k < nb; k++) {
-                xi[k] = perm_rhs[(size_t)(b0 + k) * n + i];
-            }
-            for (uint32_t k = nb; k < WE_RIG_RHS_BATCH; k++) {
-                xi[k] = 0.0;
-            }
-        }
-
-        for (uint32_t i = 0; i < n; i++) {
-            const double *xi = &X[(size_t)i * WE_RIG_RHS_BATCH];
-            for (uint32_t p = Lp[i]; p < Lp[i + 1u]; p++) {
-                double lval = Lx[p];
-                double *xr = &X[(size_t)Li[p] * WE_RIG_RHS_BATCH];
-                for (uint32_t k = 0; k < WE_RIG_RHS_BATCH; k++) {
-                    xr[k] -= lval * xi[k];
-                }
-            }
-        }
-
-        for (uint32_t i = 0; i < n; i++) {
-            double inv_d = 1.0 / D[i];
-            double *xi = &X[(size_t)i * WE_RIG_RHS_BATCH];
-            for (uint32_t k = 0; k < WE_RIG_RHS_BATCH; k++) {
-                xi[k] *= inv_d;
-            }
-        }
-
-        for (uint32_t i = n; i > 0u; i--) {
-            uint32_t row = i - 1u;
-            double *xr = &X[(size_t)row * WE_RIG_RHS_BATCH];
-            for (uint32_t p = Lp[row]; p < Lp[row + 1u]; p++) {
-                double lval = Lx[p];
-                const double *xd = &X[(size_t)Li[p] * WE_RIG_RHS_BATCH];
-                for (uint32_t k = 0; k < WE_RIG_RHS_BATCH; k++) {
-                    xr[k] -= lval * xd[k];
-                }
-            }
-        }
-
-        for (uint32_t i = 0; i < n; i++) {
-            const double *xi = &X[(size_t)i * WE_RIG_RHS_BATCH];
-            for (uint32_t k = 0; k < nb; k++) {
-                out_perm_sol[(size_t)(b0 + k) * n + i] = xi[k];
-            }
-        }
-    }
-
-    free(Lp);
-    free(col_cur);
-    free(Li);
-    free(Lx);
-    free(D);
-    free(Y);
-    free(X);
-    free(Ai);
-    free(Ax);
-    free(Ap);
     free(parent);
-    free(ancestor);
-    free(flag);
-    free(pattern);
-    free(tmp_stack);
+    t_off[num_sn] = (uint32_t)total_t64;
+    b_off[num_sn] = (uint32_t)total_b64;
     free(col_nnz);
+
+    uint32_t *Li = sn_h_total > 0u ? malloc((size_t)sn_h_total * sizeof(uint32_t)) : NULL;
+    if (sn_h_total > 0u && !Li) {
+        free(flag);
+        free(sn_cur);
+        free(Lp);
+        free(t_off);
+        free(b_off);
+        free(head_sn);
+        free(link_sn);
+        free(next_ptr);
+        free(sn_parent);
+        free(sn_sub_cols);
+        free(sn_sub_first);
+        free(tier);
+        free(unlinked);
+        free(sn_of);
+        free(sn_start);
+        return false;
+    }
+
+    /* Supernode quotient reachability collects off-diagonal panel rows once per supernode */
+    for (uint32_t k = 0; k < n; k++) {
+        uint32_t sk = sn_of[k];
+        for (uint32_t p = perm_row_ptr[k]; p < perm_row_ptr[k + 1u]; p++) {
+            uint32_t i = perm_col_idx[p];
+            if (i >= k) {
+                break;
+            }
+            uint32_t u = sn_of[i];
+            while (u < sk && flag[u] != k) {
+                flag[u] = k;
+                Li[sn_cur[u]++] = k;
+                u = sn_parent[u];
+            }
+        }
+    }
+    free(sn_cur);
+    free(flag);
+
+    for (uint32_t s = 0; s < num_sn; s++) {
+        uint32_t sp = sn_parent[s];
+        if (sp != UINT32_MAX) {
+            sn_sub_cols[sp] += sn_sub_cols[s];
+            if (sn_sub_first[s] < sn_sub_first[sp]) {
+                sn_sub_first[sp] = sn_sub_first[s];
+            }
+        }
+    }
+
+    uint32_t c0_cap = (n / 24u > 64u) ? (n / 24u) : 64u;
+    uint32_t c1_cap = (n / 5u > c0_cap) ? (n / 5u) : c0_cap;
+    uint32_t c2_cap = ((n * 3u) / 5u > c1_cap) ? ((n * 3u) / 5u) : c1_cap;
+    if (n < 2048u) {
+        for (uint32_t s = 0; s < num_sn; s++) {
+            tier[s] = 3u;
+        }
+    } else {
+        for (uint32_t s = 0; s < num_sn; s++) {
+            uint32_t sc = sn_sub_cols[s];
+            if (sc <= c0_cap) {
+                tier[s] = 0u;
+            } else if (sc <= c1_cap) {
+                tier[s] = 1u;
+            } else if (sc <= c2_cap) {
+                tier[s] = 2u;
+            } else {
+                tier[s] = 3u;
+            }
+        }
+    }
+
+    uint32_t *task_lo = malloc((size_t)num_sn * sizeof(uint32_t));
+    uint32_t *task_hi = malloc((size_t)num_sn * sizeof(uint32_t));
+    if (!task_lo || !task_hi) {
+        free(task_lo);
+        free(task_hi);
+        free(t_off);
+        free(b_off);
+        free(head_sn);
+        free(link_sn);
+        free(next_ptr);
+        free(sn_parent);
+        free(sn_sub_cols);
+        free(sn_sub_first);
+        free(tier);
+        free(unlinked);
+        free(Lp);
+        free(Li);
+        free(sn_of);
+        free(sn_start);
+        return false;
+    }
+
+    uint32_t t_task_off[4] = {0u, 0u, 0u, 0u};
+    uint32_t total_tasks = 0u;
+    for (uint8_t t = 0u; t < 3u; t++) {
+        t_task_off[t] = total_tasks;
+        for (uint32_t s = 0; s < num_sn; s++) {
+            if (tier[s] == t && (sn_parent[s] == UINT32_MAX || tier[sn_parent[s]] > t)) {
+                task_lo[total_tasks] = sn_sub_first[s];
+                task_hi[total_tasks] = s;
+                total_tasks++;
+            }
+        }
+        /* Sort tasks descending by supernode span for balanced dynamic OpenMP scheduling */
+        uint32_t start = t_task_off[t];
+        for (uint32_t a = start + 1u; a < total_tasks; a++) {
+            uint32_t lo = task_lo[a], hi = task_hi[a];
+            uint32_t key_len = hi - lo;
+            uint32_t j = a;
+            while (j > start && (task_hi[j - 1u] - task_lo[j - 1u]) < key_len) {
+                task_lo[j] = task_lo[j - 1u];
+                task_hi[j] = task_hi[j - 1u];
+                j--;
+            }
+            task_lo[j] = lo;
+            task_hi[j] = hi;
+        }
+    }
+    t_task_off[3] = total_tasks;
+    free(sn_parent);
+    free(sn_sub_cols);
+    free(sn_sub_first);
+
+    uint32_t tier0_tasks = t_task_off[1] - t_task_off[0];
+    uint32_t n_fac_thr = 1u;
+#ifdef HAVE_OPENMP
+    if (n >= 2048u && tier0_tasks >= 2u) {
+        int max_t = omp_get_max_threads();
+        if (max_t > 1) {
+            uint32_t cap_t = (uint32_t)max_t < 6u ? (uint32_t)max_t : 6u;
+            n_fac_thr = cap_t < tier0_tasks ? cap_t : tier0_tasks;
+        }
+    }
+#endif
+    (void)tier0_tasks;
+
+    double *sn_T = total_t64 > 0u ? malloc((size_t)total_t64 * sizeof(double)) : NULL;
+    double *sn_B = total_b64 > 0u ? malloc((size_t)total_b64 * sizeof(double)) : NULL;
+    double *D = malloc((size_t)n * sizeof(double));
+    double *inv_D = malloc((size_t)n * sizeof(double));
+    double *panel_all =
+        max_panel_rows > 0u
+            ? malloc((size_t)n_fac_thr * max_panel_rows * WE_RIG_SN_MAX_W * sizeof(double))
+            : NULL;
+    uint32_t *row_map_all =
+        max_panel_rows > 0u ? malloc((size_t)n_fac_thr * max_panel_rows * sizeof(uint32_t)) : NULL;
+    if (!D || !inv_D || (total_t64 > 0u && !sn_T) || (total_b64 > 0u && !sn_B) ||
+        (max_panel_rows > 0u && (!panel_all || !row_map_all))) {
+        free(sn_T);
+        free(sn_B);
+        free(D);
+        free(inv_D);
+        free(panel_all);
+        free(row_map_all);
+        free(task_lo);
+        free(task_hi);
+        free(t_off);
+        free(b_off);
+        free(head_sn);
+        free(link_sn);
+        free(next_ptr);
+        free(tier);
+        free(unlinked);
+        free(Lp);
+        free(Li);
+        free(sn_of);
+        free(sn_start);
+        return false;
+    }
+
+    const bool use_avx2 = rig_cpu_has_avx2_fma();
+
+    if (n_fac_thr > 1u) {
+#ifdef HAVE_OPENMP
+#pragma omp parallel num_threads(n_fac_thr)
+        {
+            uint32_t tid = (uint32_t)omp_get_thread_num();
+            double *thr_panel = max_panel_rows > 0u
+                                    ? &panel_all[(size_t)tid * max_panel_rows * WE_RIG_SN_MAX_W]
+                                    : NULL;
+            uint32_t *thr_rmap =
+                max_panel_rows > 0u ? &row_map_all[(size_t)tid * max_panel_rows] : NULL;
+            for (uint8_t t = 0u; t < 3u; t++) {
+                uint32_t t0 = t_task_off[t];
+                uint32_t t1 = t_task_off[t + 1u];
+                if (t1 > t0) {
+#pragma omp for schedule(dynamic, 1)
+                    for (uint32_t ti = t0; ti < t1; ti++) {
+                        uint32_t hi_d = task_hi[ti];
+                        for (uint32_t d = task_lo[ti]; d <= hi_d; d++) {
+                            if (tier[d] == t) {
+                                factor_one_supernode(d, sn_start, sn_of, Lp, Li, perm_row_ptr,
+                                                     perm_col_idx, perm_val, perm_diag, t_off,
+                                                     b_off, sn_T, sn_B, D, inv_D, head_sn, link_sn,
+                                                     next_ptr, tier, t, unlinked, use_avx2,
+                                                     thr_panel, thr_rmap);
+                            }
+                        }
+                    }
+#pragma omp single
+                    {
+                        for (uint32_t s = 0; s < num_sn; s++) {
+                            if (unlinked[s]) {
+                                unlinked[s] = 0u;
+                                uint32_t target = sn_of[Li[Lp[s] + next_ptr[s]]];
+                                link_sn[s] = head_sn[target];
+                                head_sn[target] = s;
+                            }
+                        }
+                    }
+                }
+            }
+#pragma omp single nowait
+            {
+                for (uint32_t d = 0; d < num_sn; d++) {
+                    if (tier[d] == 3u) {
+                        factor_one_supernode(d, sn_start, sn_of, Lp, Li, perm_row_ptr, perm_col_idx,
+                                             perm_val, perm_diag, t_off, b_off, sn_T, sn_B, D,
+                                             inv_D, head_sn, link_sn, next_ptr, tier, 3u, unlinked,
+                                             use_avx2, thr_panel, thr_rmap);
+                    }
+                }
+            }
+        }
+#endif
+    } else {
+        for (uint32_t d = 0; d < num_sn; d++) {
+            factor_one_supernode(d, sn_start, sn_of, Lp, Li, perm_row_ptr, perm_col_idx, perm_val,
+                                 perm_diag, t_off, b_off, sn_T, sn_B, D, inv_D, head_sn, link_sn,
+                                 next_ptr, tier, 3u, unlinked, use_avx2, panel_all, row_map_all);
+        }
+    }
+
+    free(task_lo);
+    free(task_hi);
+    free(tier);
+    free(unlinked);
+    free(panel_all);
+    free(row_map_all);
+    free(head_sn);
+    free(link_sn);
+    free(next_ptr);
+    free(sn_of);
+    free(D);
+
+    /* Multi-RHS forward / diagonal / backward solves directly in-place on packed batches */
+    uint32_t n_batches = (B + WE_RIG_SOLVE_BATCH - 1u) / WE_RIG_SOLVE_BATCH;
+    uint32_t n_thr = 1u;
+#ifdef HAVE_OPENMP
+    if (n >= 512u && n_batches >= 2u) {
+        int max_t = omp_get_max_threads();
+        if (max_t > 1) {
+            n_thr = (uint32_t)max_t < n_batches ? (uint32_t)max_t : n_batches;
+        }
+    }
+#endif
+
+#ifdef HAVE_OPENMP
+#pragma omp parallel for num_threads(n_thr) schedule(static) if (n_thr > 1u)
+#endif
+    for (uint32_t bi = 0; bi < n_batches; bi++) {
+        double *x_buf = &perm_rhs_inout[(size_t)bi * n * WE_RIG_SOLVE_BATCH];
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(WWAL_DISABLE_SIMD)
+        if (use_avx2) {
+            sn_solve_4rhs_avx2(n, num_sn, sn_start, Lp, Li, t_off, b_off, sn_T, sn_B, inv_D, x_buf);
+        } else
+#endif
+        {
+            sn_solve_4rhs_scalar(n, num_sn, sn_start, Lp, Li, t_off, b_off, sn_T, sn_B, inv_D,
+                                 x_buf);
+        }
+    }
+
+    free(sn_T);
+    free(sn_B);
+    free(inv_D);
+    free(t_off);
+    free(b_off);
+    free(Lp);
+    free(Li);
+    free(sn_start);
     return true;
 }
 
@@ -2075,12 +3800,23 @@ bool we_mesh_solve_heat_weights(we_puppet_t *puppet, const we_heat_skin_cfg_t *c
         }
     }
 
+    uint32_t vis_threads = 1u;
+#ifdef HAVE_OPENMP
+    if (V >= 4096u && cfg.use_visibility_raycast && b_edge_cnt > 0u) {
+        int max_t = omp_get_max_threads();
+        if (max_t > 1) {
+            vis_threads = (uint32_t)max_t < 6u ? (uint32_t)max_t : 6u;
+        }
+    }
+#endif
+    size_t stamp_stride = (b_edge_cnt > 0u) ? (((size_t)b_edge_cnt + 15u) & ~(size_t)15u) : 0u;
     uint32_t *comp_id = malloc((size_t)V * sizeof(uint32_t));
     double *H_diag = calloc(V, sizeof(double));
     double *P_rhs = calloc((size_t)V * B, sizeof(double));
     uint32_t *closest_bone = calloc(V, sizeof(uint32_t));
-    uint32_t *edge_stamp = (b_edge_cnt > 0u) ? calloc(b_edge_cnt, sizeof(uint32_t)) : NULL;
-    if (!comp_id || !H_diag || !P_rhs || !closest_bone || (b_edge_cnt > 0u && !edge_stamp)) {
+    uint32_t *edge_stamp =
+        (stamp_stride > 0u) ? calloc((size_t)vis_threads * stamp_stride, sizeof(uint32_t)) : NULL;
+    if (!comp_id || !H_diag || !P_rhs || !closest_bone || (stamp_stride > 0u && !edge_stamp)) {
         free(comp_id);
         free(H_diag);
         free(P_rhs);
@@ -2119,7 +3855,6 @@ bool we_mesh_solve_heat_weights(we_puppet_t *puppet, const we_heat_skin_cfg_t *c
     }
     mean_mass = fmax(mean_mass / (double)V, 1e-12);
 
-    uint32_t stamp_id = 1u;
     double reg_p = pow((double)WE_RIG_HEAT_DEFAULT_REG, falloff_p);
 
     typedef struct {
@@ -2127,124 +3862,153 @@ bool we_mesh_solve_heat_weights(we_puppet_t *puppet, const we_heat_skin_cfg_t *c
         double dist;
         double qx, qy;
     } bone_cand_t;
-    bone_cand_t cands[WE_MDL_MAX_BONES];
 
-    for (uint32_t i = 0; i < V; i++) {
-        double vx = (double)puppet->vertices[i].pos[0];
-        double vy = (double)puppet->vertices[i].pos[1];
-
-        for (uint32_t b = 0; b < B; b++) {
-            cands[b].bone = b;
-            closest_pt_seg2d(vx, vy, &bone_segs[b], &cands[b].qx, &cands[b].qy, &cands[b].dist);
+#ifdef HAVE_OPENMP
+#pragma omp parallel num_threads(vis_threads) if (vis_threads > 1u)
+#endif
+    {
+        uint32_t tid = 0u;
+#ifdef HAVE_OPENMP
+        if (vis_threads > 1u) {
+            tid = (uint32_t)omp_get_thread_num();
         }
-        closest_bone[i] = 0u;
-        double best_euclid = 1e30;
-        for (uint32_t b = 0; b < B; b++) {
-            if (cands[b].dist < best_euclid) {
-                best_euclid = cands[b].dist;
-                closest_bone[i] = b;
-            }
-        }
+#endif
+        uint32_t *thr_stamp = (stamp_stride > 0u) ? &edge_stamp[(size_t)tid * stamp_stride] : NULL;
+        uint32_t stamp_id = 1u;
+        bone_cand_t cands[WE_MDL_MAX_BONES];
 
-        /* Sort candidates by Euclidean distance so visibility raycasts stop immediately past
-         * (1 + 1e-3) * d_min + 1e-4 * D_mesh once a visible bone is found. */
-        for (uint32_t a = 1u; a < B; a++) {
-            bone_cand_t key = cands[a];
-            uint32_t j = a;
-            while (j > 0u && cands[j - 1u].dist > key.dist) {
-                cands[j] = cands[j - 1u];
-                j--;
-            }
-            cands[j] = key;
-        }
+#ifdef HAVE_OPENMP
+#pragma omp for schedule(static, 64)
+#endif
+        for (uint32_t i = 0; i < V; i++) {
+            double vx = (double)puppet->vertices[i].pos[0];
+            double vy = (double)puppet->vertices[i].pos[1];
 
-        bool has_vis = false;
-        double d_min = 1e30;
-        uint32_t near_bones[WE_MDL_MAX_BONES];
-        double near_dists[WE_MDL_MAX_BONES];
-        uint32_t near_cnt = 0u;
-
-        for (uint32_t idx = 0; idx < B; idx++) {
-            double tol = (1.0 + 1e-3) * d_min + 1e-4 * diag_mesh;
-            if (has_vis && cands[idx].dist > tol) {
-                break;
+            for (uint32_t b = 0; b < B; b++) {
+                cands[b].bone = b;
+                closest_pt_seg2d(vx, vy, &bone_segs[b], &cands[b].qx, &cands[b].qy, &cands[b].dist);
             }
-            bool vis = true;
-            double vis_dist = cands[idx].dist;
-            if (cfg.use_visibility_raycast && b_edge_cnt > 0u) {
-                vis = is_ray_visible_dda(puppet, i, cands[idx].qx, cands[idx].qy, b_edges, &b_grid,
-                                         edge_stamp, stamp_id++);
-                if (!vis && !bone_segs[cands[idx].bone].is_point) {
-                    /* Probe quarter-points along the bone segment to avoid false occlusion at
-                     * tight concave joint vertices. */
-                    static const double k_t[3] = {0.25, 0.5, 0.75};
-                    double best_alt = 1e30;
-                    for (int s = 0; s < 3; s++) {
-                        double sx = bone_segs[cands[idx].bone].ax +
-                                    k_t[s] * (bone_segs[cands[idx].bone].bx -
-                                              bone_segs[cands[idx].bone].ax);
-                        double sy = bone_segs[cands[idx].bone].ay +
-                                    k_t[s] * (bone_segs[cands[idx].bone].by -
-                                              bone_segs[cands[idx].bone].ay);
-                        double sd = hypot(vx - sx, vy - sy);
-                        if (has_vis && sd > tol) {
-                            continue;
-                        }
-                        if (is_ray_visible_dda(puppet, i, sx, sy, b_edges, &b_grid, edge_stamp,
-                                               stamp_id++)) {
-                            if (sd < best_alt) {
-                                best_alt = sd;
-                                vis = true;
-                            }
-                        }
-                    }
-                    if (vis) {
-                        vis_dist = best_alt;
-                    }
+            closest_bone[i] = 0u;
+            double best_euclid = 1e30;
+            for (uint32_t b = 0; b < B; b++) {
+                if (cands[b].dist < best_euclid) {
+                    best_euclid = cands[b].dist;
+                    closest_bone[i] = b;
                 }
             }
-            if (vis) {
-                if (!has_vis) {
-                    has_vis = true;
-                    d_min = vis_dist;
-                    near_bones[near_cnt] = cands[idx].bone;
-                    near_dists[near_cnt] = vis_dist;
-                    near_cnt++;
-                } else {
-                    if (vis_dist < d_min) {
-                        d_min = vis_dist;
-                        uint32_t new_cnt = 0u;
-                        double new_tol = (1.0 + 1e-3) * d_min + 1e-4 * diag_mesh;
-                        for (uint32_t q = 0; q < near_cnt; q++) {
-                            if (near_dists[q] <= new_tol) {
-                                near_bones[new_cnt] = near_bones[q];
-                                near_dists[new_cnt] = near_dists[q];
-                                new_cnt++;
+
+            /* Sort candidates by Euclidean distance so visibility raycasts stop immediately past
+             * (1 + 1e-3) * d_min + 1e-4 * D_mesh once a visible bone is found. */
+            for (uint32_t a = 1u; a < B; a++) {
+                bone_cand_t key = cands[a];
+                uint32_t j = a;
+                while (j > 0u && cands[j - 1u].dist > key.dist) {
+                    cands[j] = cands[j - 1u];
+                    j--;
+                }
+                cands[j] = key;
+            }
+
+            bool has_vis = false;
+            double d_min = 1e30;
+            uint32_t near_bones[WE_MDL_MAX_BONES];
+            double near_dists[WE_MDL_MAX_BONES];
+            uint32_t near_cnt = 0u;
+
+            for (uint32_t idx = 0; idx < B; idx++) {
+                double tol = (1.0 + 1e-3) * d_min + 1e-4 * diag_mesh;
+                if (has_vis && cands[idx].dist > tol) {
+                    break;
+                }
+                bool vis = true;
+                double vis_dist = cands[idx].dist;
+                if (cfg.use_visibility_raycast && b_edge_cnt > 0u) {
+                    if (stamp_id == UINT32_MAX) {
+                        memset(thr_stamp, 0, (size_t)b_edge_cnt * sizeof(uint32_t));
+                        stamp_id = 1u;
+                    }
+                    vis = is_ray_visible_dda(puppet, i, cands[idx].qx, cands[idx].qy, b_edges,
+                                             &b_grid, thr_stamp, stamp_id++);
+                    if (!vis && !bone_segs[cands[idx].bone].is_point) {
+                        /* Probe quarter-points along the bone segment to avoid false occlusion at
+                         * tight concave joint vertices. */
+                        static const double k_t[3] = {0.25, 0.5, 0.75};
+                        double best_alt = 1e30;
+                        for (int s = 0; s < 3; s++) {
+                            double sx = bone_segs[cands[idx].bone].ax +
+                                        k_t[s] * (bone_segs[cands[idx].bone].bx -
+                                                  bone_segs[cands[idx].bone].ax);
+                            double sy = bone_segs[cands[idx].bone].ay +
+                                        k_t[s] * (bone_segs[cands[idx].bone].by -
+                                                  bone_segs[cands[idx].bone].ay);
+                            double sd = hypot(vx - sx, vy - sy);
+                            if (has_vis && sd > tol) {
+                                continue;
+                            }
+                            if (stamp_id == UINT32_MAX) {
+                                memset(thr_stamp, 0, (size_t)b_edge_cnt * sizeof(uint32_t));
+                                stamp_id = 1u;
+                            }
+                            if (is_ray_visible_dda(puppet, i, sx, sy, b_edges, &b_grid, thr_stamp,
+                                                   stamp_id++)) {
+                                if (sd < best_alt) {
+                                    best_alt = sd;
+                                    vis = true;
+                                }
                             }
                         }
-                        near_cnt = new_cnt;
+                        if (vis) {
+                            vis_dist = best_alt;
+                        }
                     }
-                    double cur_tol = (1.0 + 1e-3) * d_min + 1e-4 * diag_mesh;
-                    if (vis_dist <= cur_tol) {
+                }
+                if (vis) {
+                    if (!has_vis) {
+                        has_vis = true;
+                        d_min = vis_dist;
                         near_bones[near_cnt] = cands[idx].bone;
                         near_dists[near_cnt] = vis_dist;
                         near_cnt++;
+                    } else {
+                        if (vis_dist < d_min) {
+                            d_min = vis_dist;
+                            uint32_t new_cnt = 0u;
+                            double new_tol = (1.0 + 1e-3) * d_min + 1e-4 * diag_mesh;
+                            for (uint32_t q = 0; q < near_cnt; q++) {
+                                if (near_dists[q] <= new_tol) {
+                                    near_bones[new_cnt] = near_bones[q];
+                                    near_dists[new_cnt] = near_dists[q];
+                                    new_cnt++;
+                                }
+                            }
+                            near_cnt = new_cnt;
+                        }
+                        double cur_tol = (1.0 + 1e-3) * d_min + 1e-4 * diag_mesh;
+                        if (vis_dist <= cur_tol) {
+                            near_bones[near_cnt] = cands[idx].bone;
+                            near_dists[near_cnt] = vis_dist;
+                            near_cnt++;
+                        }
                     }
                 }
             }
-        }
 
-        if (has_vis && near_cnt > 0u) {
-            double d_norm = d_min / diag_mesh;
-            double h_val = (mass[i] / mean_mass) * c_heat / (pow(d_norm, falloff_p) + reg_p);
-            H_diag[i] = h_val;
-            comp_H_sum[comp_id[i]] += h_val;
-            double inv_n = 1.0 / (double)near_cnt;
-            for (uint32_t k = 0; k < near_cnt; k++) {
-                P_rhs[(size_t)i * B + near_bones[k]] = inv_n;
+            if (has_vis && near_cnt > 0u) {
+                double d_norm = d_min / diag_mesh;
+                double d_pow = (falloff_p == 2.0) ? (d_norm * d_norm) : pow(d_norm, falloff_p);
+                double h_val = (mass[i] / mean_mass) * c_heat / (d_pow + reg_p);
+                H_diag[i] = h_val;
+                double inv_n = 1.0 / (double)near_cnt;
+                for (uint32_t k = 0; k < near_cnt; k++) {
+                    P_rhs[(size_t)i * B + near_bones[k]] = inv_n;
+                }
+                closest_bone[i] = near_bones[0];
             }
-            closest_bone[i] = near_bones[0];
         }
+    }
+
+    for (uint32_t i = 0; i < V; i++) {
+        comp_H_sum[comp_id[i]] += H_diag[i];
     }
 
     /* Recover disconnected floating islands that had zero visible bones */
@@ -2319,7 +4083,7 @@ bool we_mesh_solve_heat_weights(we_puppet_t *puppet, const we_heat_skin_cfg_t *c
 
     uint32_t factor_nnz = 0u;
     bool used_ic0 = false;
-    double *W_full = calloc((size_t)V * B, sizeof(double));
+    double *W_full = (n_free == V) ? P_rhs : calloc((size_t)V * B, sizeof(double));
     if (!W_full) {
         free(v_to_free);
         free(free_to_v);
@@ -2343,12 +4107,16 @@ bool we_mesh_solve_heat_weights(we_puppet_t *puppet, const we_heat_skin_cfg_t *c
     }
 
     if (n_free > 0u) {
-        uint32_t *f_row_ptr = calloc((size_t)n_free + 1u, sizeof(uint32_t));
+        const bool all_free = (n_free == V);
+        uint32_t *alloc_f_row_ptr = all_free ? NULL : calloc((size_t)n_free + 1u, sizeof(uint32_t));
+        const uint32_t *f_row_ptr = all_free ? L.row_ptr : alloc_f_row_ptr;
         double *f_diag = malloc((size_t)n_free * sizeof(double));
-        if (!f_row_ptr || !f_diag) {
-            free(f_row_ptr);
+        if ((!all_free && !alloc_f_row_ptr) || !f_diag) {
+            free(alloc_f_row_ptr);
             free(f_diag);
-            free(W_full);
+            if (W_full != P_rhs) {
+                free(W_full);
+            }
             free(v_to_free);
             free(free_to_v);
             free_laplacian_csr(&L);
@@ -2360,32 +4128,44 @@ bool we_mesh_solve_heat_weights(we_puppet_t *puppet, const we_heat_skin_cfg_t *c
         }
 
         uint32_t f_nnz = 0u;
-        for (uint32_t fi = 0; fi < n_free; fi++) {
-            uint32_t i = free_to_v[fi];
-            f_diag[fi] = L.diag_L[i] + H_diag[i] + tikhonov_eps * mass[i];
-            for (uint32_t p = L.row_ptr[i]; p < L.row_ptr[i + 1u]; p++) {
-                if (v_to_free[L.col_idx[p]] != UINT32_MAX) {
-                    f_row_ptr[fi + 1u]++;
-                    f_nnz++;
+        if (all_free) {
+            f_nnz = L.row_ptr[V];
+            for (uint32_t i = 0; i < V; i++) {
+                f_diag[i] = L.diag_L[i] + H_diag[i] + tikhonov_eps * mass[i];
+            }
+        } else {
+            for (uint32_t fi = 0; fi < n_free; fi++) {
+                uint32_t i = free_to_v[fi];
+                f_diag[fi] = L.diag_L[i] + H_diag[i] + tikhonov_eps * mass[i];
+                for (uint32_t p = L.row_ptr[i]; p < L.row_ptr[i + 1u]; p++) {
+                    if (v_to_free[L.col_idx[p]] != UINT32_MAX) {
+                        alloc_f_row_ptr[fi + 1u]++;
+                        f_nnz++;
+                    }
                 }
             }
-        }
-        for (uint32_t fi = 0; fi < n_free; fi++) {
-            f_row_ptr[fi + 1u] += f_row_ptr[fi];
+            for (uint32_t fi = 0; fi < n_free; fi++) {
+                alloc_f_row_ptr[fi + 1u] += alloc_f_row_ptr[fi];
+            }
         }
 
-        uint32_t *f_col_idx = f_nnz > 0u ? malloc((size_t)f_nnz * sizeof(uint32_t)) : NULL;
-        double *f_val = f_nnz > 0u ? malloc((size_t)f_nnz * sizeof(double)) : NULL;
+        uint32_t *alloc_f_col_idx =
+            (!all_free && f_nnz > 0u) ? malloc((size_t)f_nnz * sizeof(uint32_t)) : NULL;
+        double *alloc_f_val =
+            (!all_free && f_nnz > 0u) ? malloc((size_t)f_nnz * sizeof(double)) : NULL;
+        const uint32_t *f_col_idx = all_free ? L.col_idx : alloc_f_col_idx;
         uint32_t *perm = malloc((size_t)n_free * sizeof(uint32_t));
         uint32_t *inv_perm = malloc((size_t)n_free * sizeof(uint32_t));
-        if ((f_nnz > 0u && (!f_col_idx || !f_val)) || !perm || !inv_perm) {
-            free(f_row_ptr);
+        if ((!all_free && f_nnz > 0u && (!alloc_f_col_idx || !alloc_f_val)) || !perm || !inv_perm) {
+            free(alloc_f_row_ptr);
             free(f_diag);
-            free(f_col_idx);
-            free(f_val);
+            free(alloc_f_col_idx);
+            free(alloc_f_val);
             free(perm);
             free(inv_perm);
-            free(W_full);
+            if (W_full != P_rhs) {
+                free(W_full);
+            }
             free(v_to_free);
             free(free_to_v);
             free_laplacian_csr(&L);
@@ -2396,47 +4176,65 @@ bool we_mesh_solve_heat_weights(we_puppet_t *puppet, const we_heat_skin_cfg_t *c
             return false;
         }
 
-        uint32_t wpos = 0u;
-        for (uint32_t fi = 0; fi < n_free; fi++) {
-            uint32_t i = free_to_v[fi];
-            for (uint32_t p = L.row_ptr[i]; p < L.row_ptr[i + 1u]; p++) {
-                uint32_t fj = v_to_free[L.col_idx[p]];
-                if (fj != UINT32_MAX) {
-                    f_col_idx[wpos] = fj;
-                    f_val[wpos] = -L.edge_w[p];
-                    wpos++;
+        if (!all_free) {
+            uint32_t wpos = 0u;
+            for (uint32_t fi = 0; fi < n_free; fi++) {
+                uint32_t i = free_to_v[fi];
+                for (uint32_t p = L.row_ptr[i]; p < L.row_ptr[i + 1u]; p++) {
+                    uint32_t fj = v_to_free[L.col_idx[p]];
+                    if (fj != UINT32_MAX) {
+                        alloc_f_col_idx[wpos] = fj;
+                        alloc_f_val[wpos] = -L.edge_w[p];
+                        wpos++;
+                    }
                 }
             }
         }
 
-        if (!compute_rcm_permutation(n_free, f_row_ptr, f_col_idx, perm, inv_perm)) {
+        float (*free_coords)[3] = malloc((size_t)n_free * sizeof(float[3]));
+        if (free_coords) {
+            if (all_free) {
+                for (uint32_t i = 0; i < V; i++) {
+                    memcpy(free_coords[i], puppet->vertices[i].pos, sizeof(float[3]));
+                }
+            } else {
+                for (uint32_t fi = 0; fi < n_free; fi++) {
+                    memcpy(free_coords[fi], puppet->vertices[free_to_v[fi]].pos, sizeof(float[3]));
+                }
+            }
+        }
+        if (!compute_nd_ordering(n_free, f_row_ptr, f_col_idx, (const float (*)[3])free_coords,
+                                 perm, inv_perm)) {
             for (uint32_t i = 0; i < n_free; i++) {
                 perm[i] = i;
                 inv_perm[i] = i;
             }
         }
+        free(free_coords);
+        apply_etree_postorder(n_free, f_row_ptr, f_col_idx, perm, inv_perm);
 
-        /* Build permuted CSR (sorted ascending col_idx per row) and permuted RHS */
+        /* Build permuted CSR (sorted ascending col_idx per row) and packed 4-RHS batches */
+        uint32_t n_batches = (B + WE_RIG_SOLVE_BATCH - 1u) / WE_RIG_SOLVE_BATCH;
         uint32_t *p_row_ptr = calloc((size_t)n_free + 1u, sizeof(uint32_t));
         uint32_t *p_col_idx = f_nnz > 0u ? malloc((size_t)f_nnz * sizeof(uint32_t)) : NULL;
         double *p_val = f_nnz > 0u ? malloc((size_t)f_nnz * sizeof(double)) : NULL;
         double *p_diag = malloc((size_t)n_free * sizeof(double));
-        double *p_rhs = calloc((size_t)B * n_free, sizeof(double));
-        double *p_sol = calloc((size_t)B * n_free, sizeof(double));
-        if (!p_row_ptr || !p_diag || !p_rhs || !p_sol || (f_nnz > 0u && (!p_col_idx || !p_val))) {
+        double *p_pack = malloc((size_t)n_batches * WE_RIG_SOLVE_BATCH * n_free * sizeof(double));
+        if (!p_row_ptr || !p_diag || !p_pack || (f_nnz > 0u && (!p_col_idx || !p_val))) {
             free(p_row_ptr);
             free(p_col_idx);
             free(p_val);
             free(p_diag);
-            free(p_rhs);
-            free(p_sol);
-            free(f_row_ptr);
+            free(p_pack);
+            free(alloc_f_row_ptr);
             free(f_diag);
-            free(f_col_idx);
-            free(f_val);
+            free(alloc_f_col_idx);
+            free(alloc_f_val);
             free(perm);
             free(inv_perm);
-            free(W_full);
+            if (W_full != P_rhs) {
+                free(W_full);
+            }
             free(v_to_free);
             free(free_to_v);
             free_laplacian_csr(&L);
@@ -2453,60 +4251,106 @@ bool we_mesh_solve_heat_weights(we_puppet_t *puppet, const we_heat_skin_cfg_t *c
             p_row_ptr[pi + 1u] = p_row_ptr[pi] + (f_row_ptr[fi + 1u] - f_row_ptr[fi]);
         }
 
+        /* O(n + nnz) symmetric transpose builds strictly sorted p_col_idx without insertion sort */
+        uint32_t *p_row_cur = malloc((size_t)n_free * sizeof(uint32_t));
+        if (!p_row_cur) {
+            free(p_row_ptr);
+            free(p_col_idx);
+            free(p_val);
+            free(p_diag);
+            free(p_pack);
+            free(alloc_f_row_ptr);
+            free(f_diag);
+            free(alloc_f_col_idx);
+            free(alloc_f_val);
+            free(perm);
+            free(inv_perm);
+            if (W_full != P_rhs) {
+                free(W_full);
+            }
+            free(v_to_free);
+            free(free_to_v);
+            free_laplacian_csr(&L);
+            free(H_diag);
+            free(P_rhs);
+            free(closest_bone);
+            free(mass);
+            return false;
+        }
+        memcpy(p_row_cur, p_row_ptr, (size_t)n_free * sizeof(uint32_t));
         for (uint32_t pi = 0; pi < n_free; pi++) {
             uint32_t fi = perm[pi];
-            uint32_t orig_v = free_to_v[fi];
-            uint32_t dst = p_row_ptr[pi];
-            uint32_t cnt = f_row_ptr[fi + 1u] - f_row_ptr[fi];
-            for (uint32_t p = f_row_ptr[fi]; p < f_row_ptr[fi + 1u]; p++) {
-                p_col_idx[dst] = inv_perm[f_col_idx[p]];
-                p_val[dst] = f_val[p];
-                dst++;
-            }
-            /* Insertion sort row entries by permuted column index */
-            uint32_t r0 = p_row_ptr[pi];
-            for (uint32_t a = 1u; a < cnt; a++) {
-                uint32_t kc = p_col_idx[r0 + a];
-                double kv = p_val[r0 + a];
-                uint32_t j = a;
-                while (j > 0u && p_col_idx[r0 + j - 1u] > kc) {
-                    p_col_idx[r0 + j] = p_col_idx[r0 + j - 1u];
-                    p_val[r0 + j] = p_val[r0 + j - 1u];
-                    j--;
+            uint32_t orig_v = all_free ? fi : free_to_v[fi];
+            if (all_free) {
+                for (uint32_t p = L.row_ptr[fi]; p < L.row_ptr[fi + 1u]; p++) {
+                    uint32_t pj = inv_perm[L.col_idx[p]];
+                    uint32_t dst = p_row_cur[pj]++;
+                    p_col_idx[dst] = pi;
+                    p_val[dst] = -L.edge_w[p];
                 }
-                p_col_idx[r0 + j] = kc;
-                p_val[r0 + j] = kv;
+            } else {
+                for (uint32_t p = f_row_ptr[fi]; p < f_row_ptr[fi + 1u]; p++) {
+                    uint32_t pj = inv_perm[f_col_idx[p]];
+                    uint32_t dst = p_row_cur[pj]++;
+                    p_col_idx[dst] = pi;
+                    p_val[dst] = alloc_f_val[p];
+                }
             }
 
             double hi = H_diag[orig_v];
-            for (uint32_t b = 0; b < B; b++) {
-                p_rhs[(size_t)b * n_free + pi] = hi * P_rhs[(size_t)orig_v * B + b];
+            const double *pr = &P_rhs[(size_t)orig_v * B];
+            for (uint32_t bi = 0; bi < n_batches; bi++) {
+                uint32_t b0 = bi * WE_RIG_SOLVE_BATCH;
+                double *dst = &p_pack[((size_t)bi * n_free + pi) * WE_RIG_SOLVE_BATCH];
+                for (uint32_t k = 0; k < WE_RIG_SOLVE_BATCH; k++) {
+                    uint32_t b = b0 + k;
+                    dst[k] = (b < B) ? hi * pr[b] : 0.0;
+                }
             }
-            /* Subtract Dirichlet contribution A_{orig_v, locked} * W_locked from RHS */
-            for (uint32_t p = L.row_ptr[orig_v]; p < L.row_ptr[orig_v + 1u]; p++) {
-                uint32_t nbr = L.col_idx[p];
-                if (v_to_free[nbr] == UINT32_MAX) {
-                    double w_edge = L.edge_w[p];
-                    for (uint32_t b = 0; b < B; b++) {
-                        p_rhs[(size_t)b * n_free + pi] += w_edge * W_full[(size_t)nbr * B + b];
+            if (!all_free) {
+                /* Subtract Dirichlet contribution A_{orig_v, locked} * W_locked from RHS */
+                for (uint32_t p = L.row_ptr[orig_v]; p < L.row_ptr[orig_v + 1u]; p++) {
+                    uint32_t nbr = L.col_idx[p];
+                    if (v_to_free[nbr] == UINT32_MAX) {
+                        double w_edge = L.edge_w[p];
+                        const double *wn = &W_full[(size_t)nbr * B];
+                        for (uint32_t bi = 0; bi < n_batches; bi++) {
+                            uint32_t b0 = bi * WE_RIG_SOLVE_BATCH;
+                            uint32_t nb =
+                                (B - b0 < WE_RIG_SOLVE_BATCH) ? (B - b0) : WE_RIG_SOLVE_BATCH;
+                            double *dst = &p_pack[((size_t)bi * n_free + pi) * WE_RIG_SOLVE_BATCH];
+                            for (uint32_t k = 0; k < nb; k++) {
+                                dst[k] += w_edge * wn[b0 + k];
+                            }
+                        }
                     }
                 }
             }
         }
+        free(p_row_cur);
+        if (W_full == P_rhs) {
+            P_rhs = NULL;
+        }
 
-        free(f_row_ptr);
+        free(alloc_f_row_ptr);
         free(f_diag);
-        free(f_col_idx);
-        free(f_val);
+        free(alloc_f_col_idx);
+        free(alloc_f_val);
 
         bool solved = solve_sparse_ldlt_or_ic0(n_free, p_row_ptr, p_col_idx, p_val, p_diag, B,
-                                               p_rhs, p_sol, &factor_nnz, &used_ic0);
+                                               p_pack, &factor_nnz, &used_ic0);
 
         if (solved) {
             for (uint32_t pi = 0; pi < n_free; pi++) {
                 uint32_t orig_v = free_to_v[perm[pi]];
-                for (uint32_t b = 0; b < B; b++) {
-                    W_full[(size_t)orig_v * B + b] = p_sol[(size_t)b * n_free + pi];
+                double *wo = &W_full[(size_t)orig_v * B];
+                for (uint32_t bi = 0; bi < n_batches; bi++) {
+                    uint32_t b0 = bi * WE_RIG_SOLVE_BATCH;
+                    uint32_t nb = (B - b0 < WE_RIG_SOLVE_BATCH) ? (B - b0) : WE_RIG_SOLVE_BATCH;
+                    const double *src = &p_pack[((size_t)bi * n_free + pi) * WE_RIG_SOLVE_BATCH];
+                    for (uint32_t k = 0; k < nb; k++) {
+                        wo[b0 + k] = clampd(src[k], 0.0, 1.0);
+                    }
                 }
             }
         }
@@ -2515,8 +4359,7 @@ bool we_mesh_solve_heat_weights(we_puppet_t *puppet, const we_heat_skin_cfg_t *c
         free(p_col_idx);
         free(p_val);
         free(p_diag);
-        free(p_rhs);
-        free(p_sol);
+        free(p_pack);
         free(perm);
         free(inv_perm);
 
@@ -2548,8 +4391,8 @@ bool we_mesh_solve_heat_weights(we_puppet_t *puppet, const we_heat_skin_cfg_t *c
                     for (uint32_t p = L.row_ptr[i]; p < L.row_ptr[i + 1u]; p++) {
                         avg += L.edge_w[p] * W_full[(size_t)L.col_idx[p] * B + b];
                     }
-                    W_smooth[(size_t)i * B + b] =
-                        (1.0 - sf) * W_full[(size_t)i * B + b] + sf * avg * inv_deg;
+                    double ws = (1.0 - sf) * W_full[(size_t)i * B + b] + sf * avg * inv_deg;
+                    W_smooth[(size_t)i * B + b] = clampd(ws, 0.0, 1.0);
                 }
             }
             memcpy(W_full, W_smooth, (size_t)V * B * sizeof(double));
@@ -2597,9 +4440,10 @@ static inline bool is_bone_locked_mask(uint32_t bone_idx, const uint64_t locked_
     return ((locked_bone_mask[bone_idx >> 6u] >> (bone_idx & 63u)) & 1ull) != 0ull;
 }
 
-void we_mesh_renormalize_vertex_weights(we_mdl_vertex_t *vert, uint32_t bone_count,
-                                        uint32_t active_bone, float target_weight,
-                                        const uint64_t locked_bone_mask[2])
+static void renormalize_vertex_weights_impl(we_mdl_vertex_t *vert, uint32_t bone_count,
+                                            uint32_t active_bone, float target_weight,
+                                            bool apply_active_target,
+                                            const uint64_t locked_bone_mask[2])
 {
     if (!vert || bone_count == 0u) {
         return;
@@ -2648,8 +4492,8 @@ void we_mesh_renormalize_vertex_weights(we_mdl_vertex_t *vert, uint32_t bone_cou
     }
 
     float unlocked_budget = fmaxf(0.0f, 1.0f - locked_sum);
-    bool active_valid =
-        (active_bone < bone_count) && !is_bone_locked_mask(active_bone, locked_bone_mask);
+    bool active_valid = apply_active_target && (active_bone < bone_count) &&
+                        !is_bone_locked_mask(active_bone, locked_bone_mask);
 
     int active_slot = -1;
     int evict_slot = -1;
@@ -2659,11 +4503,12 @@ void we_mesh_renormalize_vertex_weights(we_mdl_vertex_t *vert, uint32_t bone_cou
     for (int k = 0; k < 4; k++) {
         bool is_locked = (vert->weight[k] > 0.0f) &&
                          is_bone_locked_mask(vert->blend_indices[k], locked_bone_mask);
-        if (vert->weight[k] > 0.0f && vert->blend_indices[k] == active_bone) {
+        if (active_valid && vert->weight[k] > 0.0f && vert->blend_indices[k] == active_bone) {
             active_slot = k;
         }
         if (!is_locked) {
-            if (vert->weight[k] > 0.0f && vert->blend_indices[k] != active_bone) {
+            if (vert->weight[k] > 0.0f &&
+                (!active_valid || vert->blend_indices[k] != active_bone)) {
                 other_unlocked_sum += vert->weight[k];
             }
             if (vert->weight[k] < min_unlocked) {
@@ -2748,7 +4593,17 @@ void we_mesh_renormalize_vertex_weights(we_mdl_vertex_t *vert, uint32_t bone_cou
     /* Enforce exact 1-ULP sum == 1.0f on the largest unlocked positive slot */
     float total = vert->weight[0] + vert->weight[1] + vert->weight[2] + vert->weight[3];
     if (total <= 1e-6f) {
-        uint32_t fb = (active_bone < bone_count) ? active_bone : 0u;
+        uint32_t fb = 0u;
+        if (active_bone < bone_count && !is_bone_locked_mask(active_bone, locked_bone_mask)) {
+            fb = active_bone;
+        } else {
+            for (uint32_t b = 0u; b < bone_count; b++) {
+                if (!is_bone_locked_mask(b, locked_bone_mask)) {
+                    fb = b;
+                    break;
+                }
+            }
+        }
         vert->blend_indices[0] = fb;
         vert->weight[0] = 1.0f;
         return;
@@ -2763,6 +4618,24 @@ void we_mesh_renormalize_vertex_weights(we_mdl_vertex_t *vert, uint32_t bone_cou
             fix_slot = k;
         }
     }
+    if (fix_slot < 0 && total < 1.0f - 1e-6f) {
+        uint32_t fb = bone_count;
+        for (uint32_t b = 0u; b < bone_count; b++) {
+            if (!is_bone_locked_mask(b, locked_bone_mask)) {
+                fb = b;
+                break;
+            }
+        }
+        if (fb < bone_count) {
+            for (int k = 0; k < 4; k++) {
+                if (vert->weight[k] == 0.0f) {
+                    vert->blend_indices[k] = fb;
+                    fix_slot = k;
+                    break;
+                }
+            }
+        }
+    }
     if (fix_slot >= 0) {
         float others = 0.0f;
         for (int k = 0; k < 4; k++) {
@@ -2772,6 +4645,14 @@ void we_mesh_renormalize_vertex_weights(we_mdl_vertex_t *vert, uint32_t bone_cou
         }
         vert->weight[fix_slot] = fmaxf(0.0f, 1.0f - others);
     }
+}
+
+void we_mesh_renormalize_vertex_weights(we_mdl_vertex_t *vert, uint32_t bone_count,
+                                        uint32_t active_bone, float target_weight,
+                                        const uint64_t locked_bone_mask[2])
+{
+    renormalize_vertex_weights_impl(vert, bone_count, active_bone, target_weight, true,
+                                    locked_bone_mask);
 }
 
 typedef struct {
@@ -2855,13 +4736,13 @@ static const char *const k_weight_brush_comp_parts[3] = {
     "void renormalize_with_locks(inout uvec4 idx, inout vec4 w, uint active_bone, float target_w) "
     "{\n"
     "    for (int i = 0; i < 4; ++i) {\n"
-    "        if (w[i] <= 0.0 || idx[i] >= u_BoneCount) {\n"
+    "        if (isnan(w[i]) || isinf(w[i]) || w[i] <= 0.0 || idx[i] >= u_BoneCount) {\n"
     "            w[i] = 0.0;\n"
     "            idx[i] = 0u;\n"
     "            continue;\n"
     "        }\n"
     "        for (int j = i + 1; j < 4; ++j) {\n"
-    "            if (w[j] > 0.0 && idx[j] == idx[i]) {\n"
+    "            if (!isnan(w[j]) && !isinf(w[j]) && w[j] > 0.0 && idx[j] == idx[i]) {\n"
     "                w[i] += w[j];\n"
     "                w[j] = 0.0;\n"
     "                idx[j] = 0u;\n"
@@ -2965,6 +4846,56 @@ static const char *const k_weight_brush_comp_parts[3] = {
     "            w[k] = 0.0;\n"
     "            idx[k] = 0u;\n"
     "        }\n"
+    "    }\n"
+    "    float total = w[0] + w[1] + w[2] + w[3];\n"
+    "    if (total <= 1e-6) {\n"
+    "        uint fb = 0u;\n"
+    "        if (active_bone < u_BoneCount && !is_bone_locked(active_bone)) {\n"
+    "            fb = active_bone;\n"
+    "        } else {\n"
+    "            for (uint b = 0u; b < u_BoneCount; ++b) {\n"
+    "                if (!is_bone_locked(b)) {\n"
+    "                    fb = b;\n"
+    "                    break;\n"
+    "                }\n"
+    "            }\n"
+    "        }\n"
+    "        idx[0] = fb;\n"
+    "        w[0]   = 1.0;\n"
+    "        return;\n"
+    "    }\n"
+    "    int   fix_slot = -1;\n"
+    "    float best_w   = -1.0;\n"
+    "    for (int k = 0; k < 4; ++k) {\n"
+    "        if (w[k] > best_w && !is_bone_locked(idx[k])) {\n"
+    "            best_w   = w[k];\n"
+    "            fix_slot = k;\n"
+    "        }\n"
+    "    }\n"
+    "    if (fix_slot < 0 && total < 1.0 - 1e-6) {\n"
+    "        uint fb = u_BoneCount;\n"
+    "        for (uint b = 0u; b < u_BoneCount; ++b) {\n"
+    "            if (!is_bone_locked(b)) {\n"
+    "                fb = b;\n"
+    "                break;\n"
+    "            }\n"
+    "        }\n"
+    "        if (fb < u_BoneCount) {\n"
+    "            for (int k = 0; k < 4; ++k) {\n"
+    "                if (w[k] == 0.0) {\n"
+    "                    idx[k]   = fb;\n"
+    "                    fix_slot = k;\n"
+    "                    break;\n"
+    "                }\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "    if (fix_slot >= 0) {\n"
+    "        float others = 0.0;\n"
+    "        for (int k = 0; k < 4; ++k) {\n"
+    "            if (k != fix_slot) others += w[k];\n"
+    "        }\n"
+    "        w[fix_slot] = max(0.0, 1.0 - others);\n"
     "    }\n"
     "}\n",
     "void main() {\n"
@@ -3143,10 +5074,107 @@ typedef struct {
     uint32_t heatmap_vert_cap;
     uint32_t heatmap_skin_cap;
     uint32_t heatmap_idx_cap;
+    gpu_weight_vert_t *brush_staging_scratch;
+    uint32_t brush_staging_cap;
+    we_skinned_vertex_t *heatmap_skinned_scratch;
+    uint32_t heatmap_skinned_cap;
+    gpu_skin_vbo_attrib_t *heatmap_skin_scratch;
+    uint32_t heatmap_skin_cpu_cap;
+    uint64_t last_use_seq;
     bool ready;
 } gpu_weight_brush_state_t;
 
-static gpu_weight_brush_state_t g_gpu_brush = {0};
+#define WE_GPU_BRUSH_MAX_CTXS 16u
+static pthread_mutex_t g_gpu_brush_mtx = PTHREAD_MUTEX_INITIALIZER;
+static gpu_weight_brush_state_t g_gpu_brush_slots[WE_GPU_BRUSH_MAX_CTXS] = {0};
+static uint64_t g_gpu_brush_seq = 0u;
+
+static void free_gpu_brush_cpu_scratch(gpu_weight_brush_state_t *st)
+{
+    free(st->brush_staging_scratch);
+    st->brush_staging_scratch = NULL;
+    st->brush_staging_cap = 0u;
+    free(st->heatmap_skinned_scratch);
+    st->heatmap_skinned_scratch = NULL;
+    st->heatmap_skinned_cap = 0u;
+    free(st->heatmap_skin_scratch);
+    st->heatmap_skin_scratch = NULL;
+    st->heatmap_skin_cpu_cap = 0u;
+}
+
+static void delete_gpu_brush_gl_objects(gpu_weight_brush_state_t *st)
+{
+    if (st->compute_prog) {
+        glDeleteProgram(st->compute_prog);
+    }
+    if (st->heatmap_prog) {
+        glDeleteProgram(st->heatmap_prog);
+    }
+    if (st->ssbo_ping) {
+        glDeleteBuffers(1, &st->ssbo_ping);
+    }
+    if (st->ssbo_pong) {
+        glDeleteBuffers(1, &st->ssbo_pong);
+    }
+    if (st->ssbo_adj) {
+        glDeleteBuffers(1, &st->ssbo_adj);
+    }
+    if (st->ssbo_dirty) {
+        glDeleteBuffers(1, &st->ssbo_dirty);
+    }
+    if (st->ubo_params) {
+        glDeleteBuffers(1, &st->ubo_params);
+    }
+    if (st->heatmap_vbo_dyn) {
+        glDeleteBuffers(1, &st->heatmap_vbo_dyn);
+    }
+    if (st->heatmap_vbo_skin) {
+        glDeleteBuffers(1, &st->heatmap_vbo_skin);
+    }
+    if (st->heatmap_ebo) {
+        glDeleteBuffers(1, &st->heatmap_ebo);
+    }
+    if (st->heatmap_vao) {
+        glDeleteVertexArrays(1, &st->heatmap_vao);
+    }
+    if (st->heatmap_white_tex) {
+        glDeleteTextures(1, &st->heatmap_white_tex);
+    }
+}
+
+static gpu_weight_brush_state_t *gpu_brush_get_slot(EGLContext ctx, bool create)
+{
+    if (ctx == EGL_NO_CONTEXT) {
+        return NULL;
+    }
+    pthread_mutex_lock(&g_gpu_brush_mtx);
+    uint32_t free_idx = WE_GPU_BRUSH_MAX_CTXS;
+    uint32_t lru_idx = 0u;
+    for (uint32_t i = 0u; i < WE_GPU_BRUSH_MAX_CTXS; i++) {
+        if (g_gpu_brush_slots[i].owner_ctx == ctx) {
+            g_gpu_brush_slots[i].last_use_seq = ++g_gpu_brush_seq;
+            pthread_mutex_unlock(&g_gpu_brush_mtx);
+            return &g_gpu_brush_slots[i];
+        }
+        if (g_gpu_brush_slots[i].owner_ctx == EGL_NO_CONTEXT && free_idx == WE_GPU_BRUSH_MAX_CTXS) {
+            free_idx = i;
+        }
+        if (g_gpu_brush_slots[i].last_use_seq < g_gpu_brush_slots[lru_idx].last_use_seq) {
+            lru_idx = i;
+        }
+    }
+    if (!create) {
+        pthread_mutex_unlock(&g_gpu_brush_mtx);
+        return NULL;
+    }
+    uint32_t dst = (free_idx < WE_GPU_BRUSH_MAX_CTXS) ? free_idx : lru_idx;
+    free_gpu_brush_cpu_scratch(&g_gpu_brush_slots[dst]);
+    memset(&g_gpu_brush_slots[dst], 0, sizeof(g_gpu_brush_slots[dst]));
+    g_gpu_brush_slots[dst].owner_ctx = ctx;
+    g_gpu_brush_slots[dst].last_use_seq = ++g_gpu_brush_seq;
+    pthread_mutex_unlock(&g_gpu_brush_mtx);
+    return &g_gpu_brush_slots[dst];
+}
 
 static GLuint compile_gl_shader_parts(GLenum stage, const char *const *parts, GLsizei count)
 {
@@ -3168,58 +5196,33 @@ static GLuint compile_gl_shader_parts(GLenum stage, const char *const *parts, GL
     return sh;
 }
 
-static void delete_gpu_brush_gl_objects(void)
-{
-    if (g_gpu_brush.compute_prog) {
-        glDeleteProgram(g_gpu_brush.compute_prog);
-    }
-    if (g_gpu_brush.heatmap_prog) {
-        glDeleteProgram(g_gpu_brush.heatmap_prog);
-    }
-    if (g_gpu_brush.ssbo_ping) {
-        glDeleteBuffers(1, &g_gpu_brush.ssbo_ping);
-    }
-    if (g_gpu_brush.ssbo_pong) {
-        glDeleteBuffers(1, &g_gpu_brush.ssbo_pong);
-    }
-    if (g_gpu_brush.ssbo_adj) {
-        glDeleteBuffers(1, &g_gpu_brush.ssbo_adj);
-    }
-    if (g_gpu_brush.ssbo_dirty) {
-        glDeleteBuffers(1, &g_gpu_brush.ssbo_dirty);
-    }
-    if (g_gpu_brush.ubo_params) {
-        glDeleteBuffers(1, &g_gpu_brush.ubo_params);
-    }
-    if (g_gpu_brush.heatmap_vbo_dyn) {
-        glDeleteBuffers(1, &g_gpu_brush.heatmap_vbo_dyn);
-    }
-    if (g_gpu_brush.heatmap_vbo_skin) {
-        glDeleteBuffers(1, &g_gpu_brush.heatmap_vbo_skin);
-    }
-    if (g_gpu_brush.heatmap_ebo) {
-        glDeleteBuffers(1, &g_gpu_brush.heatmap_ebo);
-    }
-    if (g_gpu_brush.heatmap_vao) {
-        glDeleteVertexArrays(1, &g_gpu_brush.heatmap_vao);
-    }
-    if (g_gpu_brush.heatmap_white_tex) {
-        glDeleteTextures(1, &g_gpu_brush.heatmap_white_tex);
-    }
-}
-
 void we_gpu_weight_brush_destroy(void)
 {
     EGLContext cur_ctx = eglGetCurrentContext();
-    if (cur_ctx != EGL_NO_CONTEXT && g_gpu_brush.owner_ctx == cur_ctx) {
-        delete_gpu_brush_gl_objects();
+    pthread_mutex_lock(&g_gpu_brush_mtx);
+    if (cur_ctx != EGL_NO_CONTEXT) {
+        for (uint32_t i = 0u; i < WE_GPU_BRUSH_MAX_CTXS; i++) {
+            if (g_gpu_brush_slots[i].owner_ctx == cur_ctx) {
+                delete_gpu_brush_gl_objects(&g_gpu_brush_slots[i]);
+                free_gpu_brush_cpu_scratch(&g_gpu_brush_slots[i]);
+                memset(&g_gpu_brush_slots[i], 0, sizeof(g_gpu_brush_slots[i]));
+            }
+        }
+    } else {
+        for (uint32_t i = 0u; i < WE_GPU_BRUSH_MAX_CTXS; i++) {
+            free_gpu_brush_cpu_scratch(&g_gpu_brush_slots[i]);
+            memset(&g_gpu_brush_slots[i], 0, sizeof(g_gpu_brush_slots[i]));
+        }
     }
-    memset(&g_gpu_brush, 0, sizeof(g_gpu_brush));
+    pthread_mutex_unlock(&g_gpu_brush_mtx);
 }
 
-static bool gpu_heatmap_compile_program(void)
+static bool gpu_heatmap_compile_program(gpu_weight_brush_state_t *st)
 {
-    if (g_gpu_brush.heatmap_prog && glIsProgram(g_gpu_brush.heatmap_prog)) {
+    if (!st) {
+        return false;
+    }
+    if (st->heatmap_prog && glIsProgram(st->heatmap_prog)) {
         return true;
     }
     GLuint hvs = compile_gl_shader_parts(GL_VERTEX_SHADER, &k_heatmap_vert_glsl, 1);
@@ -3232,7 +5235,7 @@ static bool gpu_heatmap_compile_program(void)
         GLint hok = 0;
         glGetProgramiv(hprog, GL_LINK_STATUS, &hok);
         if (hok) {
-            g_gpu_brush.heatmap_prog = hprog;
+            st->heatmap_prog = hprog;
         } else {
             glDeleteProgram(hprog);
         }
@@ -3243,18 +5246,21 @@ static bool gpu_heatmap_compile_program(void)
     if (hfs) {
         glDeleteShader(hfs);
     }
-    return g_gpu_brush.heatmap_prog != 0u;
+    return st->heatmap_prog != 0u;
 }
 
-static bool gpu_weight_brush_ensure_ready(void)
+static gpu_weight_brush_state_t *gpu_weight_brush_ensure_ready(void)
 {
     EGLContext cur_ctx = eglGetCurrentContext();
     if (cur_ctx == EGL_NO_CONTEXT) {
-        return false;
+        return NULL;
     }
-    if (g_gpu_brush.ready && g_gpu_brush.owner_ctx == cur_ctx &&
-        glIsProgram(g_gpu_brush.compute_prog)) {
-        return true;
+    gpu_weight_brush_state_t *st = gpu_brush_get_slot(cur_ctx, true);
+    if (!st) {
+        return NULL;
+    }
+    if (st->ready && glIsProgram(st->compute_prog)) {
+        return st;
     }
 
     GLint major = 0, minor = 0, ssbo_blocks = 0;
@@ -3262,18 +5268,18 @@ static bool gpu_weight_brush_ensure_ready(void)
     glGetIntegerv(GL_MINOR_VERSION, &minor);
     glGetIntegerv(GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS, &ssbo_blocks);
     if (major < 3 || (major == 3 && minor < 1) || ssbo_blocks < 4) {
-        return false;
+        return NULL;
     }
 
-    if (g_gpu_brush.owner_ctx == cur_ctx) {
-        delete_gpu_brush_gl_objects();
-    }
-    memset(&g_gpu_brush, 0, sizeof(g_gpu_brush));
-    g_gpu_brush.owner_ctx = cur_ctx;
+    delete_gpu_brush_gl_objects(st);
+    free_gpu_brush_cpu_scratch(st);
+    memset(st, 0, sizeof(*st));
+    st->owner_ctx = cur_ctx;
+    st->last_use_seq = ++g_gpu_brush_seq;
 
     GLuint cs = compile_gl_shader_parts(GL_COMPUTE_SHADER, k_weight_brush_comp_parts, 3);
     if (!cs) {
-        return false;
+        return NULL;
     }
     GLuint cprog = glCreateProgram();
     glAttachShader(cprog, cs);
@@ -3283,37 +5289,38 @@ static bool gpu_weight_brush_ensure_ready(void)
     glGetProgramiv(cprog, GL_LINK_STATUS, &ok);
     if (!ok) {
         glDeleteProgram(cprog);
-        return false;
+        return NULL;
     }
-    g_gpu_brush.compute_prog = cprog;
-    (void)gpu_heatmap_compile_program();
+    st->compute_prog = cprog;
+    (void)gpu_heatmap_compile_program(st);
 
     GLint prev_ssbo = 0, prev_ubo = 0;
     glGetIntegerv(GL_SHADER_STORAGE_BUFFER_BINDING, &prev_ssbo);
     glGetIntegerv(GL_UNIFORM_BUFFER_BINDING, &prev_ubo);
 
-    glGenBuffers(1, &g_gpu_brush.ssbo_ping);
-    glGenBuffers(1, &g_gpu_brush.ssbo_pong);
-    glGenBuffers(1, &g_gpu_brush.ssbo_adj);
-    glGenBuffers(1, &g_gpu_brush.ssbo_dirty);
-    glGenBuffers(1, &g_gpu_brush.ubo_params);
+    glGenBuffers(1, &st->ssbo_ping);
+    glGenBuffers(1, &st->ssbo_pong);
+    glGenBuffers(1, &st->ssbo_adj);
+    glGenBuffers(1, &st->ssbo_dirty);
+    glGenBuffers(1, &st->ubo_params);
 
     uint32_t zero_dirty[8] = {0};
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu_brush.ssbo_dirty);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, st->ssbo_dirty);
     glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(zero_dirty), zero_dirty, GL_DYNAMIC_DRAW);
-    glBindBuffer(GL_UNIFORM_BUFFER, g_gpu_brush.ubo_params);
+    glBindBuffer(GL_UNIFORM_BUFFER, st->ubo_params);
     glBufferData(GL_UNIFORM_BUFFER, sizeof(gpu_brush_params_ubo_t), NULL, GL_DYNAMIC_DRAW);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, (GLuint)prev_ssbo);
     glBindBuffer(GL_UNIFORM_BUFFER, (GLuint)prev_ubo);
 
     if (glGetError() != GL_NO_ERROR) {
-        delete_gpu_brush_gl_objects();
-        memset(&g_gpu_brush, 0, sizeof(g_gpu_brush));
-        return false;
+        delete_gpu_brush_gl_objects(st);
+        free_gpu_brush_cpu_scratch(st);
+        memset(st, 0, sizeof(*st));
+        return NULL;
     }
 
-    g_gpu_brush.ready = true;
-    return true;
+    st->ready = true;
+    return st;
 }
 
 static bool build_packed_csr_adjacency(const we_puppet_t *puppet, uint32_t **out_buf,
@@ -3386,46 +5393,11 @@ static bool build_packed_csr_adjacency(const we_puppet_t *puppet, uint32_t **out
     return true;
 }
 
-static void normalize_readback_vertex_with_locks(we_mdl_vertex_t *dv,
+static void normalize_readback_vertex_with_locks(we_mdl_vertex_t *dv, uint32_t bone_count,
+                                                 uint32_t active_bone,
                                                  const uint64_t locked_bone_mask[2])
 {
-    float locked_sum = 0.0f;
-    float unlocked_sum = 0.0f;
-    for (int k = 0; k < 4; k++) {
-        if (dv->weight[k] <= 0.0f) {
-            continue;
-        }
-        if (is_bone_locked_mask(dv->blend_indices[k], locked_bone_mask)) {
-            locked_sum += dv->weight[k];
-        } else {
-            unlocked_sum += dv->weight[k];
-        }
-    }
-    if (unlocked_sum > 1e-6f) {
-        float budget = fmaxf(0.0f, 1.0f - locked_sum);
-        float inv = budget / unlocked_sum;
-        int fix_slot = -1;
-        float best_w = -1.0f;
-        for (int k = 0; k < 4; k++) {
-            if (dv->weight[k] > 0.0f &&
-                !is_bone_locked_mask(dv->blend_indices[k], locked_bone_mask)) {
-                dv->weight[k] *= inv;
-                if (dv->weight[k] > best_w) {
-                    best_w = dv->weight[k];
-                    fix_slot = k;
-                }
-            }
-        }
-        if (fix_slot >= 0) {
-            float others = 0.0f;
-            for (int k = 0; k < 4; k++) {
-                if (k != fix_slot) {
-                    others += dv->weight[k];
-                }
-            }
-            dv->weight[fix_slot] = fmaxf(0.0f, 1.0f - others);
-        }
-    }
+    renormalize_vertex_weights_impl(dv, bone_count, active_bone, 0.0f, false, locked_bone_mask);
 }
 
 static void sync_puppet_gl_vbo_skin_block(const we_puppet_t *puppet, uint32_t v0, uint32_t v1)
@@ -3462,16 +5434,30 @@ static bool gpu_weight_brush_dispatch(we_puppet_t *puppet, const float axy[2], c
                                       const uint64_t *locked_vert_bs,
                                       uint64_t *inout_dirty_block_mask, uint32_t *out_modified_cnt)
 {
-    if (!puppet->gl_uploaded || !gpu_weight_brush_ensure_ready()) {
+    if (!puppet->gl_uploaded) {
+        return false;
+    }
+    EGLContext cur_ctx = eglGetCurrentContext();
+    if (cur_ctx == EGL_NO_CONTEXT ||
+        (puppet->gl_owner_ctx != NULL && puppet->gl_owner_ctx != (void *)cur_ctx)) {
+        return false;
+    }
+    gpu_weight_brush_state_t *st = gpu_weight_brush_ensure_ready();
+    if (!st) {
         return false;
     }
 
     uint32_t V = puppet->vertex_count;
     size_t vert_bytes = (size_t)V * sizeof(gpu_weight_vert_t);
-    gpu_weight_vert_t *staging = malloc(vert_bytes);
-    if (!staging) {
-        return false;
+    if (V > st->brush_staging_cap) {
+        gpu_weight_vert_t *ns = realloc(st->brush_staging_scratch, vert_bytes);
+        if (!ns) {
+            return false;
+        }
+        st->brush_staging_scratch = ns;
+        st->brush_staging_cap = V;
     }
+    gpu_weight_vert_t *staging = st->brush_staging_scratch;
 
     for (uint32_t i = 0; i < V; i++) {
         const we_mdl_vertex_t *sv = &puppet->vertices[i];
@@ -3489,14 +5475,12 @@ static bool gpu_weight_brush_dispatch(we_puppet_t *puppet, const float axy[2], c
     size_t adj_words = 0u;
     if (op == WE_WEIGHT_OP_SMOOTH) {
         if (!build_packed_csr_adjacency(puppet, &adj_buf, &adj_words)) {
-            free(staging);
             return false;
         }
     } else {
         adj_words = 6u;
         adj_buf = calloc(adj_words, sizeof(uint32_t));
         if (!adj_buf) {
-            free(staging);
             return false;
         }
     }
@@ -3519,22 +5503,22 @@ static bool gpu_weight_brush_dispatch(we_puppet_t *puppet, const float axy[2], c
     bool ok = false;
     uint32_t modified_cnt = 0u;
 
-    if (V > g_gpu_brush.ssbo_vert_cap) {
-        glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu_brush.ssbo_ping);
+    if (V > st->ssbo_vert_cap) {
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, st->ssbo_ping);
         glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)vert_bytes, staging, GL_DYNAMIC_DRAW);
-        glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu_brush.ssbo_pong);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, st->ssbo_pong);
         glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)vert_bytes, NULL, GL_DYNAMIC_READ);
-        g_gpu_brush.ssbo_vert_cap = V;
+        st->ssbo_vert_cap = V;
     } else {
-        glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu_brush.ssbo_ping);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, st->ssbo_ping);
         glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)vert_bytes, staging);
     }
 
     size_t adj_bytes = adj_words * sizeof(uint32_t);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu_brush.ssbo_adj);
-    if (adj_bytes > g_gpu_brush.adj_bytes_cap) {
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, st->ssbo_adj);
+    if (adj_bytes > st->adj_bytes_cap) {
         glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)adj_bytes, adj_buf, GL_DYNAMIC_DRAW);
-        g_gpu_brush.adj_bytes_cap = adj_bytes;
+        st->adj_bytes_cap = adj_bytes;
     } else {
         glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)adj_bytes, adj_buf);
     }
@@ -3542,7 +5526,7 @@ static bool gpu_weight_brush_dispatch(we_puppet_t *puppet, const float axy[2], c
     adj_buf = NULL;
 
     uint32_t zero_dirty[8] = {0};
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu_brush.ssbo_dirty);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, st->ssbo_dirty);
     glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(zero_dirty), zero_dirty);
 
     gpu_brush_params_ubo_t ubo = {0};
@@ -3567,22 +5551,22 @@ static bool gpu_weight_brush_dispatch(we_puppet_t *puppet, const float axy[2], c
     ubo.prune_eps = 1e-4f;
     ubo.bone_count = puppet->bone_count;
 
-    glBindBuffer(GL_UNIFORM_BUFFER, g_gpu_brush.ubo_params);
+    glBindBuffer(GL_UNIFORM_BUFFER, st->ubo_params);
     glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(ubo), &ubo);
 
-    glUseProgram(g_gpu_brush.compute_prog);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, g_gpu_brush.ssbo_ping);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g_gpu_brush.ssbo_adj);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, g_gpu_brush.ssbo_pong);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, g_gpu_brush.ssbo_dirty);
-    glBindBufferBase(GL_UNIFORM_BUFFER, 0, g_gpu_brush.ubo_params);
+    glUseProgram(st->compute_prog);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, st->ssbo_ping);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, st->ssbo_adj);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, st->ssbo_pong);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, st->ssbo_dirty);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 0, st->ubo_params);
 
     GLuint groups = (V + 63u) / 64u;
     glDispatchCompute(groups, 1u, 1u);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
 
     uint32_t dirty_words[8] = {0};
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu_brush.ssbo_dirty);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, st->ssbo_dirty);
     void *dptr =
         glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(dirty_words), GL_MAP_READ_BIT);
     if (!dptr) {
@@ -3591,7 +5575,7 @@ static bool gpu_weight_brush_dispatch(we_puppet_t *puppet, const float axy[2], c
     memcpy(dirty_words, dptr, sizeof(dirty_words));
     glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
 
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu_brush.ssbo_pong);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, st->ssbo_pong);
     const gpu_weight_vert_t *out_ptr = (const gpu_weight_vert_t *)glMapBufferRange(
         GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)vert_bytes, GL_MAP_READ_BIT);
     if (!out_ptr) {
@@ -3605,10 +5589,10 @@ static bool gpu_weight_brush_dispatch(we_puppet_t *puppet, const float axy[2], c
 
     uint32_t num_blocks = (V + WE_RIG_COW_BLOCK_VERTS - 1u) / WE_RIG_COW_BLOCK_VERTS;
     for (uint32_t blk = 0; blk < num_blocks; blk++) {
-        if (((dirty_words[blk >> 5u] >> (blk & 31u)) & 1u) == 0u) {
+        if ((blk >> 5u) >= 8u || ((dirty_words[blk >> 5u] >> (blk & 31u)) & 1u) == 0u) {
             continue;
         }
-        if (inout_dirty_block_mask) {
+        if (inout_dirty_block_mask && (blk >> 6u) < WE_RIG_COW_WORDS) {
             inout_dirty_block_mask[blk >> 6u] |= (1ull << (blk & 63u));
         }
         uint32_t v0 = blk * WE_RIG_COW_BLOCK_VERTS;
@@ -3621,21 +5605,23 @@ static bool gpu_weight_brush_dispatch(we_puppet_t *puppet, const float axy[2], c
             bool changed = false;
             for (int k = 0; k < 4; k++) {
                 if (dv->blend_indices[k] != out_ptr[i].blend_indices[k] ||
-                    fabsf(dv->weight[k] - out_ptr[i].weight[k]) > 1e-6f) {
+                    fabsf(dv->weight[k] - out_ptr[i].weight[k]) > 1e-6f ||
+                    !isfinite(out_ptr[i].weight[k])) {
                     changed = true;
                 }
                 dv->blend_indices[k] = out_ptr[i].blend_indices[k];
                 dv->weight[k] = out_ptr[i].weight[k];
             }
             if (changed) {
-                normalize_readback_vertex_with_locks(dv, locked_bone_mask);
+                normalize_readback_vertex_with_locks(dv, puppet->bone_count, active_bone,
+                                                     locked_bone_mask);
                 modified_cnt++;
             }
         }
         sync_puppet_gl_vbo_skin_block(puppet, v0, v1);
     }
 
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu_brush.ssbo_pong);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, st->ssbo_pong);
     glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
     glMemoryBarrier(GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT);
     ok = (glGetError() == GL_NO_ERROR);
@@ -3650,7 +5636,6 @@ restore_gl:
     glBindBuffer(GL_UNIFORM_BUFFER, (GLuint)prev_ubo);
     glUseProgram((GLuint)prev_prog);
     free(adj_buf);
-    free(staging);
 
     if (ok) {
         *out_modified_cnt = modified_cnt;
@@ -3665,12 +5650,14 @@ uint32_t we_mesh_apply_weight_paint_dab(we_puppet_t *puppet, const float axy[2],
                                         const uint64_t *locked_vert_bs,
                                         uint64_t *inout_dirty_block_mask)
 {
-    if (!puppet || !puppet->vertices || puppet->vertex_count == 0u || puppet->bone_count == 0u ||
-        !axy || !bxy) {
+    if (!puppet || !puppet->vertices || puppet->vertex_count == 0u ||
+        puppet->vertex_count > WE_MDL_MAX_VERTICES || puppet->bone_count == 0u ||
+        puppet->bone_count > WE_MDL_MAX_BONES || !axy || !bxy) {
         return 0u;
     }
     if (!isfinite(axy[0]) || !isfinite(axy[1]) || !isfinite(bxy[0]) || !isfinite(bxy[1]) ||
-        !isfinite(radius_a) || !isfinite(radius_b) || !isfinite(strength)) {
+        !isfinite(radius_a) || !isfinite(radius_b) || !isfinite(strength) ||
+        !isfinite(target_value)) {
         return 0u;
     }
 
@@ -3804,9 +5791,9 @@ uint32_t we_mesh_apply_weight_paint_dab(we_puppet_t *puppet, const float axy[2],
             uint32_t blk = vid / WE_RIG_COW_BLOCK_VERTS;
             if ((blk >> 6u) < WE_RIG_COW_WORDS) {
                 local_dirty[blk >> 6u] |= (1ull << (blk & 63u));
-            }
-            if (inout_dirty_block_mask) {
-                inout_dirty_block_mask[blk >> 6u] |= (1ull << (blk & 63u));
+                if (inout_dirty_block_mask) {
+                    inout_dirty_block_mask[blk >> 6u] |= (1ull << (blk & 63u));
+                }
             }
             modified_cnt++;
         }
@@ -3840,7 +5827,7 @@ bool we_mesh_rig_draw_heatmap_gl(const we_puppet_t *puppet, const float (*skin_m
                                  uint8_t mode, uint8_t palette, uint16_t active_bone, float opacity)
 {
     if (!puppet || !puppet->vertices || !puppet->indices || puppet->vertex_count == 0u ||
-        puppet->index_count == 0u || mode == 0u) {
+        puppet->vertex_count > WE_MDL_MAX_VERTICES || puppet->index_count == 0u || mode == 0u) {
         return false;
     }
 
@@ -3849,42 +5836,53 @@ bool we_mesh_rig_draw_heatmap_gl(const we_puppet_t *puppet, const float (*skin_m
         return false;
     }
 
-    if (!gpu_weight_brush_ensure_ready()) {
+    gpu_weight_brush_state_t *st = gpu_weight_brush_ensure_ready();
+    if (!st) {
         GLint major = 0;
         glGetIntegerv(GL_MAJOR_VERSION, &major);
         if (major < 3) {
             return false;
         }
-        if (g_gpu_brush.owner_ctx == cur_ctx && g_gpu_brush.heatmap_prog == 0u) {
-            if (!gpu_heatmap_compile_program()) {
-                return false;
-            }
-        } else if (g_gpu_brush.owner_ctx != cur_ctx) {
-            memset(&g_gpu_brush, 0, sizeof(g_gpu_brush));
-            g_gpu_brush.owner_ctx = cur_ctx;
-            if (!gpu_heatmap_compile_program()) {
-                return false;
-            }
+        st = gpu_brush_get_slot(cur_ctx, true);
+        if (!st || !gpu_heatmap_compile_program(st)) {
+            return false;
         }
     }
-    if (g_gpu_brush.heatmap_prog == 0u || !glIsProgram(g_gpu_brush.heatmap_prog)) {
+    if (st->heatmap_prog == 0u || !glIsProgram(st->heatmap_prog)) {
         return false;
     }
 
     uint32_t V = puppet->vertex_count;
-    we_skinned_vertex_t *skinned = malloc((size_t)V * sizeof(we_skinned_vertex_t));
-    if (!skinned) {
-        return false;
-    }
-    we_puppet_skin_vertices_cpu(puppet, skin_mats, skinned);
-
-    gpu_skin_vbo_attrib_t *skin_buf = NULL;
-    if (puppet->gl_vbo_skin == 0u) {
-        skin_buf = calloc(V, sizeof(gpu_skin_vbo_attrib_t));
-        if (!skin_buf) {
-            free(skinned);
+    if (V > st->heatmap_skinned_cap) {
+        we_skinned_vertex_t *ns =
+            realloc(st->heatmap_skinned_scratch, (size_t)V * sizeof(we_skinned_vertex_t));
+        if (!ns) {
             return false;
         }
+        st->heatmap_skinned_scratch = ns;
+        st->heatmap_skinned_cap = V;
+    }
+    we_skinned_vertex_t *skinned = st->heatmap_skinned_scratch;
+    we_puppet_skin_vertices_cpu(puppet, skin_mats, skinned);
+
+    bool use_puppet_skin_vbo =
+        (puppet->gl_vbo_skin != 0u &&
+         (puppet->gl_owner_ctx == NULL || puppet->gl_owner_ctx == (void *)cur_ctx));
+    bool use_puppet_ebo = (puppet->gl_ebo != 0u && (puppet->gl_owner_ctx == NULL ||
+                                                    puppet->gl_owner_ctx == (void *)cur_ctx));
+
+    gpu_skin_vbo_attrib_t *skin_buf = NULL;
+    if (!use_puppet_skin_vbo) {
+        if (V > st->heatmap_skin_cpu_cap) {
+            gpu_skin_vbo_attrib_t *nb =
+                realloc(st->heatmap_skin_scratch, (size_t)V * sizeof(gpu_skin_vbo_attrib_t));
+            if (!nb) {
+                return false;
+            }
+            st->heatmap_skin_scratch = nb;
+            st->heatmap_skin_cpu_cap = V;
+        }
+        skin_buf = st->heatmap_skin_scratch;
         for (uint32_t i = 0; i < V; i++) {
             for (int j = 0; j < 4; j++) {
                 uint32_t bidx = puppet->vertices[i].blend_indices[j];
@@ -3901,6 +5899,7 @@ bool we_mesh_rig_draw_heatmap_gl(const we_puppet_t *puppet, const float (*skin_m
     GLint prev_prog = 0;
     GLint prev_vao = 0;
     GLint prev_vbo = 0;
+    GLint prev_ebo = 0;
     GLint prev_active_tex = GL_TEXTURE0;
     GLint prev_tex0 = 0;
     GLboolean prev_blend = glIsEnabled(GL_BLEND);
@@ -3913,6 +5912,7 @@ bool we_mesh_rig_draw_heatmap_gl(const we_puppet_t *puppet, const float (*skin_m
     glGetIntegerv(GL_CURRENT_PROGRAM, &prev_prog);
     glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prev_vao);
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prev_vbo);
+    glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &prev_ebo);
     glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active_tex);
     glActiveTexture(GL_TEXTURE0);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex0);
@@ -3939,29 +5939,28 @@ bool we_mesh_rig_draw_heatmap_gl(const we_puppet_t *puppet, const float (*skin_m
         }
     }
 
-    if (g_gpu_brush.heatmap_vao == 0u) {
-        glGenVertexArrays(1, &g_gpu_brush.heatmap_vao);
+    if (st->heatmap_vao == 0u) {
+        glGenVertexArrays(1, &st->heatmap_vao);
     }
-    if (g_gpu_brush.heatmap_vbo_dyn == 0u) {
-        glGenBuffers(1, &g_gpu_brush.heatmap_vbo_dyn);
+    if (st->heatmap_vbo_dyn == 0u) {
+        glGenBuffers(1, &st->heatmap_vbo_dyn);
     }
-    if (g_gpu_brush.heatmap_white_tex == 0u) {
+    if (st->heatmap_white_tex == 0u) {
         uint8_t white[4] = {255u, 255u, 255u, 255u};
-        glGenTextures(1, &g_gpu_brush.heatmap_white_tex);
-        glBindTexture(GL_TEXTURE_2D, g_gpu_brush.heatmap_white_tex);
+        glGenTextures(1, &st->heatmap_white_tex);
+        glBindTexture(GL_TEXTURE_2D, st->heatmap_white_tex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, white);
-        glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex0);
     }
 
-    glBindVertexArray(g_gpu_brush.heatmap_vao);
+    glBindVertexArray(st->heatmap_vao);
 
-    glBindBuffer(GL_ARRAY_BUFFER, g_gpu_brush.heatmap_vbo_dyn);
-    if (V > g_gpu_brush.heatmap_vert_cap) {
+    glBindBuffer(GL_ARRAY_BUFFER, st->heatmap_vbo_dyn);
+    if (V > st->heatmap_vert_cap) {
         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(V * sizeof(we_skinned_vertex_t)), skinned,
                      GL_DYNAMIC_DRAW);
-        g_gpu_brush.heatmap_vert_cap = V;
+        st->heatmap_vert_cap = V;
     } else {
         glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(V * sizeof(we_skinned_vertex_t)), skinned);
     }
@@ -3971,17 +5970,17 @@ bool we_mesh_rig_draw_heatmap_gl(const we_puppet_t *puppet, const float (*skin_m
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(we_skinned_vertex_t),
                           (const void *)(3u * sizeof(float)));
 
-    if (puppet->gl_vbo_skin != 0u) {
+    if (use_puppet_skin_vbo) {
         glBindBuffer(GL_ARRAY_BUFFER, puppet->gl_vbo_skin);
     } else {
-        if (g_gpu_brush.heatmap_vbo_skin == 0u) {
-            glGenBuffers(1, &g_gpu_brush.heatmap_vbo_skin);
+        if (st->heatmap_vbo_skin == 0u) {
+            glGenBuffers(1, &st->heatmap_vbo_skin);
         }
-        glBindBuffer(GL_ARRAY_BUFFER, g_gpu_brush.heatmap_vbo_skin);
-        if (V > g_gpu_brush.heatmap_skin_cap) {
+        glBindBuffer(GL_ARRAY_BUFFER, st->heatmap_vbo_skin);
+        if (V > st->heatmap_skin_cap) {
             glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(V * sizeof(gpu_skin_vbo_attrib_t)), skin_buf,
                          GL_DYNAMIC_DRAW);
-            g_gpu_brush.heatmap_skin_cap = V;
+            st->heatmap_skin_cap = V;
         } else {
             glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(V * sizeof(gpu_skin_vbo_attrib_t)),
                             skin_buf);
@@ -3994,30 +5993,30 @@ bool we_mesh_rig_draw_heatmap_gl(const we_puppet_t *puppet, const float (*skin_m
     glVertexAttribPointer(6, 4, GL_FLOAT, GL_FALSE, sizeof(gpu_skin_vbo_attrib_t),
                           (const void *)offsetof(gpu_skin_vbo_attrib_t, weight));
 
-    if (puppet->gl_ebo != 0u) {
+    if (use_puppet_ebo) {
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, puppet->gl_ebo);
     } else {
-        if (g_gpu_brush.heatmap_ebo == 0u) {
-            glGenBuffers(1, &g_gpu_brush.heatmap_ebo);
+        if (st->heatmap_ebo == 0u) {
+            glGenBuffers(1, &st->heatmap_ebo);
         }
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_gpu_brush.heatmap_ebo);
-        if (puppet->index_count > g_gpu_brush.heatmap_idx_cap) {
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, st->heatmap_ebo);
+        if (puppet->index_count > st->heatmap_idx_cap) {
             glBufferData(GL_ELEMENT_ARRAY_BUFFER,
                          (GLsizeiptr)(puppet->index_count * sizeof(uint16_t)), puppet->indices,
                          GL_DYNAMIC_DRAW);
-            g_gpu_brush.heatmap_idx_cap = puppet->index_count;
+            st->heatmap_idx_cap = puppet->index_count;
         } else {
             glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0,
                             (GLsizeiptr)(puppet->index_count * sizeof(uint16_t)), puppet->indices);
         }
     }
 
-    glUseProgram(g_gpu_brush.heatmap_prog);
-    GLint loc_mvp = glGetUniformLocation(g_gpu_brush.heatmap_prog, "u_MVP");
-    GLint loc_bone = glGetUniformLocation(g_gpu_brush.heatmap_prog, "u_ActiveBone");
-    GLint loc_tex = glGetUniformLocation(g_gpu_brush.heatmap_prog, "u_Texture0");
-    GLint loc_pal = glGetUniformLocation(g_gpu_brush.heatmap_prog, "u_PaletteId");
-    GLint loc_alpha = glGetUniformLocation(g_gpu_brush.heatmap_prog, "u_OverlayAlpha");
+    glUseProgram(st->heatmap_prog);
+    GLint loc_mvp = glGetUniformLocation(st->heatmap_prog, "u_MVP");
+    GLint loc_bone = glGetUniformLocation(st->heatmap_prog, "u_ActiveBone");
+    GLint loc_tex = glGetUniformLocation(st->heatmap_prog, "u_Texture0");
+    GLint loc_pal = glGetUniformLocation(st->heatmap_prog, "u_PaletteId");
+    GLint loc_alpha = glGetUniformLocation(st->heatmap_prog, "u_OverlayAlpha");
 
     if (loc_mvp >= 0) {
         glUniformMatrix4fv(loc_mvp, 1, GL_FALSE, mvp);
@@ -4025,9 +6024,8 @@ bool we_mesh_rig_draw_heatmap_gl(const we_puppet_t *puppet, const float (*skin_m
     if (loc_bone >= 0) {
         glUniform1i(loc_bone, (GLint)active_bone);
     }
-    if (prev_tex0 == 0) {
-        glBindTexture(GL_TEXTURE_2D, g_gpu_brush.heatmap_white_tex);
-    }
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, st->heatmap_white_tex);
     if (loc_tex >= 0) {
         glUniform1i(loc_tex, 0);
     }
@@ -4055,14 +6053,16 @@ bool we_mesh_rig_draw_heatmap_gl(const we_puppet_t *puppet, const float (*skin_m
     glBlendEquationSeparate((GLenum)prev_eq_rgb, (GLenum)prev_eq_a);
     glBlendFuncSeparate((GLenum)prev_src_rgb, (GLenum)prev_dst_rgb, (GLenum)prev_src_a,
                         (GLenum)prev_dst_a);
+    glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex0);
     glActiveTexture((GLenum)prev_active_tex);
     glBindVertexArray((GLuint)prev_vao);
+    if (prev_vao == 0) {
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, (GLuint)prev_ebo);
+    }
     glBindBuffer(GL_ARRAY_BUFFER, (GLuint)prev_vbo);
     glUseProgram((GLuint)prev_prog);
 
-    free(skin_buf);
-    free(skinned);
     return glGetError() == GL_NO_ERROR;
 }
 
@@ -4254,34 +6254,60 @@ bool we_ik_solve_two_bone(const we_puppet_t *puppet, const we_ik_chain_t *chain,
         return true;
     }
 
-    float bind_world[WE_MDL_MAX_BONES][16];
-    compute_bind_world_matrices(puppet, topo, bind_world);
-    float L1 =
-        sqrtf((bind_world[m][12] - bind_world[r][12]) * (bind_world[m][12] - bind_world[r][12]) +
-              (bind_world[m][13] - bind_world[r][13]) * (bind_world[m][13] - bind_world[r][13]) +
-              (bind_world[m][14] - bind_world[r][14]) * (bind_world[m][14] - bind_world[r][14]));
-    float L2 =
-        sqrtf((bind_world[e][12] - bind_world[m][12]) * (bind_world[e][12] - bind_world[m][12]) +
-              (bind_world[e][13] - bind_world[m][13]) * (bind_world[e][13] - bind_world[m][13]) +
-              (bind_world[e][14] - bind_world[m][14]) * (bind_world[e][14] - bind_world[m][14]));
-    if (!isfinite(L1) || !isfinite(L2) || L1 <= 1e-5f || L2 <= 1e-5f) {
+    /* Collect ancestor chains (mid..r) and (end..mid) for multi-hop segment stretch & blend. */
+    uint32_t m_chain[WE_MDL_MAX_BONES];
+    uint32_t m_chain_len = 0u;
+    for (uint32_t cur = m; cur != 0xFFFFFFFFu && cur != r && m_chain_len < bcnt;
+         cur = puppet->bones[cur].parent) {
+        m_chain[m_chain_len++] = cur;
+    }
+    uint32_t e_chain[WE_MDL_MAX_BONES];
+    uint32_t e_chain_len = 0u;
+    for (uint32_t cur = e; cur != 0xFFFFFFFFu && cur != m && e_chain_len < bcnt;
+         cur = puppet->bones[cur].parent) {
+        e_chain[e_chain_len++] = cur;
+    }
+    if (m_chain_len == 0u || e_chain_len == 0u) {
         return false;
     }
 
-    float orig_r[16], orig_m[16], orig_e[16];
+    float orig_r[16], orig_m[16];
+    float orig_m_trans[WE_MDL_MAX_BONES][3];
+    float orig_e_trans[WE_MDL_MAX_BONES][3];
     memcpy(orig_r, inout_anim_local[r], sizeof(orig_r));
     memcpy(orig_m, inout_anim_local[m], sizeof(orig_m));
-    memcpy(orig_e, inout_anim_local[e], sizeof(orig_e));
+    for (uint32_t i = 0u; i < m_chain_len; i++) {
+        uint32_t bi = m_chain[i];
+        orig_m_trans[i][0] = inout_anim_local[bi][12];
+        orig_m_trans[i][1] = inout_anim_local[bi][13];
+        orig_m_trans[i][2] = inout_anim_local[bi][14];
+    }
+    for (uint32_t i = 0u; i < e_chain_len; i++) {
+        uint32_t bi = e_chain[i];
+        orig_e_trans[i][0] = inout_anim_local[bi][12];
+        orig_e_trans[i][1] = inout_anim_local[bi][13];
+        orig_e_trans[i][2] = inout_anim_local[bi][14];
+    }
     /* Bit 1 (0x2) opts into strict [0, 0] angle locking while keeping zero-initialized limits
      * unconstrained. */
     bool allow_zero_lock = (chain->enabled & 0x2u) != 0u;
 
+    /* Evaluate current pose world matrices so multi-hop animated/scaled segments yield true L1/L2.
+     */
     float world[WE_MDL_MAX_BONES][16];
     eval_world_mats_topo(puppet, topo, inout_anim_local, world);
 
     float p0[3] = {world[r][12], world[r][13], world[r][14]};
     float p1[3] = {world[m][12], world[m][13], world[m][14]};
     float p2[3] = {world[e][12], world[e][13], world[e][14]};
+
+    float L1 = sqrtf((p1[0] - p0[0]) * (p1[0] - p0[0]) + (p1[1] - p0[1]) * (p1[1] - p0[1]) +
+                     (p1[2] - p0[2]) * (p1[2] - p0[2]));
+    float L2 = sqrtf((p2[0] - p1[0]) * (p2[0] - p1[0]) + (p2[1] - p1[1]) * (p2[1] - p1[1]) +
+                     (p2[2] - p1[2]) * (p2[2] - p1[2]));
+    if (!isfinite(L1) || !isfinite(L2) || L1 <= 1e-5f || L2 <= 1e-5f) {
+        return false;
+    }
 
     float to_tgt[3] = {chain->target_world[0] - p0[0], chain->target_world[1] - p0[1],
                        chain->target_world[2] - p0[2]};
@@ -4395,15 +6421,24 @@ bool we_ik_solve_two_bone(const we_puppet_t *puppet, const we_ik_chain_t *chain,
     clamp_bone_z_angle_limit(puppet->bones[r].local_trans, chain->root_angle_min_rad,
                              chain->root_angle_max_rad, allow_zero_lock, inout_anim_local[r]);
 
-    /* Scale segment translations smoothly when soft-stretch elongates L1/L2 */
-    float sigma_stretch = L1_eff / L1;
-    if (fabsf(sigma_stretch - 1.0f) > 1e-5f) {
-        inout_anim_local[m][12] *= sigma_stretch;
-        inout_anim_local[m][13] *= sigma_stretch;
-        inout_anim_local[m][14] *= sigma_stretch;
-        inout_anim_local[e][12] *= sigma_stretch;
-        inout_anim_local[e][13] *= sigma_stretch;
-        inout_anim_local[e][14] *= sigma_stretch;
+    /* Scale every local translation link along (r->..->m) and (m->..->e) proportionally. */
+    float sigma_stretch1 = L1_eff / L1;
+    if (fabsf(sigma_stretch1 - 1.0f) > 1e-5f) {
+        for (uint32_t i = 0u; i < m_chain_len; i++) {
+            uint32_t bi = m_chain[i];
+            inout_anim_local[bi][12] *= sigma_stretch1;
+            inout_anim_local[bi][13] *= sigma_stretch1;
+            inout_anim_local[bi][14] *= sigma_stretch1;
+        }
+    }
+    float sigma_stretch2 = L2_eff / L2;
+    if (fabsf(sigma_stretch2 - 1.0f) > 1e-5f) {
+        for (uint32_t i = 0u; i < e_chain_len; i++) {
+            uint32_t bi = e_chain[i];
+            inout_anim_local[bi][12] *= sigma_stretch2;
+            inout_anim_local[bi][13] *= sigma_stretch2;
+            inout_anim_local[bi][14] *= sigma_stretch2;
+        }
     }
 
     /* Recompute world matrices after root rotation so mid-bone aims cleanly at target */
@@ -4434,9 +6469,24 @@ bool we_ik_solve_two_bone(const we_puppet_t *puppet, const we_ik_chain_t *chain,
                              chain->mid_angle_max_rad, allow_zero_lock, inout_anim_local[m]);
 
     blend_local_trs(orig_r, inout_anim_local[r], w_blend, inout_anim_local[r]);
-    blend_local_trs(orig_m, inout_anim_local[m], w_blend, inout_anim_local[m]);
-    for (int c = 12; c < 15; c++) {
-        inout_anim_local[e][c] = orig_e[c] + w_blend * (inout_anim_local[e][c] - orig_e[c]);
+    for (uint32_t i = 0u; i < m_chain_len; i++) {
+        uint32_t bi = m_chain[i];
+        if (bi == m) {
+            blend_local_trs(orig_m, inout_anim_local[m], w_blend, inout_anim_local[m]);
+        } else {
+            for (int c = 0; c < 3; c++) {
+                inout_anim_local[bi][12 + c] =
+                    orig_m_trans[i][c] +
+                    w_blend * (inout_anim_local[bi][12 + c] - orig_m_trans[i][c]);
+            }
+        }
+    }
+    for (uint32_t i = 0u; i < e_chain_len; i++) {
+        uint32_t bi = e_chain[i];
+        for (int c = 0; c < 3; c++) {
+            inout_anim_local[bi][12 + c] =
+                orig_e_trans[i][c] + w_blend * (inout_anim_local[bi][12 + c] - orig_e_trans[i][c]);
+        }
     }
     return true;
 }
@@ -4459,6 +6509,9 @@ bool we_ik_solve_aim(const we_puppet_t *puppet, const we_aim_constraint_t *aim,
         if (!isfinite(aim->target_world[i]) || !isfinite(aim->aim_axis_local[i])) {
             return false;
         }
+    }
+    if (!isfinite(aim->blend_weight)) {
+        return false;
     }
 
     float w_blend = clampf(aim->blend_weight, 0.0f, 1.0f);
@@ -4494,7 +6547,13 @@ bool we_ik_solve_aim(const we_puppet_t *puppet, const we_aim_constraint_t *aim,
         world[k][1] * local_ax[0] + world[k][5] * local_ax[1] + world[k][9] * local_ax[2],
         world[k][2] * local_ax[0] + world[k][6] * local_ax[1] + world[k][10] * local_ax[2],
     };
-    vec3_norm(dir_cur);
+    float dc_len = sqrtf(vec3_dot(dir_cur, dir_cur));
+    if (!isfinite(dc_len) || dc_len <= 1e-6f) {
+        return false;
+    }
+    dir_cur[0] /= dc_len;
+    dir_cur[1] /= dc_len;
+    dir_cur[2] /= dc_len;
 
     float cos_th = clampf(vec3_dot(dir_cur, dir_tgt), -1.0f, 1.0f);
     float theta = acosf(cos_th);
@@ -4508,9 +6567,20 @@ bool we_ik_solve_aim(const we_puppet_t *puppet, const we_aim_constraint_t *aim,
 
     float axis[3];
     if (cos_th < -1.0f + 1e-6f) {
-        axis[0] = 0.0f;
-        axis[1] = 0.0f;
-        axis[2] = 1.0f;
+        /* 180-deg reversal: keep XY flips around +Z, pick an orthogonal axis for +/-Z bones. */
+        if (fabsf(dir_cur[2]) < 0.9f) {
+            axis[0] = 0.0f;
+            axis[1] = 0.0f;
+            axis[2] = 1.0f;
+        } else {
+            float ref[3] = {1.0f, 0.0f, 0.0f};
+            if (fabsf(dir_cur[0]) > 0.9f) {
+                ref[0] = 0.0f;
+                ref[1] = 1.0f;
+            }
+            vec3_cross(dir_cur, ref, axis);
+            vec3_norm(axis);
+        }
     } else {
         vec3_cross(dir_cur, dir_tgt, axis);
         vec3_norm(axis);
@@ -4606,6 +6676,7 @@ static const we_mdl_anim_t *rig_find_anim(const we_puppet_t *puppet, const we_pu
                 return &puppet->anims[i];
             }
         }
+        return NULL;
     }
     for (uint32_t i = 0; i < puppet->anim_count; i++) {
         if (puppet->anims[i].id == layer->anim_id) {
@@ -4622,64 +6693,124 @@ static void rig_eval_track_at_time(const we_mdl_anim_t *anim, const we_mdl_bone_
                                    double time_sec, float out_pos[3], float out_angle[3],
                                    float out_scale[3])
 {
-    if (!tr || tr->kf_count == 0u || !tr->keyframes) {
+    if (!anim || !tr || tr->kf_count == 0u || !tr->keyframes) {
         return;
     }
     if (tr->kf_count == 1u) {
-        memcpy(out_pos, tr->keyframes[0].pos, 3u * sizeof(float));
-        memcpy(out_angle, tr->keyframes[0].angle, 3u * sizeof(float));
-        memcpy(out_scale, tr->keyframes[0].scale, 3u * sizeof(float));
+        const we_mdl_keyframe_t *k0 = &tr->keyframes[0];
+        for (int c = 0; c < 3; c++) {
+            if (isfinite(k0->pos[c])) {
+                out_pos[c] = k0->pos[c];
+            }
+            if (isfinite(k0->angle[c])) {
+                out_angle[c] = k0->angle[c];
+            }
+            if (isfinite(k0->scale[c])) {
+                out_scale[c] = k0->scale[c];
+            }
+        }
         return;
     }
 
-    double fps = (anim->fps > 0.0f) ? (double)anim->fps : 30.0;
-    double frame_pos = (isfinite(time_sec) ? time_sec : 0.0) * fps;
+    double fps = (isfinite(anim->fps) && anim->fps > 0.0f) ? (double)anim->fps : 30.0;
+    if (fps > 1e6) {
+        fps = 1e6;
+    }
+    double t_sec = isfinite(time_sec) ? time_sec : 0.0;
+    double frame_pos = t_sec * fps;
+    if (!isfinite(frame_pos)) {
+        frame_pos = 0.0;
+    }
+    bool decimated =
+        (anim->length > 1 && tr->kf_count > 1u && tr->kf_count < (uint32_t)anim->length);
     uint32_t f0 = 0u, f1 = 0u;
     float alpha = 0.0f;
 
     if (anim->mode == WE_ANIM_SINGLE) {
-        double max_f = (double)(tr->kf_count - 1u);
-        double clamped = fmin(fmax(frame_pos, 0.0), max_f);
-        double fl = floor(clamped);
-        f0 = (uint32_t)fl;
+        double max_logical = decimated ? (double)(anim->length - 1) : (double)(tr->kf_count - 1u);
+        double clamped = fmin(fmax(frame_pos, 0.0), max_logical);
+        double sample = decimated
+                            ? (clamped * ((double)(tr->kf_count - 1u) / (double)(anim->length - 1)))
+                            : clamped;
+        sample = fmin(fmax(sample, 0.0), (double)(tr->kf_count - 1u));
+        double fl = floor(sample);
+        f0 = (fl >= (double)(tr->kf_count - 1u)) ? (tr->kf_count - 1u) : (uint32_t)fl;
         f1 = (f0 + 1u < tr->kf_count) ? (f0 + 1u) : f0;
-        alpha = (float)(clamped - fl);
+        alpha = (float)fmin(fmax(sample - (double)f0, 0.0), 1.0);
     } else if (anim->mode == WE_ANIM_MIRROR) {
         double span = (double)(anim->length > 1 ? (anim->length - 1) : 1);
         double period = 2.0 * span;
         double wrapped = fmod(frame_pos, period);
+        if (!isfinite(wrapped)) {
+            wrapped = 0.0;
+        }
         if (wrapped < 0.0) {
             wrapped += period;
         }
         if (wrapped > span) {
             wrapped = period - wrapped;
         }
-        double fl = floor(wrapped);
-        f0 = (uint32_t)fl;
-        if (f0 >= tr->kf_count) {
-            f0 = tr->kf_count - 1u;
-        }
+        double sample = decimated ? (wrapped * ((double)(tr->kf_count - 1u) / span)) : wrapped;
+        sample = fmin(fmax(sample, 0.0), (double)(tr->kf_count - 1u));
+        double fl = floor(sample);
+        f0 = (fl >= (double)(tr->kf_count - 1u)) ? (tr->kf_count - 1u) : (uint32_t)fl;
         f1 = (f0 + 1u < tr->kf_count) ? (f0 + 1u) : f0;
-        alpha = (float)(wrapped - fl);
+        alpha = (float)fmin(fmax(sample - (double)f0, 0.0), 1.0);
     } else {
         double cycle = (double)(anim->length > 0 ? anim->length : (int32_t)tr->kf_count);
+        if (cycle < 1.0) {
+            cycle = (double)tr->kf_count;
+        }
         double wrapped = fmod(frame_pos, cycle);
+        if (!isfinite(wrapped)) {
+            wrapped = 0.0;
+        }
         if (wrapped < 0.0) {
             wrapped += cycle;
         }
-        double fl = floor(wrapped);
-        f0 = ((uint32_t)fl) % tr->kf_count;
-        f1 = (f0 + 1u) % tr->kf_count;
-        alpha = (float)(wrapped - fl);
+        if (decimated) {
+            double last_logical = (double)(anim->length - 1);
+            if (wrapped < last_logical) {
+                double sample = wrapped * ((double)(tr->kf_count - 1u) / last_logical);
+                sample = fmin(fmax(sample, 0.0), (double)(tr->kf_count - 1u));
+                double fl = floor(sample);
+                f0 = (fl >= (double)(tr->kf_count - 1u)) ? (tr->kf_count - 1u) : (uint32_t)fl;
+                f1 = (f0 + 1u < tr->kf_count) ? (f0 + 1u) : 0u;
+                alpha = (float)fmin(fmax(sample - (double)f0, 0.0), 1.0);
+            } else {
+                f0 = tr->kf_count - 1u;
+                f1 = 0u;
+                alpha = (float)fmin(fmax(wrapped - last_logical, 0.0), 1.0);
+            }
+        } else {
+            double fl = floor(wrapped);
+            if (!isfinite(fl) || fl < 0.0) {
+                fl = 0.0;
+            }
+            double kf_d = (double)tr->kf_count;
+            double f0_d = fmod(fl, kf_d);
+            if (!isfinite(f0_d) || f0_d < 0.0 || f0_d >= kf_d) {
+                f0_d = 0.0;
+            }
+            f0 = (uint32_t)f0_d;
+            f1 = (f0 + 1u) % tr->kf_count;
+            alpha = (float)fmin(fmax(wrapped - fl, 0.0), 1.0);
+        }
     }
 
     const we_mdl_keyframe_t *k0 = &tr->keyframes[f0];
     const we_mdl_keyframe_t *k1 = &tr->keyframes[f1];
     for (int c = 0; c < 3; c++) {
-        out_pos[c] = k0->pos[c] + alpha * (k1->pos[c] - k0->pos[c]);
-        float da = remainderf(k1->angle[c] - k0->angle[c], WE_RIG_TWO_PI_F);
-        out_angle[c] = k0->angle[c] + alpha * da;
-        out_scale[c] = k0->scale[c] + alpha * (k1->scale[c] - k0->scale[c]);
+        if (isfinite(k0->pos[c]) && isfinite(k1->pos[c])) {
+            out_pos[c] = k0->pos[c] + alpha * (k1->pos[c] - k0->pos[c]);
+        }
+        if (isfinite(k0->angle[c]) && isfinite(k1->angle[c])) {
+            float da = remainderf(k1->angle[c] - k0->angle[c], WE_RIG_TWO_PI_F);
+            out_angle[c] = k0->angle[c] + alpha * da;
+        }
+        if (isfinite(k0->scale[c]) && isfinite(k1->scale[c])) {
+            out_scale[c] = k0->scale[c] + alpha * (k1->scale[c] - k0->scale[c]);
+        }
     }
 }
 
@@ -4780,6 +6911,11 @@ void we_puppet_eval_skin_matrices_ex(const we_puppet_t *puppet, const we_puppet_
     uint32_t topo[WE_MDL_MAX_BONES];
     bool already_topo = true;
     if (!validate_and_topo_sort_skeleton(puppet, topo, &already_topo)) {
+        uint32_t fail_cnt =
+            puppet->bone_count < WE_MDL_MAX_BONES ? puppet->bone_count : WE_MDL_MAX_BONES;
+        for (uint32_t k = 0; k < fail_cnt; k++) {
+            rig_mat4_identity(out_skin_mats[k]);
+        }
         return;
     }
 
@@ -4815,24 +6951,31 @@ void we_puppet_eval_skin_matrices_ex(const we_puppet_t *puppet, const we_puppet_
 
     float anim_local[WE_MDL_MAX_BONES][16];
     uint32_t bcnt = puppet->bone_count;
+    double safe_t = isfinite(time_sec) ? time_sec : 0.0;
 
     for (uint32_t k = 0; k < bcnt; k++) {
         const we_mdl_bone_t *bone = &puppet->bones[k];
         float bpos[3] = {bone->bind_pos[0], bone->bind_pos[1], bone->bind_pos[2]};
         float bang[3] = {bone->bind_angle[0], bone->bind_angle[1], bone->bind_angle[2]};
         float bscl[3] = {bone->bind_scale[0], bone->bind_scale[1], bone->bind_scale[2]};
-        if (!mat4_is_finite(bone->local_trans)) {
-            if (fabsf(bscl[0]) < 1e-6f) {
-                bscl[0] = 1.0f;
+        bool need_decomp = false;
+        for (int c = 0; c < 3; c++) {
+            if (!isfinite(bpos[c]) || !isfinite(bang[c]) || !isfinite(bscl[c])) {
+                need_decomp = true;
+                break;
             }
-            if (fabsf(bscl[1]) < 1e-6f) {
-                bscl[1] = 1.0f;
+        }
+        if (fabsf(bscl[0]) < 1e-6f && fabsf(bscl[1]) < 1e-6f && fabsf(bscl[2]) < 1e-6f) {
+            need_decomp = true;
+        }
+        if (need_decomp) {
+            if (mat4_is_finite(bone->local_trans)) {
+                rig_mat4_decompose_trs(bone->local_trans, bpos, bang, bscl);
+            } else {
+                memset(bpos, 0, sizeof(bpos));
+                memset(bang, 0, sizeof(bang));
+                bscl[0] = bscl[1] = bscl[2] = 1.0f;
             }
-            if (fabsf(bscl[2]) < 1e-6f) {
-                bscl[2] = 1.0f;
-            }
-        } else if (fabsf(bscl[0]) < 1e-6f && fabsf(bscl[1]) < 1e-6f && fabsf(bscl[2]) < 1e-6f) {
-            rig_mat4_decompose_trs(bone->local_trans, bpos, bang, bscl);
         }
 
         float pos[3] = {bpos[0], bpos[1], bpos[2]};
@@ -4859,9 +7002,15 @@ void we_puppet_eval_skin_matrices_ex(const we_puppet_t *puppet, const we_puppet_
                 if (!tr) {
                     continue;
                 }
-                float t_pos[3], t_ang[3], t_scl[3];
+                float t_pos[3] = {bpos[0], bpos[1], bpos[2]};
+                float t_ang[3] = {bang[0], bang[1], bang[2]};
+                float t_scl[3] = {bscl[0], bscl[1], bscl[2]};
                 float rate = isfinite(lay->rate) ? lay->rate : 1.0f;
-                rig_eval_track_at_time(anim, tr, time_sec * (double)rate, t_pos, t_ang, t_scl);
+                double eval_t = safe_t * (double)rate;
+                if (!isfinite(eval_t)) {
+                    eval_t = 0.0;
+                }
+                rig_eval_track_at_time(anim, tr, eval_t, t_pos, t_ang, t_scl);
                 float w = clampf(lay->blend, 0.0f, 1.0f);
 
                 if (mode == WE_ANIM_BLEND_OVERRIDE) {

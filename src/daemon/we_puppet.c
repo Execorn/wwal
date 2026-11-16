@@ -9,6 +9,7 @@
 #include <GLES3/gl31.h>
 #include <ctype.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -62,15 +63,76 @@ static bool has_mdl_magic_at(const uint8_t *buf, size_t size, size_t pos)
     return false;
 }
 
-static bool is_printable_ascii_span(const uint8_t *p, size_t n)
+static bool is_printable_utf8_span(const uint8_t *p, size_t n)
 {
-    for (size_t i = 0; i < n; i++) {
+    size_t i = 0u;
+    while (i < n) {
         uint8_t c = p[i];
-        if (!((c >= 0x20u && c < 0x7Fu) || c == '\t' || c == '\n' || c == '\r')) {
+        if (c < 0x80u) {
+            if (!((c >= 0x20u && c < 0x7Fu) || c == '\t' || c == '\n' || c == '\r')) {
+                return false;
+            }
+            i += 1u;
+            continue;
+        }
+        if (c >= 0xC2u && c <= 0xDFu) {
+            if (i + 1u >= n) {
+                return false;
+            }
+            uint8_t b1 = p[i + 1u];
+            if ((b1 & 0xC0u) != 0x80u || (c == 0xC2u && b1 < 0xA0u)) {
+                return false;
+            }
+            i += 2u;
+        } else if (c >= 0xE0u && c <= 0xEFu) {
+            if (i + 2u >= n) {
+                return false;
+            }
+            uint8_t b1 = p[i + 1u];
+            uint8_t b2 = p[i + 2u];
+            if ((b1 & 0xC0u) != 0x80u || (b2 & 0xC0u) != 0x80u) {
+                return false;
+            }
+            if ((c == 0xE0u && b1 < 0xA0u) || (c == 0xEDu && b1 > 0x9Fu)) {
+                return false;
+            }
+            i += 3u;
+        } else if (c >= 0xF0u && c <= 0xF4u) {
+            if (i + 3u >= n) {
+                return false;
+            }
+            uint8_t b1 = p[i + 1u];
+            uint8_t b2 = p[i + 2u];
+            uint8_t b3 = p[i + 3u];
+            if ((b1 & 0xC0u) != 0x80u || (b2 & 0xC0u) != 0x80u || (b3 & 0xC0u) != 0x80u) {
+                return false;
+            }
+            if ((c == 0xF0u && b1 < 0x90u) || (c == 0xF4u && b1 > 0x8Fu)) {
+                return false;
+            }
+            i += 4u;
+        } else {
             return false;
         }
     }
     return true;
+}
+
+static size_t trim_utf8_truncation(const uint8_t *p, size_t copy_len, size_t total_len)
+{
+    if (copy_len >= total_len || copy_len == 0u) {
+        return copy_len;
+    }
+    /* Avoid splitting a multi-byte UTF-8 codepoint across the output buffer boundary. */
+    if ((p[copy_len] & 0xC0u) == 0x80u) {
+        while (copy_len > 0u && (p[copy_len - 1u] & 0xC0u) == 0x80u) {
+            copy_len--;
+        }
+        if (copy_len > 0u && (p[copy_len - 1u] & 0x80u) != 0u) {
+            copy_len--;
+        }
+    }
+    return copy_len;
 }
 
 /* Reads either a NUL-terminated C-string or a [u32 len][chars] string */
@@ -97,8 +159,9 @@ static bool read_mdl_string_ex(const uint8_t *buf, size_t size, size_t *inout_cu
             bool has_trailing_nul = (buf[c + 4u + ulen - 1u] == '\0');
             size_t span_len = has_trailing_nul ? (size_t)(ulen - 1u) : (size_t)ulen;
             if ((span_len == 0u && ulen == 1u && has_trailing_nul) ||
-                (span_len > 0u && is_printable_ascii_span(buf + c + 4u, span_len))) {
+                (span_len > 0u && is_printable_utf8_span(buf + c + 4u, span_len))) {
                 size_t copy_len = span_len < (out_cap - 1u) ? span_len : (out_cap - 1u);
+                copy_len = trim_utf8_truncation(buf + c + 4u, copy_len, span_len);
                 if (copy_len > 0u) {
                     memcpy(out_str, buf + c + 4u, copy_len);
                 }
@@ -126,7 +189,10 @@ static bool read_mdl_string_ex(const uint8_t *buf, size_t size, size_t *inout_cu
     }
     size_t slen = c - start;
     size_t copy_len = slen < (out_cap - 1u) ? slen : (out_cap - 1u);
-    memcpy(out_str, buf + start, copy_len);
+    copy_len = trim_utf8_truncation(buf + start, copy_len, slen);
+    if (copy_len > 0u) {
+        memcpy(out_str, buf + start, copy_len);
+    }
     out_str[copy_len] = '\0';
     *inout_cur = c + 1u; /* skip trailing '\0' */
     return true;
@@ -535,6 +601,11 @@ static void mat4_decompose_trs(const float m[16], float out_pos[3], float out_an
     /* Preserve odd-axis reflection sign so mirrored 2D puppet limbs do not invert orientation. */
     float det3 = m[0] * (m[5] * m[10] - m[6] * m[9]) - m[4] * (m[1] * m[10] - m[2] * m[9]) +
                  m[8] * (m[1] * m[6] - m[2] * m[5]);
+    if (!isfinite(sx) || !isfinite(sy) || !isfinite(sz) || !isfinite(det3)) {
+        memset(out_angle, 0, 3u * sizeof(float));
+        out_scale[0] = out_scale[1] = out_scale[2] = 1.0f;
+        return;
+    }
     if (det3 < 0.0f) {
         sx = -sx;
     }
@@ -615,8 +686,8 @@ we_puppet_t *we_puppet_parse_cpu(const uint8_t *data, size_t size)
     }
     int32_t mdl_flag = read_i32_le(data + cur);
     cur += 4u;
-    if (mdl_flag == 9) {
-        /* Incomplete stub mesh */
+    if (mdl_flag == 9 || mdl_flag < 0 || mdl_flag > 256) {
+        /* Reject incomplete stub meshes (9) and out-of-range mdl flags. */
         return NULL;
     }
 
@@ -932,7 +1003,26 @@ we_puppet_t *we_puppet_parse_cpu(const uint8_t *data, size_t size)
                 } else {
                     we_mat4_mul(puppet->bones[b->parent].world_bind, b->local_trans, b->world_bind);
                 }
-                we_mat4_inverse(b->world_bind, b->offset_trans);
+                bool wb_finite = true;
+                for (int m = 0; m < 16; m++) {
+                    if (!isfinite(b->world_bind[m])) {
+                        wb_finite = false;
+                        break;
+                    }
+                }
+                if (!wb_finite) {
+                    mat4_identity(b->local_trans);
+                    if (b->parent == 0xFFFFFFFFu) {
+                        mat4_identity(b->world_bind);
+                    } else {
+                        memcpy(b->world_bind, puppet->bones[b->parent].world_bind,
+                               sizeof(b->world_bind));
+                    }
+                    mat4_decompose_trs(b->local_trans, b->bind_pos, b->bind_angle, b->bind_scale);
+                }
+                if (!we_mat4_inverse(b->world_bind, b->offset_trans)) {
+                    mat4_identity(b->offset_trans);
+                }
                 mat4_identity(puppet->skin_mats[i]);
             }
 
@@ -1089,13 +1179,15 @@ we_puppet_t *we_puppet_parse_cpu(const uint8_t *data, size_t size)
                 anim->fps = read_f32_le(data + cur);
                 if (!isfinite(anim->fps) || anim->fps <= 0.0f) {
                     anim->fps = 30.0f;
+                } else if (anim->fps > 1000.0f) {
+                    anim->fps = 1000.0f;
                 }
                 anim->length = read_i32_le(data + cur + 4u);
                 anim->unk2 = read_i32_le(data + cur + 8u);
                 uint32_t b_num = read_u32_le(data + cur + 12u);
                 cur += 16u;
 
-                if (anim->length < 1 || b_num > WE_MDL_MAX_BONES) {
+                if (anim->length < 1 || anim->length > 1000000 || b_num > WE_MDL_MAX_BONES) {
                     we_puppet_destroy(puppet);
                     return NULL;
                 }
@@ -1174,6 +1266,14 @@ we_puppet_t *we_puppet_parse_cpu(const uint8_t *data, size_t size)
                     }
                 }
 
+                for (uint32_t t = 0; t < b_num; t++) {
+                    int32_t bi = anim->tracks[t].bone_index;
+                    if (bi < 0 || (uint32_t)bi >= WE_MDL_MAX_BONES ||
+                        (uint32_t)bi >= puppet->bone_count) {
+                        we_puppet_destroy(puppet);
+                        return NULL;
+                    }
+                }
                 for (uint32_t b = 0; b < WE_MDL_MAX_BONES; b++) {
                     anim->bone_to_track[b] = -1;
                 }
@@ -1203,6 +1303,7 @@ static const we_mdl_anim_t *find_puppet_anim(const we_puppet_t *puppet,
                 return &puppet->anims[i];
             }
         }
+        return NULL;
     }
     for (uint32_t i = 0; i < puppet->anim_count; i++) {
         if (puppet->anims[i].id == layer->anim_id) {
@@ -1219,68 +1320,124 @@ static void eval_track_at_time(const we_mdl_anim_t *anim, const we_mdl_bone_trac
                                double time_sec, float out_pos[3], float out_angle[3],
                                float out_scale[3])
 {
-    if (!tr || tr->kf_count == 0u) {
+    if (!anim || !tr || tr->kf_count == 0u || !tr->keyframes) {
         return;
     }
     if (tr->kf_count == 1u) {
-        memcpy(out_pos, tr->keyframes[0].pos, 3 * sizeof(float));
-        memcpy(out_angle, tr->keyframes[0].angle, 3 * sizeof(float));
-        memcpy(out_scale, tr->keyframes[0].scale, 3 * sizeof(float));
+        const we_mdl_keyframe_t *k0 = &tr->keyframes[0];
+        for (int c = 0; c < 3; c++) {
+            if (isfinite(k0->pos[c])) {
+                out_pos[c] = k0->pos[c];
+            }
+            if (isfinite(k0->angle[c])) {
+                out_angle[c] = k0->angle[c];
+            }
+            if (isfinite(k0->scale[c])) {
+                out_scale[c] = k0->scale[c];
+            }
+        }
         return;
     }
 
-    double fps = (anim->fps > 0.0f) ? (double)anim->fps : 30.0;
-    double frame_time = 1.0 / fps;
-    double max_time = (double)anim->length / fps;
-    (void)max_time;
-
-    double frame_pos = (isfinite(time_sec) ? time_sec : 0.0) / frame_time;
+    double fps = (isfinite(anim->fps) && anim->fps > 0.0f) ? (double)anim->fps : 30.0;
+    if (fps > 1e6) {
+        fps = 1e6;
+    }
+    double t_sec = isfinite(time_sec) ? time_sec : 0.0;
+    double frame_pos = t_sec * fps;
+    if (!isfinite(frame_pos)) {
+        frame_pos = 0.0;
+    }
+    bool decimated =
+        (anim->length > 1 && tr->kf_count > 1u && tr->kf_count < (uint32_t)anim->length);
     uint32_t f0 = 0, f1 = 0;
     float alpha = 0.0f;
 
     if (anim->mode == WE_ANIM_SINGLE) {
-        double max_f = (double)(tr->kf_count - 1u);
-        double clamped = fmin(fmax(frame_pos, 0.0), max_f);
-        double fl = floor(clamped);
-        f0 = (uint32_t)fl;
+        double max_logical = decimated ? (double)(anim->length - 1) : (double)(tr->kf_count - 1u);
+        double clamped = fmin(fmax(frame_pos, 0.0), max_logical);
+        double sample = decimated
+                            ? (clamped * ((double)(tr->kf_count - 1u) / (double)(anim->length - 1)))
+                            : clamped;
+        sample = fmin(fmax(sample, 0.0), (double)(tr->kf_count - 1u));
+        double fl = floor(sample);
+        f0 = (fl >= (double)(tr->kf_count - 1u)) ? (tr->kf_count - 1u) : (uint32_t)fl;
         f1 = (f0 + 1u < tr->kf_count) ? (f0 + 1u) : f0;
-        alpha = (float)(clamped - fl);
+        alpha = (float)fmin(fmax(sample - (double)f0, 0.0), 1.0);
     } else if (anim->mode == WE_ANIM_MIRROR) {
         double span = (double)(anim->length > 1 ? (anim->length - 1) : 1);
         double period = 2.0 * span;
         double wrapped = fmod(frame_pos, period);
+        if (!isfinite(wrapped)) {
+            wrapped = 0.0;
+        }
         if (wrapped < 0.0) {
             wrapped += period;
         }
         if (wrapped > span) {
             wrapped = period - wrapped;
         }
-        double fl = floor(wrapped);
-        f0 = (uint32_t)fl;
-        if (f0 >= tr->kf_count) {
-            f0 = tr->kf_count - 1u;
-        }
+        double sample = decimated ? (wrapped * ((double)(tr->kf_count - 1u) / span)) : wrapped;
+        sample = fmin(fmax(sample, 0.0), (double)(tr->kf_count - 1u));
+        double fl = floor(sample);
+        f0 = (fl >= (double)(tr->kf_count - 1u)) ? (tr->kf_count - 1u) : (uint32_t)fl;
         f1 = (f0 + 1u < tr->kf_count) ? (f0 + 1u) : f0;
-        alpha = (float)(wrapped - fl);
+        alpha = (float)fmin(fmax(sample - (double)f0, 0.0), 1.0);
     } else {
         /* WE_ANIM_LOOP: max_time = length / fps, cycle length = anim->length frames */
         double cycle = (double)(anim->length > 0 ? anim->length : (int32_t)tr->kf_count);
+        if (cycle < 1.0) {
+            cycle = (double)tr->kf_count;
+        }
         double wrapped = fmod(frame_pos, cycle);
+        if (!isfinite(wrapped)) {
+            wrapped = 0.0;
+        }
         if (wrapped < 0.0) {
             wrapped += cycle;
         }
-        double fl = floor(wrapped);
-        f0 = ((uint32_t)fl) % tr->kf_count;
-        f1 = (f0 + 1u) % tr->kf_count;
-        alpha = (float)(wrapped - fl);
+        if (decimated) {
+            double last_logical = (double)(anim->length - 1);
+            if (wrapped < last_logical) {
+                double sample = wrapped * ((double)(tr->kf_count - 1u) / last_logical);
+                sample = fmin(fmax(sample, 0.0), (double)(tr->kf_count - 1u));
+                double fl = floor(sample);
+                f0 = (fl >= (double)(tr->kf_count - 1u)) ? (tr->kf_count - 1u) : (uint32_t)fl;
+                f1 = (f0 + 1u < tr->kf_count) ? (f0 + 1u) : 0u;
+                alpha = (float)fmin(fmax(sample - (double)f0, 0.0), 1.0);
+            } else {
+                f0 = tr->kf_count - 1u;
+                f1 = 0u;
+                alpha = (float)fmin(fmax(wrapped - last_logical, 0.0), 1.0);
+            }
+        } else {
+            double fl = floor(wrapped);
+            if (!isfinite(fl) || fl < 0.0) {
+                fl = 0.0;
+            }
+            double kf_d = (double)tr->kf_count;
+            double f0_d = fmod(fl, kf_d);
+            if (!isfinite(f0_d) || f0_d < 0.0 || f0_d >= kf_d) {
+                f0_d = 0.0;
+            }
+            f0 = (uint32_t)f0_d;
+            f1 = (f0 + 1u) % tr->kf_count;
+            alpha = (float)fmin(fmax(wrapped - fl, 0.0), 1.0);
+        }
     }
 
     const we_mdl_keyframe_t *k0 = &tr->keyframes[f0];
     const we_mdl_keyframe_t *k1 = &tr->keyframes[f1];
     for (int i = 0; i < 3; i++) {
-        out_pos[i] = k0->pos[i] + alpha * (k1->pos[i] - k0->pos[i]);
-        out_angle[i] = k0->angle[i] + alpha * (k1->angle[i] - k0->angle[i]);
-        out_scale[i] = k0->scale[i] + alpha * (k1->scale[i] - k0->scale[i]);
+        if (isfinite(k0->pos[i]) && isfinite(k1->pos[i])) {
+            out_pos[i] = k0->pos[i] + alpha * (k1->pos[i] - k0->pos[i]);
+        }
+        if (isfinite(k0->angle[i]) && isfinite(k1->angle[i])) {
+            out_angle[i] = k0->angle[i] + alpha * (k1->angle[i] - k0->angle[i]);
+        }
+        if (isfinite(k0->scale[i]) && isfinite(k1->scale[i])) {
+            out_scale[i] = k0->scale[i] + alpha * (k1->scale[i] - k0->scale[i]);
+        }
     }
 }
 
@@ -1324,12 +1481,42 @@ void we_puppet_eval_skin_matrices(const we_puppet_t *puppet, const we_puppet_lay
 
     float anim_local[WE_MDL_MAX_BONES][16];
     uint32_t bcnt = puppet->bone_count < WE_MDL_MAX_BONES ? puppet->bone_count : WE_MDL_MAX_BONES;
+    double safe_t = isfinite(time_sec) ? time_sec : 0.0;
 
     for (uint32_t k = 0; k < bcnt; k++) {
         const we_mdl_bone_t *bone = &puppet->bones[k];
-        float pos[3] = {bone->bind_pos[0], bone->bind_pos[1], bone->bind_pos[2]};
-        float angle[3] = {bone->bind_angle[0], bone->bind_angle[1], bone->bind_angle[2]};
-        float scale[3] = {bone->bind_scale[0], bone->bind_scale[1], bone->bind_scale[2]};
+        float bpos[3] = {bone->bind_pos[0], bone->bind_pos[1], bone->bind_pos[2]};
+        float bang[3] = {bone->bind_angle[0], bone->bind_angle[1], bone->bind_angle[2]};
+        float bscl[3] = {bone->bind_scale[0], bone->bind_scale[1], bone->bind_scale[2]};
+        bool need_decomp = false;
+        for (int c = 0; c < 3; c++) {
+            if (!isfinite(bpos[c]) || !isfinite(bang[c]) || !isfinite(bscl[c])) {
+                need_decomp = true;
+                break;
+            }
+        }
+        if (fabsf(bscl[0]) < 1e-6f && fabsf(bscl[1]) < 1e-6f && fabsf(bscl[2]) < 1e-6f) {
+            need_decomp = true;
+        }
+        if (need_decomp) {
+            bool local_ok = true;
+            for (int m = 0; m < 16; m++) {
+                if (!isfinite(bone->local_trans[m])) {
+                    local_ok = false;
+                    break;
+                }
+            }
+            if (local_ok) {
+                mat4_decompose_trs(bone->local_trans, bpos, bang, bscl);
+            } else {
+                memset(bpos, 0, sizeof(bpos));
+                memset(bang, 0, sizeof(bang));
+                bscl[0] = bscl[1] = bscl[2] = 1.0f;
+            }
+        }
+        float pos[3] = {bpos[0], bpos[1], bpos[2]};
+        float angle[3] = {bang[0], bang[1], bang[2]};
+        float scale[3] = {bscl[0], bscl[1], bscl[2]};
         bool animated = false;
 
         for (uint32_t l = 0; l < active_count; l++) {
@@ -1356,10 +1543,17 @@ void we_puppet_eval_skin_matrices(const we_puppet_t *puppet, const we_puppet_lay
                 }
             }
             if (tr) {
-                float t_pos[3], t_ang[3], t_scl[3];
+                float t_pos[3] = {bpos[0], bpos[1], bpos[2]};
+                float t_ang[3] = {bang[0], bang[1], bang[2]};
+                float t_scl[3] = {bscl[0], bscl[1], bscl[2]};
                 float rate = isfinite(lay->rate) ? lay->rate : 1.0f;
-                eval_track_at_time(anim, tr, time_sec * (double)rate, t_pos, t_ang, t_scl);
-                float w = fminf(fmaxf(lay->blend, 0.0f), 1.0f);
+                double eval_t = safe_t * (double)rate;
+                if (!isfinite(eval_t)) {
+                    eval_t = 0.0;
+                }
+                eval_track_at_time(anim, tr, eval_t, t_pos, t_ang, t_scl);
+                float raw_w = isfinite(lay->blend) ? lay->blend : 0.0f;
+                float w = fminf(fmaxf(raw_w, 0.0f), 1.0f);
                 for (int c = 0; c < 3; c++) {
                     pos[c] = pos[c] + w * (t_pos[c] - pos[c]);
                     if (w >= 0.9999f) {
@@ -1516,16 +1710,129 @@ typedef struct {
     float weight[4];
 } we_gpu_skin_attrib_t;
 
+typedef struct {
+    void *owner_ctx;
+    void *owner_dpy;
+    uint32_t vao;
+    uint32_t vbo_dyn;
+    uint32_t vbo_skin;
+    uint32_t ebo;
+    bool used;
+} we_puppet_gl_trash_entry_t;
+
+#define WE_PUPPET_GL_TRASH_CAP 64u
+static pthread_mutex_t g_deferred_gl_mtx = PTHREAD_MUTEX_INITIALIZER;
+static we_puppet_gl_trash_entry_t g_deferred_gl_trash[WE_PUPPET_GL_TRASH_CAP];
+static uint32_t g_deferred_gl_next_evict = 0u;
+
+static void we_puppet_delete_gl_ids(uint32_t vao, uint32_t vbo_dyn, uint32_t vbo_skin, uint32_t ebo)
+{
+    if (ebo != 0u) {
+        GLuint b = ebo;
+        glDeleteBuffers(1, &b);
+    }
+    if (vbo_skin != 0u) {
+        GLuint b = vbo_skin;
+        glDeleteBuffers(1, &b);
+    }
+    if (vbo_dyn != 0u) {
+        GLuint b = vbo_dyn;
+        glDeleteBuffers(1, &b);
+    }
+    if (vao != 0u) {
+        GLuint v = vao;
+        glDeleteVertexArrays(1, &v);
+    }
+}
+
+static void we_puppet_flush_deferred_gl(EGLContext cur_ctx, EGLDisplay cur_dpy)
+{
+    if (cur_ctx == EGL_NO_CONTEXT) {
+        return;
+    }
+    we_puppet_gl_trash_entry_t pending[WE_PUPPET_GL_TRASH_CAP];
+    uint32_t count = 0u;
+
+    pthread_mutex_lock(&g_deferred_gl_mtx);
+    for (uint32_t i = 0u; i < WE_PUPPET_GL_TRASH_CAP; i++) {
+        we_puppet_gl_trash_entry_t *e = &g_deferred_gl_trash[i];
+        if (!e->used || e->owner_ctx != (void *)cur_ctx) {
+            continue;
+        }
+        if (e->owner_dpy != NULL && e->owner_dpy != (void *)cur_dpy) {
+            continue;
+        }
+        pending[count++] = *e;
+        memset(e, 0, sizeof(*e));
+    }
+    pthread_mutex_unlock(&g_deferred_gl_mtx);
+
+    for (uint32_t i = 0u; i < count; i++) {
+        we_puppet_delete_gl_ids(pending[i].vao, pending[i].vbo_dyn, pending[i].vbo_skin,
+                                pending[i].ebo);
+    }
+}
+
+static void we_puppet_enqueue_deferred_gl(we_puppet_t *puppet)
+{
+    if (!puppet || !puppet->gl_owner_ctx) {
+        return;
+    }
+    if (puppet->gl_vao == 0u && puppet->gl_vbo_dyn == 0u && puppet->gl_vbo_skin == 0u &&
+        puppet->gl_ebo == 0u) {
+        return;
+    }
+    pthread_mutex_lock(&g_deferred_gl_mtx);
+    uint32_t slot = WE_PUPPET_GL_TRASH_CAP;
+    for (uint32_t i = 0u; i < WE_PUPPET_GL_TRASH_CAP; i++) {
+        if (!g_deferred_gl_trash[i].used) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == WE_PUPPET_GL_TRASH_CAP) {
+        slot = g_deferred_gl_next_evict % WE_PUPPET_GL_TRASH_CAP;
+        g_deferred_gl_next_evict = (slot + 1u) % WE_PUPPET_GL_TRASH_CAP;
+    }
+    g_deferred_gl_trash[slot] = (we_puppet_gl_trash_entry_t){
+        .owner_ctx = puppet->gl_owner_ctx,
+        .owner_dpy = puppet->gl_owner_dpy,
+        .vao = puppet->gl_vao,
+        .vbo_dyn = puppet->gl_vbo_dyn,
+        .vbo_skin = puppet->gl_vbo_skin,
+        .ebo = puppet->gl_ebo,
+        .used = true,
+    };
+    pthread_mutex_unlock(&g_deferred_gl_mtx);
+}
+
 bool we_puppet_upload_gl(we_puppet_t *puppet)
 {
     if (!puppet || puppet->vertex_count == 0u || puppet->index_count == 0u) {
         return false;
     }
-    if (puppet->gl_uploaded) {
-        return true;
-    }
-    if (eglGetCurrentContext() == EGL_NO_CONTEXT) {
+    EGLContext cur_ctx = eglGetCurrentContext();
+    if (cur_ctx == EGL_NO_CONTEXT) {
         return false;
+    }
+    EGLDisplay cur_dpy = eglGetCurrentDisplay();
+    we_puppet_flush_deferred_gl(cur_ctx, cur_dpy);
+
+    if (puppet->gl_uploaded) {
+        if (puppet->gl_owner_ctx == (void *)cur_ctx &&
+            (puppet->gl_owner_dpy == NULL || puppet->gl_owner_dpy == (void *)cur_dpy)) {
+            return true;
+        }
+        /* Re-upload on a new context without deleting handles belonging to the old context. */
+        we_puppet_enqueue_deferred_gl(puppet);
+        puppet->gl_vao = 0u;
+        puppet->gl_vbo_dyn = 0u;
+        puppet->gl_vbo_skin = 0u;
+        puppet->gl_ebo = 0u;
+        puppet->gl_uploaded = false;
+        puppet->cached_gl_prog = 0u;
+        puppet->gl_owner_ctx = NULL;
+        puppet->gl_owner_dpy = NULL;
     }
 
     GLuint vao = 0, vbo_dyn = 0, vbo_skin = 0, ebo = 0;
@@ -1590,6 +1897,8 @@ bool we_puppet_upload_gl(we_puppet_t *puppet)
     puppet->gl_ebo = ebo;
     puppet->gl_uploaded = true;
     puppet->vbo_has_bind_pose = true;
+    puppet->gl_owner_ctx = (void *)cur_ctx;
+    puppet->gl_owner_dpy = (void *)cur_dpy;
     return true;
 }
 
@@ -1598,7 +1907,14 @@ void we_puppet_draw_gl(we_puppet_t *puppet, uint32_t gl_prog, double time_sec)
     if (!puppet || puppet->vertex_count == 0u || puppet->index_count == 0u) {
         return;
     }
-    if (!puppet->gl_uploaded && !we_puppet_upload_gl(puppet)) {
+    EGLContext cur_ctx = eglGetCurrentContext();
+    if (cur_ctx == EGL_NO_CONTEXT) {
+        return;
+    }
+    EGLDisplay cur_dpy = eglGetCurrentDisplay();
+    bool need_upload = !puppet->gl_uploaded || puppet->gl_owner_ctx != (void *)cur_ctx ||
+                       (puppet->gl_owner_dpy != NULL && puppet->gl_owner_dpy != (void *)cur_dpy);
+    if (need_upload && !we_puppet_upload_gl(puppet)) {
         return;
     }
 
@@ -1774,23 +2090,24 @@ void we_puppet_destroy(we_puppet_t *puppet)
     if (!puppet) {
         return;
     }
-    if (puppet->gl_uploaded && eglGetCurrentContext() != EGL_NO_CONTEXT) {
-        if (puppet->gl_ebo) {
-            GLuint b = puppet->gl_ebo;
-            glDeleteBuffers(1, &b);
+    if (puppet->gl_uploaded) {
+        EGLContext cur_ctx = eglGetCurrentContext();
+        EGLDisplay cur_dpy = eglGetCurrentDisplay();
+        if (cur_ctx != EGL_NO_CONTEXT && puppet->gl_owner_ctx == (void *)cur_ctx &&
+            (puppet->gl_owner_dpy == NULL || puppet->gl_owner_dpy == (void *)cur_dpy)) {
+            we_puppet_delete_gl_ids(puppet->gl_vao, puppet->gl_vbo_dyn, puppet->gl_vbo_skin,
+                                    puppet->gl_ebo);
+            we_puppet_flush_deferred_gl(cur_ctx, cur_dpy);
+        } else {
+            we_puppet_enqueue_deferred_gl(puppet);
         }
-        if (puppet->gl_vbo_skin) {
-            GLuint b = puppet->gl_vbo_skin;
-            glDeleteBuffers(1, &b);
-        }
-        if (puppet->gl_vbo_dyn) {
-            GLuint b = puppet->gl_vbo_dyn;
-            glDeleteBuffers(1, &b);
-        }
-        if (puppet->gl_vao) {
-            GLuint v = puppet->gl_vao;
-            glDeleteVertexArrays(1, &v);
-        }
+        puppet->gl_vao = 0u;
+        puppet->gl_vbo_dyn = 0u;
+        puppet->gl_vbo_skin = 0u;
+        puppet->gl_ebo = 0u;
+        puppet->gl_uploaded = false;
+        puppet->gl_owner_ctx = NULL;
+        puppet->gl_owner_dpy = NULL;
     }
     if (puppet->anims) {
         for (uint32_t a = 0; a < puppet->anim_count; a++) {

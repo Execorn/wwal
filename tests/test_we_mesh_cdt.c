@@ -679,6 +679,102 @@ static void test_high_res_and_strict_perf(void)
     free(alpha4);
 }
 
+static void test_aud024_aud110_aud109_aud423_regressions(void)
+{
+    printf("[+] Testing AUD-024 grid clamp, AUD-110 incircle, AUD-109 Sloan fan & AUD-423 "
+           "budget...\n");
+    we_mesh_gen_cfg_t cfg;
+    we_mesh_gen_cfg_default(&cfg);
+    cfg.min_angle_deg = 25.0f;
+    we_mesh_gen_result_t res;
+
+    /* AUD-024: extreme near-degenerate aspect & huge 1e9/tiny 1e-4 coordinates for RDP & Bridson
+     * grid cell clamping without heap OOB. */
+    we_cdt_vec2_t huge_strip[6] = {
+        {1e9, 1e9},
+        {1e9 + 1e4, 1e9},
+        {1e9 + 1e4, 1e9 + 0.05},
+        {1e9 + 5e3, 1e9 + 0.1},
+        {1e9 + 1.0, 1e9 + 0.05},
+        {1e9, 1e9 + 0.02},
+    };
+    we_cdt_loop_t huge_loop = {.points = huge_strip, .point_count = 6u, .is_hole = false};
+    we_mesh_gen_cfg_t strip_cfg = cfg;
+    strip_cfg.simplify_eps_px = 0.01f;
+    strip_cfg.interior_spacing = 4.0f;
+    strip_cfg.max_vertices = 512u;
+    if (we_mesh_gen_from_loops(&huge_loop, 1u, 1024u, 1024u, &strip_cfg, NULL, 0u, &res)) {
+        assert(res.vertex_count >= 3u && res.vertex_count <= 512u);
+        we_mesh_gen_result_free(&res);
+    }
+
+    /* AUD-110: axis-aligned cocircular perturbation stressing incircle_adapt dx==0/dy==0 tails */
+    we_cdt_vec2_t axis_box[8] = {
+        {100.0, 100.0}, {200.0, 100.0}, {300.0, 100.0}, {300.0, 200.0},
+        {300.0, 300.0}, {200.0, 300.0}, {100.0, 300.0}, {100.0, 200.0 + 1e-11},
+    };
+    we_cdt_loop_t axis_loop = {.points = axis_box, .point_count = 8u, .is_hole = false};
+    we_mesh_gen_cfg_t axis_cfg = cfg;
+    axis_cfg.interior_spacing = 50.0f;
+    assert(we_mesh_gen_from_loops(&axis_loop, 1u, 512u, 512u, &axis_cfg, NULL, 0u, &res));
+    assert_valid_mesh(&res, 512u, 512u, axis_cfg.max_vertices, 1, true);
+    we_mesh_gen_result_free(&res);
+
+    /* AUD-109 + PERF-022: collinear point lying past segment end (dot > |ab|^2) & 800-seg Sloan */
+    we_cdt_vec2_t needle_collinear[5] = {
+        {100.0, 100.0}, {200.0, 100.0},
+        {350.0, 100.0}, /* strictly beyond (200,100) along same Y axis */
+        {250.0, 220.0}, {100.0, 220.0},
+    };
+    we_cdt_loop_t needle_loop = {.points = needle_collinear, .point_count = 5u, .is_hole = false};
+    we_mesh_gen_cfg_t needle_cfg = cfg;
+    needle_cfg.simplify_eps_px = 0.01f;
+    needle_cfg.interior_spacing = 60.0f;
+    assert(we_mesh_gen_from_loops(&needle_loop, 1u, 512u, 512u, &needle_cfg, NULL, 0u, &res));
+    assert_valid_mesh(&res, 512u, 512u, needle_cfg.max_vertices, 1, true);
+    we_mesh_gen_result_free(&res);
+
+    const uint32_t N_STAR = 800u;
+    we_cdt_vec2_t *star_pts = malloc(N_STAR * sizeof(we_cdt_vec2_t));
+    assert(star_pts != NULL);
+    for (uint32_t k = 0u; k < N_STAR; k++) {
+        double a = (double)k * (2.0 * M_PI / (double)N_STAR);
+        double r = (k % 2u == 0u) ? 420.0 : 280.0;
+        star_pts[k] = (we_cdt_vec2_t){512.0 + r * cos(a), 512.0 + r * sin(a)};
+    }
+    we_cdt_loop_t star_loop = {.points = star_pts, .point_count = N_STAR, .is_hole = false};
+    we_mesh_gen_cfg_t star_cfg = cfg;
+    star_cfg.simplify_eps_px = 0.01f;
+    star_cfg.interior_spacing = 48.0f;
+    star_cfg.max_vertices = 4096u;
+    assert(we_mesh_gen_from_loops(&star_loop, 1u, 1024u, 1024u, &star_cfg, NULL, 0u, &res));
+    assert_valid_mesh(&res, 1024u, 1024u, 4096u, 1, true);
+    we_mesh_gen_result_free(&res);
+    free(star_pts);
+
+    /* PERF-003 + AUD-423: fine spacing reaches requested budget (>7500 of 10000) without 40% stall
+     * and accepts WE_MDL_MAX_VERTICES (65536u) ceiling cleanly. */
+    we_cdt_vec2_t dense_box[4] = {{64.0, 64.0}, {960.0, 64.0}, {960.0, 960.0}, {64.0, 960.0}};
+    we_cdt_loop_t dense_loop = {.points = dense_box, .point_count = 4u, .is_hole = false};
+    we_mesh_gen_cfg_t dense_cfg = cfg;
+    dense_cfg.interior_spacing = 5.0f;
+    dense_cfg.max_vertices = 10000u;
+    dense_cfg.min_angle_deg = 25.0f;
+    assert(we_mesh_gen_from_loops(&dense_loop, 1u, 1024u, 1024u, &dense_cfg, NULL, 0u, &res));
+    assert_valid_mesh(&res, 1024u, 1024u, 10000u, 1, true);
+    printf("[BENCH] dense CDT vertex budget fill: %u / 10000 verts (%u tris)\n", res.vertex_count,
+           res.triangle_count);
+    assert(res.vertex_count > 7500u);
+    we_mesh_gen_result_free(&res);
+
+    dense_cfg.max_vertices = WE_MDL_MAX_VERTICES;
+    dense_cfg.interior_spacing = 4.0f;
+    assert(we_mesh_gen_from_loops(&dense_loop, 1u, 1024u, 1024u, &dense_cfg, NULL, 0u, &res));
+    assert_valid_mesh(&res, 1024u, 1024u, WE_MDL_MAX_VERTICES, 1, true);
+    assert(res.vertex_count > 10000u);
+    we_mesh_gen_result_free(&res);
+}
+
 int main(void)
 {
     test_config_and_validation();
@@ -691,6 +787,7 @@ int main(void)
     test_adversarial_fuzz_inputs();
     test_pin_edge_cases_and_budget_clamping();
     test_high_res_and_strict_perf();
+    test_aud024_aud110_aud109_aud423_regressions();
     printf("[PASS] All we_mesh_cdt tests passed.\n");
     return 0;
 }

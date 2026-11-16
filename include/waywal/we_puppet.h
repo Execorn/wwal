@@ -135,6 +135,8 @@ typedef struct we_puppet {
     int32_t cached_loc_bones;
     uint32_t cached_bone_utype;
     uint32_t cached_blend_idx_atype;
+    void *gl_owner_ctx;
+    void *gl_owner_dpy;
     /* Live rigging / timeline preview state synchronized from daemon slots */
     void *rig_ctx; /* Optional heap-allocated we_rig_pose_ctx_t owned by we_puppet_t */
     uint8_t heatmap_mode;

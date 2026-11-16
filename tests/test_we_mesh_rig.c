@@ -185,6 +185,507 @@ static float get_bone_weight(const we_mdl_vertex_t *v, uint32_t bone)
     return w;
 }
 
+#define RIG_HARD_CHECK(cond, fmt, ...)                                                             \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            fprintf(stderr, "RIG_HARD_CHECK failed at %s:%d: " fmt "\n", __FILE__,                 \
+                    __LINE__, ##__VA_ARGS__);                                                      \
+            abort();                                                                               \
+        }                                                                                          \
+    } while (0)
+
+typedef struct {
+    double ax, ay, bx, by;
+    bool is_point;
+} ref_seg_t;
+
+typedef struct {
+    uint32_t v;
+    double w;
+} ref_adj_t;
+
+/* Independent natural-order scalar float64 cotangent + LDL^T reference for VD-05 accuracy check */
+static void ref_compute_9991_weights(const we_puppet_t *p, float (*out_top4_w)[4],
+                                     uint32_t (*out_top4_b)[4])
+{
+    uint32_t V = p->vertex_count;
+    uint32_t T = p->triangle_count;
+    uint32_t B = p->bone_count;
+
+    double *mass = calloc(V, sizeof(double));
+    double *H_diag = calloc(V, sizeof(double));
+    double *P_rhs = calloc((size_t)V * B, sizeof(double));
+    uint32_t *closest_b = calloc(V, sizeof(uint32_t));
+    uint32_t *row_cnt = calloc((size_t)V + 1u, sizeof(uint32_t));
+    uint32_t *row_cur = calloc((size_t)V + 1u, sizeof(uint32_t));
+    ref_adj_t *entries = malloc((size_t)T * 6u * sizeof(ref_adj_t));
+    double *tri_w = malloc((size_t)T * 3u * sizeof(double));
+    uint8_t *tri_ok = calloc(T, sizeof(uint8_t));
+    assert(mass && H_diag && P_rhs && closest_b && row_cnt && row_cur && entries && tri_w &&
+           tri_ok);
+
+    double total_area = 0.0;
+    uint32_t valid_tris = 0u;
+    double min_x = 1e30, min_y = 1e30, max_x = -1e30, max_y = -1e30;
+    for (uint32_t i = 0; i < V; i++) {
+        double x = (double)p->vertices[i].pos[0];
+        double y = (double)p->vertices[i].pos[1];
+        if (x < min_x)
+            min_x = x;
+        if (x > max_x)
+            max_x = x;
+        if (y < min_y)
+            min_y = y;
+        if (y > max_y)
+            max_y = y;
+    }
+
+    for (uint32_t t = 0; t < T; t++) {
+        uint32_t i0 = p->indices[t * 3u + 0u];
+        uint32_t i1 = p->indices[t * 3u + 1u];
+        uint32_t i2 = p->indices[t * 3u + 2u];
+        double e01x = (double)p->vertices[i1].pos[0] - (double)p->vertices[i0].pos[0];
+        double e01y = (double)p->vertices[i1].pos[1] - (double)p->vertices[i0].pos[1];
+        double e12x = (double)p->vertices[i2].pos[0] - (double)p->vertices[i1].pos[0];
+        double e12y = (double)p->vertices[i2].pos[1] - (double)p->vertices[i1].pos[1];
+        double e20x = (double)p->vertices[i0].pos[0] - (double)p->vertices[i2].pos[0];
+        double e20y = (double)p->vertices[i0].pos[1] - (double)p->vertices[i2].pos[1];
+        double l01_2 = e01x * e01x + e01y * e01y;
+        double l12_2 = e12x * e12x + e12y * e12y;
+        double l20_2 = e20x * e20x + e20y * e20y;
+        double area = 0.5 * fabs(e01x * (-e20y) - e01y * (-e20x));
+        if (area <= 1e-16) {
+            continue;
+        }
+        total_area += area;
+        valid_tris++;
+        double d0 = l01_2 + l20_2 - l12_2;
+        double d1 = l01_2 + l12_2 - l20_2;
+        double d2 = l12_2 + l20_2 - l01_2;
+        if (d0 < 0.0) {
+            mass[i0] += 0.5 * area;
+            mass[i1] += 0.25 * area;
+            mass[i2] += 0.25 * area;
+        } else if (d1 < 0.0) {
+            mass[i1] += 0.5 * area;
+            mass[i0] += 0.25 * area;
+            mass[i2] += 0.25 * area;
+        } else if (d2 < 0.0) {
+            mass[i2] += 0.5 * area;
+            mass[i0] += 0.25 * area;
+            mass[i1] += 0.25 * area;
+        } else {
+            double c0 = d0 / (4.0 * area);
+            double c1 = d1 / (4.0 * area);
+            double c2 = d2 / (4.0 * area);
+            mass[i0] += 0.125 * (l20_2 * c1 + l01_2 * c2);
+            mass[i1] += 0.125 * (l01_2 * c2 + l12_2 * c0);
+            mass[i2] += 0.125 * (l12_2 * c0 + l20_2 * c1);
+        }
+        double four_A = 4.0 * area;
+        tri_w[t * 3u + 0u] = 0.5 * (l20_2 + l12_2 - l01_2) / four_A;
+        tri_w[t * 3u + 1u] = 0.5 * (l01_2 + l20_2 - l12_2) / four_A;
+        tri_w[t * 3u + 2u] = 0.5 * (l12_2 + l01_2 - l20_2) / four_A;
+        tri_ok[t] = 1u;
+        row_cnt[i0] += 2u;
+        row_cnt[i1] += 2u;
+        row_cnt[i2] += 2u;
+    }
+
+    double mean_area = (valid_tris > 0u) ? (total_area / (double)valid_tris) : 1.0;
+    double floor_mass = fmax(1e-8 * mean_area, 1e-12);
+    double mean_mass = 0.0;
+    for (uint32_t i = 0; i < V; i++) {
+        if (mass[i] < floor_mass) {
+            mass[i] = floor_mass;
+        }
+        mean_mass += mass[i];
+    }
+    mean_mass = fmax(mean_mass / (double)V, 1e-12);
+
+    uint32_t total_raw = 0u;
+    for (uint32_t u = 0; u < V; u++) {
+        row_cur[u] = total_raw;
+        total_raw += row_cnt[u];
+    }
+    for (uint32_t t = 0; t < T; t++) {
+        if (!tri_ok[t])
+            continue;
+        uint32_t v0 = p->indices[t * 3u + 0u];
+        uint32_t v1 = p->indices[t * 3u + 1u];
+        uint32_t v2 = p->indices[t * 3u + 2u];
+        double w01 = tri_w[t * 3u + 0u], w12 = tri_w[t * 3u + 1u], w20 = tri_w[t * 3u + 2u];
+        entries[row_cur[v0]++] = (ref_adj_t){v1, w01};
+        entries[row_cur[v1]++] = (ref_adj_t){v0, w01};
+        entries[row_cur[v1]++] = (ref_adj_t){v2, w12};
+        entries[row_cur[v2]++] = (ref_adj_t){v1, w12};
+        entries[row_cur[v2]++] = (ref_adj_t){v0, w20};
+        entries[row_cur[v0]++] = (ref_adj_t){v2, w20};
+    }
+
+    uint32_t *L_rp = calloc((size_t)V + 1u, sizeof(uint32_t));
+    uint32_t *Ap = calloc((size_t)V + 1u, sizeof(uint32_t));
+    double *diag_A = malloc(V * sizeof(double));
+    assert(L_rp && Ap && diag_A);
+
+    uint32_t uniq = 0u, rs = 0u;
+    for (uint32_t u = 0; u < V; u++) {
+        uint32_t re = rs + row_cnt[u];
+        for (uint32_t i = rs + 1u; i < re; i++) {
+            ref_adj_t key = entries[i];
+            uint32_t j = i;
+            while (j > rs && entries[j - 1u].v > key.v) {
+                entries[j] = entries[j - 1u];
+                j--;
+            }
+            entries[j] = key;
+        }
+        uint32_t uo = uniq;
+        double d_sum = 0.0;
+        for (uint32_t i = rs; i < re;) {
+            uint32_t nbr = entries[i].v;
+            double sw = 0.0;
+            while (i < re && entries[i].v == nbr) {
+                sw += entries[i].w;
+                i++;
+            }
+            sw = fmax(0.0, sw);
+            if (sw > 0.0) {
+                entries[uniq++] = (ref_adj_t){nbr, sw};
+                d_sum += sw;
+                if (u < nbr)
+                    Ap[nbr + 1u]++;
+            }
+        }
+        row_cur[u] = uniq - uo;
+        L_rp[u + 1u] = L_rp[u] + row_cur[u];
+        diag_A[u] = d_sum;
+        rs = re;
+    }
+
+    ref_seg_t segs[WE_MDL_MAX_BONES];
+    float world[WE_MDL_MAX_BONES][16];
+    for (uint32_t b = 0; b < B; b++) {
+        if (p->bones[b].parent == 0xFFFFFFFFu) {
+            memcpy(world[b], p->bones[b].local_trans, sizeof(world[b]));
+        } else {
+            we_mat4_mul(world[p->bones[b].parent], p->bones[b].local_trans, world[b]);
+        }
+    }
+    double diag_mesh = fmax(hypot(max_x - min_x, max_y - min_y), 1e-6);
+    for (uint32_t b = 0; b < B; b++) {
+        segs[b].ax = world[b][12];
+        segs[b].ay = world[b][13];
+        double sx = 0.0, sy = 0.0;
+        uint32_t cc = 0u;
+        for (uint32_t c = 0; c < B; c++) {
+            if (c != b && p->bones[c].parent == b) {
+                sx += world[c][12];
+                sy += world[c][13];
+                cc++;
+            }
+        }
+        if (cc > 0u) {
+            segs[b].bx = sx / cc;
+            segs[b].by = sy / cc;
+            segs[b].is_point = ((segs[b].bx - segs[b].ax) * (segs[b].bx - segs[b].ax) +
+                                (segs[b].by - segs[b].ay) * (segs[b].by - segs[b].ay)) <= 1e-12;
+        } else if (p->bones[b].parent != 0xFFFFFFFFu && p->bones[b].parent < B) {
+            uint32_t pb = p->bones[b].parent;
+            double dx = segs[b].ax - world[pb][12];
+            double dy = segs[b].ay - world[pb][13];
+            double plen = hypot(dx, dy);
+            double max_ext = 0.0;
+            if (plen > 1e-4) {
+                double ux = dx / plen, uy = dy / plen;
+                for (uint32_t v = 0; v < V; v++) {
+                    double proj = ((double)p->vertices[v].pos[0] - segs[b].ax) * ux +
+                                  ((double)p->vertices[v].pos[1] - segs[b].ay) * uy;
+                    if (proj > max_ext)
+                        max_ext = proj;
+                }
+                double ext = fmin(plen, fmin(max_ext, diag_mesh));
+                if (ext > 1e-3 * plen) {
+                    segs[b].bx = segs[b].ax + ux * ext;
+                    segs[b].by = segs[b].ay + uy * ext;
+                    segs[b].is_point = false;
+                } else {
+                    segs[b].bx = segs[b].ax;
+                    segs[b].by = segs[b].ay;
+                    segs[b].is_point = true;
+                }
+            } else {
+                segs[b].bx = segs[b].ax;
+                segs[b].by = segs[b].ay;
+                segs[b].is_point = true;
+            }
+        } else {
+            segs[b].bx = segs[b].ax;
+            segs[b].by = segs[b].ay;
+            segs[b].is_point = true;
+        }
+    }
+
+    double reg_p = pow((double)WE_RIG_HEAT_DEFAULT_REG, 2.0);
+    double tr_LH = 0.0, tr_M = 0.0;
+    for (uint32_t i = 0; i < V; i++) {
+        double vx = p->vertices[i].pos[0], vy = p->vertices[i].pos[1];
+        double dmin = 1e30;
+        double dists[WE_MDL_MAX_BONES];
+        for (uint32_t b = 0; b < B; b++) {
+            double d;
+            if (segs[b].is_point) {
+                d = hypot(vx - segs[b].ax, vy - segs[b].ay);
+            } else {
+                double abx = segs[b].bx - segs[b].ax, aby = segs[b].by - segs[b].ay;
+                double l2 = abx * abx + aby * aby;
+                double tt =
+                    l2 > 1e-18 ? ((vx - segs[b].ax) * abx + (vy - segs[b].ay) * aby) / l2 : 0.0;
+                if (tt < 0.0)
+                    tt = 0.0;
+                if (tt > 1.0)
+                    tt = 1.0;
+                d = hypot(vx - (segs[b].ax + tt * abx), vy - (segs[b].ay + tt * aby));
+            }
+            dists[b] = d;
+            if (d < dmin) {
+                dmin = d;
+                closest_b[i] = b;
+            }
+        }
+        double tol = (1.0 + 1e-3) * dmin + 1e-4 * diag_mesh;
+        uint32_t ncnt = 0u;
+        for (uint32_t b = 0; b < B; b++) {
+            if (dists[b] <= tol)
+                ncnt++;
+        }
+        double dn = dmin / diag_mesh;
+        H_diag[i] = (mass[i] / mean_mass) / (dn * dn + reg_p);
+        double inv_n = 1.0 / (double)ncnt;
+        for (uint32_t b = 0; b < B; b++) {
+            if (dists[b] <= tol)
+                P_rhs[(size_t)i * B + b] = inv_n;
+        }
+        tr_LH += diag_A[i] + H_diag[i];
+        tr_M += mass[i];
+    }
+    double eps = 1e-8 * tr_LH / fmax(tr_M, 1e-12);
+    for (uint32_t i = 0; i < V; i++) {
+        diag_A[i] += H_diag[i] + eps * mass[i];
+        Ap[i + 1u]++; /* diag */
+        Ap[i + 1u] += Ap[i];
+    }
+
+    uint32_t nnz_u = Ap[V];
+    uint32_t *Ai = malloc(nnz_u * sizeof(uint32_t));
+    double *Ax = malloc(nnz_u * sizeof(double));
+    uint32_t *ap_cur = malloc(V * sizeof(uint32_t));
+    uint32_t *parent = malloc(V * sizeof(uint32_t));
+    uint32_t *anc = malloc(V * sizeof(uint32_t));
+    uint32_t *flag = malloc(V * sizeof(uint32_t));
+    uint32_t *pat = malloc(V * sizeof(uint32_t));
+    uint32_t *stk = malloc(V * sizeof(uint32_t));
+    uint32_t *col_nnz = calloc(V, sizeof(uint32_t));
+    assert(Ai && Ax && ap_cur && parent && anc && flag && pat && stk && col_nnz);
+    memcpy(ap_cur, Ap, V * sizeof(uint32_t));
+    for (uint32_t u = 0; u < V; u++) {
+        for (uint32_t p_i = L_rp[u]; p_i < L_rp[u + 1u]; p_i++) {
+            uint32_t v = entries[p_i].v;
+            if (u < v) {
+                uint32_t d = ap_cur[v]++;
+                Ai[d] = u;
+                Ax[d] = -entries[p_i].w;
+            }
+        }
+    }
+    for (uint32_t k = 0; k < V; k++) {
+        uint32_t d = ap_cur[k]++;
+        Ai[d] = k;
+        Ax[d] = diag_A[k];
+    }
+    free(ap_cur);
+
+    for (uint32_t k = 0; k < V; k++) {
+        parent[k] = UINT32_MAX;
+        anc[k] = UINT32_MAX;
+        for (uint32_t pp = Ap[k]; pp < Ap[k + 1u]; pp++) {
+            uint32_t ii = Ai[pp];
+            while (ii < k) {
+                uint32_t in = anc[ii];
+                anc[ii] = k;
+                if (in == UINT32_MAX) {
+                    parent[ii] = k;
+                    break;
+                }
+                ii = in;
+            }
+        }
+    }
+    uint64_t fnnz = 0u;
+    for (uint32_t i = 0; i < V; i++)
+        flag[i] = UINT32_MAX;
+    for (uint32_t k = 0; k < V; k++) {
+        flag[k] = k;
+        for (uint32_t pp = Ap[k]; pp < Ap[k + 1u]; pp++) {
+            uint32_t ii = Ai[pp];
+            while (ii < k && flag[ii] != k) {
+                flag[ii] = k;
+                col_nnz[ii]++;
+                fnnz++;
+                ii = parent[ii];
+            }
+        }
+    }
+    uint32_t *Lp = calloc((size_t)V + 1u, sizeof(uint32_t));
+    uint32_t *cc = malloc(V * sizeof(uint32_t));
+    uint32_t *Li = malloc(fnnz * sizeof(uint32_t));
+    double *Lx = malloc(fnnz * sizeof(double));
+    double *D = malloc(V * sizeof(double));
+    double *Y = calloc(V, sizeof(double));
+    double *sol = calloc(V, sizeof(double));
+    assert(Lp && cc && Li && Lx && D && Y && sol);
+    for (uint32_t i = 0; i < V; i++) {
+        Lp[i + 1u] = Lp[i] + col_nnz[i];
+        cc[i] = Lp[i];
+        flag[i] = UINT32_MAX;
+    }
+    for (uint32_t k = 0; k < V; k++) {
+        uint32_t top = V;
+        flag[k] = k;
+        Y[k] = 0.0;
+        for (uint32_t pp = Ap[k]; pp < Ap[k + 1u]; pp++) {
+            uint32_t ii = Ai[pp];
+            if (ii <= k) {
+                Y[ii] += Ax[pp];
+                uint32_t ln = 0u;
+                while (ii < k && flag[ii] != k) {
+                    stk[ln++] = ii;
+                    flag[ii] = k;
+                    ii = parent[ii];
+                }
+                while (ln > 0u)
+                    pat[--top] = stk[--ln];
+            }
+        }
+        double d = Y[k];
+        Y[k] = 0.0;
+        for (uint32_t pp = top; pp < V; pp++) {
+            uint32_t ii = pat[pp];
+            double yi = Y[ii];
+            Y[ii] = 0.0;
+            double lki = yi / D[ii];
+            for (uint32_t q = Lp[ii]; q < cc[ii]; q++)
+                Y[Li[q]] -= Lx[q] * yi;
+            uint32_t dst = cc[ii]++;
+            Li[dst] = k;
+            Lx[dst] = lki;
+            d -= lki * yi;
+        }
+        D[k] = d;
+    }
+
+    double *W_full = calloc((size_t)V * B, sizeof(double));
+    assert(W_full);
+    for (uint32_t b = 0; b < B; b++) {
+        for (uint32_t i = 0; i < V; i++)
+            sol[i] = H_diag[i] * P_rhs[(size_t)i * B + b];
+        for (uint32_t i = 0; i < V; i++) {
+            for (uint32_t q = Lp[i]; q < Lp[i + 1u]; q++)
+                sol[Li[q]] -= Lx[q] * sol[i];
+        }
+        for (uint32_t i = 0; i < V; i++)
+            sol[i] /= D[i];
+        for (uint32_t i = V; i > 0u; i--) {
+            uint32_t r = i - 1u;
+            for (uint32_t q = Lp[r]; q < Lp[r + 1u]; q++)
+                sol[r] -= Lx[q] * sol[Li[q]];
+            W_full[(size_t)r * B + b] = sol[r];
+        }
+    }
+
+    for (uint32_t v = 0; v < V; v++) {
+        uint32_t tb[4] = {0};
+        double tw[4] = {0};
+        uint32_t cnt = 0u;
+        for (uint32_t b = 0; b < B; b++) {
+            double w = W_full[(size_t)v * B + b];
+            if (w <= 0.0)
+                continue;
+            if (cnt < 4u) {
+                uint32_t ins = cnt++;
+                while (ins > 0u && tw[ins - 1u] < w) {
+                    tw[ins] = tw[ins - 1u];
+                    tb[ins] = tb[ins - 1u];
+                    ins--;
+                }
+                tw[ins] = w;
+                tb[ins] = b;
+            } else if (w > tw[3]) {
+                uint32_t ins = 3u;
+                while (ins > 0u && tw[ins - 1u] < w) {
+                    tw[ins] = tw[ins - 1u];
+                    tb[ins] = tb[ins - 1u];
+                    ins--;
+                }
+                tw[ins] = w;
+                tb[ins] = b;
+            }
+        }
+        while (cnt > 1u && tw[cnt - 1u] < 1e-4)
+            cnt--;
+        double sum = 0.0;
+        for (uint32_t k = 0; k < cnt; k++)
+            sum += tw[k];
+        for (uint32_t k = 0; k < 4u; k++) {
+            out_top4_b[v][k] = 0u;
+            out_top4_w[v][k] = 0.0f;
+        }
+        if (cnt == 0u || sum <= 1e-12) {
+            out_top4_b[v][0] = closest_b[v];
+            out_top4_w[v][0] = 1.0f;
+        } else {
+            float rem = 1.0f;
+            for (uint32_t k = 1u; k < cnt; k++) {
+                float wk = (float)(tw[k] / sum);
+                out_top4_b[v][k] = tb[k];
+                out_top4_w[v][k] = wk;
+                rem -= wk;
+            }
+            out_top4_b[v][0] = tb[0];
+            out_top4_w[v][0] = rem > 0.0f ? rem : 0.0f;
+        }
+    }
+
+    free(W_full);
+    free(Lp);
+    free(cc);
+    free(Li);
+    free(Lx);
+    free(D);
+    free(Y);
+    free(sol);
+    free(Ai);
+    free(Ax);
+    free(parent);
+    free(anc);
+    free(flag);
+    free(pat);
+    free(stk);
+    free(col_nnz);
+    free(L_rp);
+    free(Ap);
+    free(diag_A);
+    free(mass);
+    free(H_diag);
+    free(P_rhs);
+    free(closest_b);
+    free(row_cnt);
+    free(row_cur);
+    free(entries);
+    free(tri_w);
+    free(tri_ok);
+}
+
 static void test_skeleton_topology_and_cycles(void)
 {
     we_puppet_t *p = alloc_test_puppet();
@@ -814,6 +1315,69 @@ static void test_gpu_gles31_weight_brush(void)
     assert(glGetError() == GL_NO_ERROR);
     assert(fabsf(p_norm_gpu->skin_mats[0][12] - 0.25f) < 1e-4f);
 
+    /* AUD-293: VAO==0 + non-zero EBO + non-zero GL_TEXTURE0 preserved across heatmap draw */
+    GLuint ext_tex = 0, ext_ebo = 0;
+    glGenTextures(1, &ext_tex);
+    glGenBuffers(1, &ext_ebo);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, ext_tex);
+    glBindVertexArray(0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ext_ebo);
+    assert(we_mesh_rig_draw_heatmap_gl(p_norm_gpu, NULL, 1u, 0u, 0u, 0.5f));
+    assert(glGetError() == GL_NO_ERROR);
+    GLint got_ebo = 0, got_tex = 0;
+    glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &got_ebo);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &got_tex);
+    assert((GLuint)got_ebo == ext_ebo);
+    assert((GLuint)got_tex == ext_tex);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDeleteBuffers(1, &ext_ebo);
+    glDeleteTextures(1, &ext_tex);
+
+    /* AUD-293: GPU SUBTRACT clearing all unlocked weights must fall back to weight[0]=1.0 */
+    uint64_t zero_locked_bones[2] = {0ull, 0ull};
+    uint64_t dirty_zero[8] = {0};
+    for (uint32_t b = 0; b < p_gpu->bone_count; b++) {
+        we_mesh_apply_weight_paint_dab(p_gpu, cxy, cxy, 4.0f, 4.0f, 1.0f, WE_WEIGHT_OP_SUBTRACT, b,
+                                       0.0f, zero_locked_bones, no_locked_verts, dirty_zero);
+    }
+    assert(glGetError() == GL_NO_ERROR);
+    for (uint32_t i = 0; i < p_gpu->vertex_count; i++) {
+        assert_vertex_pou(&p_gpu->vertices[i], p_gpu->bone_count);
+    }
+
+    /* AUD-116 + AUD-293 multi-context: foreign context brush isolation & deferred GL cleanup */
+    EGLSurface surf2 = eglCreatePbufferSurface(dpy, egl_cfg, pbuf_attrs);
+    EGLContext ctx2 = eglCreateContext(dpy, egl_cfg, EGL_NO_CONTEXT, ctx_attrs);
+    if (ctx2 != EGL_NO_CONTEXT && surf2 != EGL_NO_SURFACE) {
+        assert(eglMakeCurrent(dpy, surf2, surf2, ctx2));
+        we_puppet_t *p_ctx2 = create_brush_test_puppet();
+        assert(we_puppet_upload_gl(p_ctx2));
+        assert(we_mesh_apply_weight_paint_dab(p_ctx2, cxy, cxy, 1.0f, 1.0f, 0.25f, WE_WEIGHT_OP_ADD,
+                                              2u, 0.0f, NULL, NULL, dirty_zero) > 0u);
+        assert(glGetError() == GL_NO_ERROR);
+
+        /* Orphaned destroy under EGL_NO_CONTEXT queues deletion instead of calling glDelete* */
+        assert(eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT));
+        we_puppet_destroy(p_ctx2);
+
+        /* Make ctx2 current again to flush deferred GL deletions and tear down cleanly */
+        assert(eglMakeCurrent(dpy, surf2, surf2, ctx2));
+        we_puppet_t *p_flush = create_brush_test_puppet();
+        assert(we_puppet_upload_gl(p_flush));
+        we_puppet_destroy(p_flush);
+        we_gpu_weight_brush_destroy();
+        assert(glGetError() == GL_NO_ERROR);
+        assert(eglMakeCurrent(dpy, surf, surf, ctx));
+    }
+    if (ctx2 != EGL_NO_CONTEXT) {
+        eglDestroyContext(dpy, ctx2);
+    }
+    if (surf2 != EGL_NO_SURFACE) {
+        eglDestroySurface(dpy, surf2);
+    }
+
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_UNIFORM_BUFFER, 0);
@@ -1322,6 +1886,351 @@ static void test_ik_zero_lock_stretch_blend_and_immutable_physics(void)
     printf("[PASS] [0,0] IK lock, stretch blend, end_bone XPBD guard & immutable physics flags\n");
 }
 
+static void test_rig_safety_and_correctness_regressions(void)
+{
+    printf("[+] Testing AUD-255, 111, 293, 292, 139, 294, 067, 068, 115, 296 regressions...\n");
+    const float cxy[2] = {0.0f, 0.0f};
+    uint64_t dirty[16] = {0};
+
+    /* 1. AUD-255 & AUD-111: >WE_MDL_MAX_VERTICES and non-finite target_value rejected cleanly */
+    we_puppet_t *pb = create_brush_test_puppet();
+    assert(we_mesh_apply_weight_paint_dab(pb, cxy, cxy, 1.0f, 1.0f, 0.5f, WE_WEIGHT_OP_REPLACE, 0u,
+                                          NAN, NULL, NULL, dirty) == 0u);
+    assert(we_mesh_apply_weight_paint_dab(pb, cxy, cxy, 1.0f, 1.0f, 0.5f, WE_WEIGHT_OP_REPLACE, 0u,
+                                          INFINITY, NULL, NULL, dirty) == 0u);
+    uint32_t orig_v = pb->vertex_count;
+    pb->vertex_count = WE_MDL_MAX_VERTICES + 1u;
+    assert(we_mesh_apply_weight_paint_dab(pb, cxy, cxy, 1.0f, 1.0f, 0.5f, WE_WEIGHT_OP_ADD, 0u,
+                                          0.0f, NULL, NULL, dirty) == 0u);
+    pb->vertex_count = orig_v;
+
+    /* AUD-293 CPU PoU fallback when all unlocked weights subtracted to 0 */
+    for (uint32_t b = 0; b < pb->bone_count; b++) {
+        we_mesh_apply_weight_paint_dab(pb, cxy, cxy, 4.0f, 4.0f, 1.0f, WE_WEIGHT_OP_SUBTRACT, b,
+                                       0.0f, NULL, NULL, dirty);
+    }
+    for (uint32_t i = 0; i < pb->vertex_count; i++) {
+        assert_vertex_pou(&pb->vertices[i], pb->bone_count);
+    }
+    we_puppet_destroy(pb);
+
+    /* 2. AUD-292: non-iDT + smooth_factor > 0 on obtuse triangles & zero-area degenerate island */
+    we_puppet_t *po = alloc_test_puppet();
+    po->vertex_count = 6u;
+    po->triangle_count = 2u;
+    po->index_count = 6u;
+    po->vertices = calloc(6u, sizeof(we_mdl_vertex_t));
+    po->skinned_verts = calloc(6u, sizeof(we_skinned_vertex_t));
+    po->indices = calloc(6u, sizeof(uint16_t));
+    assert(po->vertices && po->skinned_verts && po->indices);
+    po->vertices[0].pos[0] = 0.0f;
+    po->vertices[0].pos[1] = 0.0f;
+    po->vertices[1].pos[0] = 2.0f;
+    po->vertices[1].pos[1] = 0.0f;
+    po->vertices[2].pos[0] = 1.0f;
+    po->vertices[2].pos[1] = 0.1f;
+    /* Collinear zero-area degenerate second triangle */
+    po->vertices[3].pos[0] = 5.0f;
+    po->vertices[3].pos[1] = 0.0f;
+    po->vertices[4].pos[0] = 6.0f;
+    po->vertices[4].pos[1] = 0.0f;
+    po->vertices[5].pos[0] = 7.0f;
+    po->vertices[5].pos[1] = 0.0f;
+    for (uint16_t i = 0; i < 6u; i++) {
+        po->indices[i] = i;
+    }
+    po->bone_count = 2u;
+    po->bones = calloc(2u, sizeof(we_mdl_bone_t));
+    assert(po->bones);
+    init_bone(&po->bones[0], "left", 0xFFFFFFFFu, 0.2f, 0.05f, 0.0f);
+    init_bone(&po->bones[1], "right", 0u, 5.5f, 0.0f, 0.0f);
+    finalize_bone_bind_offsets(po);
+
+    we_heat_skin_cfg_t ocfg;
+    we_heat_skin_cfg_default(&ocfg);
+    ocfg.use_intrinsic_delaunay = false;
+    ocfg.smooth_factor = 0.6f;
+    assert(we_mesh_solve_heat_weights(po, &ocfg, NULL));
+    for (uint32_t v = 0; v < po->vertex_count; v++) {
+        assert_vertex_pou(&po->vertices[v], po->bone_count);
+    }
+    we_puppet_destroy(po);
+
+    /* 3. AUD-139 + AUD-294: +/-Z aim 180deg flip, collapsed zero-scale bone, multi-hop IK, cyclic
+     * skeleton identity output */
+    we_puppet_t *paim = alloc_test_puppet();
+    build_grid_mesh(paim, 2u, 2u, -1.0f, -1.0f, 1.0f, 1.0f, 0.0f);
+    paim->bone_count = 2u;
+    paim->bones = calloc(2u, sizeof(we_mdl_bone_t));
+    assert(paim->bones);
+    init_bone(&paim->bones[0], "root", 0xFFFFFFFFu, 0.0f, 0.0f, 0.0f);
+    init_bone(&paim->bones[1], "zero_scl", 0u, 1.0f, 0.0f, 0.0f);
+    paim->bones[1].bind_scale[0] = 0.0f;
+    paim->bones[1].bind_scale[1] = 0.0f;
+    paim->bones[1].bind_scale[2] = 0.0f;
+    memset(paim->bones[1].local_trans, 0, sizeof(paim->bones[1].local_trans));
+    paim->bones[1].local_trans[15] = 1.0f;
+    finalize_bone_bind_offsets(paim);
+
+    float aim_local[2][16];
+    memcpy(aim_local[0], paim->bones[0].local_trans, sizeof(aim_local[0]));
+    memcpy(aim_local[1], paim->bones[1].local_trans, sizeof(aim_local[1]));
+    we_aim_constraint_t aim = {
+        .bone_index = 0u,
+        .enabled = 1u,
+        .aim_axis_local = {0.0f, 0.0f, 1.0f},
+        .target_world = {0.0f, 0.0f, -5.0f},
+        .max_cone_rad = 3.14159f,
+        .blend_weight = 1.0f,
+    };
+    assert(we_ik_solve_aim(paim, &aim, aim_local));
+    for (int m = 0; m < 16; m++) {
+        assert(isfinite(aim_local[0][m]));
+    }
+    /* Local +Z should now rotate onto -Z without NaN */
+    assert(fabsf(aim_local[0][8]) < 1e-5f && fabsf(aim_local[0][9]) < 1e-5f &&
+           aim_local[0][10] < -0.99f);
+    aim.bone_index = 1u;
+    assert(!we_ik_solve_aim(paim, &aim, aim_local));
+
+    /* Cyclic invalid skeleton initializes out_skin_mats to identity cleanly */
+    paim->bones[0].parent = 1u;
+    paim->bones[1].parent = 0u;
+    float cyc_mats[2][16];
+    memset(cyc_mats, 0x7f, sizeof(cyc_mats)); /* Poisson/NaN poison pattern */
+    we_puppet_eval_skin_matrices_ex(paim, NULL, 0u, NULL, 0.0, cyc_mats);
+    for (int b = 0; b < 2; b++) {
+        assert(cyc_mats[b][0] == 1.0f && cyc_mats[b][5] == 1.0f && cyc_mats[b][10] == 1.0f &&
+               cyc_mats[b][15] == 1.0f);
+    }
+    we_puppet_destroy(paim);
+
+    /* Multi-hop grandchild two-bone IK chain: root(0) -> spacer(1) -> mid(2) -> spacer(3) -> end(4)
+     */
+    we_puppet_t *pmh = alloc_test_puppet();
+    build_grid_mesh(pmh, 4u, 2u, 0.0f, -0.1f, 4.0f, 0.1f, 0.0f);
+    pmh->bone_count = 5u;
+    pmh->bones = calloc(5u, sizeof(we_mdl_bone_t));
+    assert(pmh->bones);
+    init_bone(&pmh->bones[0], "root", 0xFFFFFFFFu, 0.0f, 0.0f, 0.0f);
+    init_bone(&pmh->bones[1], "sp1", 0u, 1.0f, 0.0f, 0.0f);
+    init_bone(&pmh->bones[2], "mid", 1u, 1.0f, 0.0f, 0.0f);
+    init_bone(&pmh->bones[3], "sp2", 2u, 1.0f, 0.0f, 0.0f);
+    init_bone(&pmh->bones[4], "end", 3u, 1.0f, 0.0f, 0.0f);
+    finalize_bone_bind_offsets(pmh);
+
+    float mh_local[5][16];
+    for (uint32_t b = 0; b < 5u; b++) {
+        memcpy(mh_local[b], pmh->bones[b].local_trans, sizeof(mh_local[b]));
+    }
+    we_ik_chain_t mh_ch = {
+        .root_bone = 0u,
+        .mid_bone = 2u,
+        .end_bone = 4u,
+        .bend_sign = 1,
+        .enabled = 1u,
+        .target_world = {2.0f, 2.0f, 0.0f},
+        .pole_world = {1.0f, 3.0f, 0.0f},
+        .soft_zone_ratio = 0.0f,
+        .max_stretch_ratio = 1.0f,
+        .blend_weight = 1.0f,
+    };
+    assert(we_ik_solve_two_bone(pmh, &mh_ch, mh_local));
+    float w_end[5][16];
+    for (uint32_t b = 0; b < 5u; b++) {
+        if (b == 0u) {
+            memcpy(w_end[b], mh_local[b], 16u * sizeof(float));
+        } else {
+            we_mat4_mul(w_end[b - 1u], mh_local[b], w_end[b]);
+        }
+    }
+    assert(fabsf(w_end[4][12] - 2.0f) < 1e-3f && fabsf(w_end[4][13] - 2.0f) < 1e-3f);
+    we_puppet_destroy(pmh);
+
+    /* 4. AUD-067/068/115/296: Inf fps, huge time_sec, decimated keyframes, bind seed & missing
+     * anim_name */
+    we_puppet_t *pa = alloc_test_puppet();
+    build_grid_mesh(pa, 2u, 2u, -1.0f, -1.0f, 1.0f, 1.0f, 0.0f);
+    pa->bone_count = 2u;
+    pa->bones = calloc(2u, sizeof(we_mdl_bone_t));
+    assert(pa->bones);
+    init_bone(&pa->bones[0], "b0", 0xFFFFFFFFu, 10.0f, 0.0f, 0.0f);
+    init_bone(&pa->bones[1], "b1", 0u, 3.0f, 4.0f, 0.0f);
+    finalize_bone_bind_offsets(pa);
+
+    pa->anim_count = 1u;
+    pa->anims = calloc(1u, sizeof(we_mdl_anim_t));
+    assert(pa->anims);
+    const float kx[3] = {0.0f, 15.0f, 30.0f};
+    const float ka[3] = {0.0f, 0.0f, 0.0f};
+    pa->anims[0] = make_single_bone_anim(1, "walk", WE_ANIM_LOOP, INFINITY, kx, ka, 3u);
+    pa->anims[0].length = 31; /* decimated: kf_count=3 < length=31 */
+    pa->layer_count = 1u;
+    pa->layers[0] = (we_puppet_layer_t){.anim_id = 1, .rate = 1.0f, .blend = 1.0f, .visible = true};
+
+    float skin[2][16];
+    we_puppet_eval_skin_matrices_ex(pa, pa->layers, 1u, NULL, 1e308, skin);
+    for (int b = 0; b < 2; b++) {
+        for (int m = 0; m < 16; m++) {
+            assert(isfinite(skin[b][m]));
+        }
+    }
+
+    /* Finite fps + decimated keyframes: halfway (1.5s @ 10fps, length=30) must evaluate ~15.0f */
+    pa->anims[0].fps = 10.0f;
+    pa->anims[0].mode = WE_ANIM_MIRROR;
+    we_puppet_eval_skin_matrices_ex(pa, pa->layers, 1u, NULL, 1.5, skin);
+    /* bone 0 bind offset is -10, animated x is 15 -> skin delta = +5 on x */
+    assert(fabsf(skin[0][12] - 5.0f) < 1e-2f);
+
+    /* Unmatched non-empty anim_name must NOT fall back to anims[0] */
+    pa->layers[0].anim_id = 1;
+    snprintf(pa->layers[0].anim_name, sizeof(pa->layers[0].anim_name), "missing_clip");
+    we_puppet_eval_skin_matrices_ex(pa, pa->layers, 1u, NULL, 1.5, skin);
+    assert(fabsf(skin[0][12]) < 1e-5f); /* Bind pose => identity skin matrix */
+    we_puppet_destroy(pa);
+    printf("[PASS] rig safety & correctness regressions\n");
+}
+
+static void build_9991_mesh(we_puppet_t *p, float shear_x)
+{
+    /* 99 rows of 100 cols (9900) + top row of 91 cols (91) = exact 9,991 manifold vertices */
+    const uint32_t V = 9991u;
+    const uint32_t nx = 100u;
+    const uint32_t ny = 100u;
+    const uint32_t top_len = 91u;
+    const uint32_t T = 98u * 99u * 2u + (top_len - 1u) * 2u;
+
+    p->vertices = calloc(V, sizeof(we_mdl_vertex_t));
+    p->skinned_verts = calloc(V, sizeof(we_skinned_vertex_t));
+    p->indices = calloc((size_t)T * 3u, sizeof(uint16_t));
+    assert(p->vertices && p->skinned_verts && p->indices);
+    p->vertex_count = V;
+    p->triangle_count = T;
+    p->index_count = T * 3u;
+
+    uint32_t vid = 0u;
+    for (uint32_t iy = 0; iy < ny; iy++) {
+        uint32_t cols = (iy < 99u) ? nx : top_len;
+        float ty = (float)iy / (float)(ny - 1u);
+        for (uint32_t ix = 0; ix < cols; ix++) {
+            float tx = (float)ix / (float)(nx - 1u);
+            p->vertices[vid].pos[0] = -2.0f + 4.0f * tx + shear_x * (float)(iy & 1u);
+            p->vertices[vid].pos[1] = -2.0f + 4.0f * ty;
+            p->vertices[vid].pos[2] = 0.0f;
+            p->vertices[vid].texcoord[0] = tx;
+            p->vertices[vid].texcoord[1] = ty;
+            p->vertices[vid].weight[0] = 1.0f;
+            vid++;
+        }
+    }
+    assert(vid == V);
+
+    uint32_t ti = 0u;
+    for (uint32_t iy = 0; iy < 99u; iy++) {
+        uint32_t max_ix = (iy < 98u) ? (nx - 1u) : (top_len - 1u);
+        uint32_t row0 = iy * nx;
+        uint32_t row1 = (iy + 1u) * nx;
+        for (uint32_t ix = 0; ix < max_ix; ix++) {
+            uint16_t i00 = (uint16_t)(row0 + ix);
+            uint16_t i10 = (uint16_t)(row0 + ix + 1u);
+            uint16_t i01 = (uint16_t)(row1 + ix);
+            uint16_t i11 = (uint16_t)(row1 + ix + 1u);
+            p->indices[ti * 3u + 0u] = i00;
+            p->indices[ti * 3u + 1u] = i10;
+            p->indices[ti * 3u + 2u] = i11;
+            ti++;
+            p->indices[ti * 3u + 0u] = i00;
+            p->indices[ti * 3u + 1u] = i11;
+            p->indices[ti * 3u + 2u] = i01;
+            ti++;
+        }
+    }
+    assert(ti == T);
+
+    p->bone_count = 12u;
+    p->bones = calloc(12u, sizeof(we_mdl_bone_t));
+    assert(p->bones);
+    init_bone(&p->bones[0], "root", 0xFFFFFFFFu, 0.0f, -1.6f, 0.0f);
+    for (uint32_t b = 1u; b < 12u; b++) {
+        char name[32];
+        snprintf(name, sizeof(name), "bone_%u", b);
+        uint32_t parent = (b <= 3u) ? (b - 1u) : (b % 4u);
+        float bx = (b < 4u) ? 0.0f : ((b % 2u == 0u) ? -0.8f : 0.8f);
+        float by = 0.35f;
+        init_bone(&p->bones[b], name, parent, bx, by, 0.0f);
+    }
+    finalize_bone_bind_offsets(p);
+}
+
+static void test_vd05_9991_biharmonic_perf_and_accuracy(void)
+{
+    /* 1. Accuracy check: 9,991-vert 12-bone solve vs independent scalar float64 reference */
+    we_puppet_t *p_acc = alloc_test_puppet();
+    build_9991_mesh(p_acc, 0.0f);
+    we_heat_skin_cfg_t cfg_acc;
+    we_heat_skin_cfg_default(&cfg_acc);
+    cfg_acc.use_visibility_raycast = false;
+    cfg_acc.use_intrinsic_delaunay = true;
+    we_heat_solve_stats_t stats_acc;
+    RIG_HARD_CHECK(we_mesh_solve_heat_weights(p_acc, &cfg_acc, &stats_acc),
+                   "9991 accuracy solve failed");
+
+    float (*ref_w)[4] = calloc(p_acc->vertex_count, sizeof(float[4]));
+    uint32_t (*ref_b)[4] = calloc(p_acc->vertex_count, sizeof(uint32_t[4]));
+    assert(ref_w && ref_b);
+    ref_compute_9991_weights(p_acc, ref_w, ref_b);
+
+    double l_inf = 0.0;
+    for (uint32_t v = 0; v < p_acc->vertex_count; v++) {
+        assert_vertex_pou(&p_acc->vertices[v], p_acc->bone_count);
+        for (uint32_t b = 0; b < p_acc->bone_count; b++) {
+            double wf = (double)get_bone_weight(&p_acc->vertices[v], b);
+            double wr = 0.0;
+            for (int k = 0; k < 4; k++) {
+                if (ref_b[v][k] == b) {
+                    wr += (double)ref_w[v][k];
+                }
+            }
+            double err = fabs(wf - wr);
+            if (err > l_inf) {
+                l_inf = err;
+            }
+        }
+    }
+    free(ref_w);
+    free(ref_b);
+    we_puppet_destroy(p_acc);
+    RIG_HARD_CHECK(l_inf <= 1e-5, "9991-vert L_inf=%.3e exceeded 1e-5 vs float64 ref", l_inf);
+
+    /* 2. Full VD-05 latency gate: 9,991-vert sheared mesh + iDT flips + DDA raycast (< 10.0 ms) */
+    we_puppet_t *p_perf = alloc_test_puppet();
+    build_9991_mesh(p_perf, 0.015f);
+    we_heat_skin_cfg_t cfg_perf;
+    we_heat_skin_cfg_default(&cfg_perf);
+    we_heat_solve_stats_t stats_perf;
+    RIG_HARD_CHECK(we_mesh_solve_heat_weights(p_perf, &cfg_perf, &stats_perf),
+                   "9991 perf solve failed");
+    printf("[BENCH] VD-05 9991-vert 12-bone heat solve: %.3f ms (fill_nnz=%u, idt_flips=%u, "
+           "ic0=%d, L_inf=%.3e)\n",
+           stats_perf.solve_time_ms, stats_perf.factor_nnz, stats_perf.idt_edge_flips,
+           (int)stats_perf.used_ic0_fallback, l_inf);
+    for (uint32_t v = 0; v < p_perf->vertex_count; v++) {
+        assert_vertex_pou(&p_perf->vertices[v], p_perf->bone_count);
+    }
+    we_puppet_destroy(p_perf);
+
+#ifdef WWAL_PERF_GATES
+    const bool strict_perf = true;
+#else
+    const bool strict_perf = (getenv("WWAL_STRICT_PERF_ASSERTS") != NULL);
+#endif
+    if (strict_perf) {
+        RIG_HARD_CHECK(stats_perf.solve_time_ms < 10.0, "VD-05 SLO failed: %.3f ms >= 10.0 ms",
+                       stats_perf.solve_time_ms);
+    }
+}
+
 int main(void)
 {
     test_skeleton_topology_and_cycles();
@@ -1332,6 +2241,8 @@ int main(void)
     test_multilayer_blending_and_modes();
     test_obtuse_cotangent_and_small_mesh_heat();
     test_ik_zero_lock_stretch_blend_and_immutable_physics();
+    test_rig_safety_and_correctness_regressions();
+    test_vd05_9991_biharmonic_perf_and_accuracy();
     printf("ALL test_we_mesh_rig CHECKS PASSED\n");
     return 0;
 }

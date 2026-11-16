@@ -415,7 +415,7 @@ static double incircle_adapt(we_cdt_vec2_t pa, we_cdt_vec2_t pb, we_cdt_vec2_t p
     double *finnow = fin1;
     double *finother = fin2;
 
-    double aa[4], bb[4], cc[4];
+    double aa[4] = {0}, bb[4] = {0}, cc[4] = {0};
     int aalen = 0, bblen = 0, cclen = 0;
     if ((bdxtail != 0.0) || (bdytail != 0.0) || (cdxtail != 0.0) || (cdytail != 0.0)) {
         double adxadx1, adxadx0, adyady1, adyady0;
@@ -605,7 +605,7 @@ static double incircle_adapt(we_cdt_vec2_t pa, we_cdt_vec2_t pb, we_cdt_vec2_t p
             finother = sw;
 
             if (bdytail != 0.0) {
-                temp8len = scale_expansion_zeroelim(4, cc, adxtail, temp8);
+                temp8len = scale_expansion_zeroelim(cclen, cc, adxtail, temp8);
                 temp16alen = scale_expansion_zeroelim(temp8len, temp8, bdytail, temp16a);
                 finlength =
                     fast_expansion_sum_zeroelim(finlength, finnow, temp16alen, temp16a, finother);
@@ -614,7 +614,7 @@ static double incircle_adapt(we_cdt_vec2_t pa, we_cdt_vec2_t pb, we_cdt_vec2_t p
                 finother = sw;
             }
             if (cdytail != 0.0) {
-                temp8len = scale_expansion_zeroelim(4, bb, -adxtail, temp8);
+                temp8len = scale_expansion_zeroelim(bblen, bb, -adxtail, temp8);
                 temp16alen = scale_expansion_zeroelim(temp8len, temp8, cdytail, temp16a);
                 finlength =
                     fast_expansion_sum_zeroelim(finlength, finnow, temp16alen, temp16a, finother);
@@ -709,7 +709,7 @@ static double incircle_adapt(we_cdt_vec2_t pa, we_cdt_vec2_t pb, we_cdt_vec2_t p
             finother = sw;
 
             if (cdytail != 0.0) {
-                temp8len = scale_expansion_zeroelim(4, aa, bdxtail, temp8);
+                temp8len = scale_expansion_zeroelim(aalen, aa, bdxtail, temp8);
                 temp16alen = scale_expansion_zeroelim(temp8len, temp8, cdytail, temp16a);
                 finlength =
                     fast_expansion_sum_zeroelim(finlength, finnow, temp16alen, temp16a, finother);
@@ -718,7 +718,7 @@ static double incircle_adapt(we_cdt_vec2_t pa, we_cdt_vec2_t pb, we_cdt_vec2_t p
                 finother = sw;
             }
             if (adytail != 0.0) {
-                temp8len = scale_expansion_zeroelim(4, cc, -bdxtail, temp8);
+                temp8len = scale_expansion_zeroelim(cclen, cc, -bdxtail, temp8);
                 temp16alen = scale_expansion_zeroelim(temp8len, temp8, adytail, temp16a);
                 finlength =
                     fast_expansion_sum_zeroelim(finlength, finnow, temp16alen, temp16a, finother);
@@ -813,7 +813,7 @@ static double incircle_adapt(we_cdt_vec2_t pa, we_cdt_vec2_t pb, we_cdt_vec2_t p
             finother = sw;
 
             if (adytail != 0.0) {
-                temp8len = scale_expansion_zeroelim(4, bb, cdxtail, temp8);
+                temp8len = scale_expansion_zeroelim(bblen, bb, cdxtail, temp8);
                 temp16alen = scale_expansion_zeroelim(temp8len, temp8, adytail, temp16a);
                 finlength =
                     fast_expansion_sum_zeroelim(finlength, finnow, temp16alen, temp16a, finother);
@@ -822,7 +822,7 @@ static double incircle_adapt(we_cdt_vec2_t pa, we_cdt_vec2_t pb, we_cdt_vec2_t p
                 finother = sw;
             }
             if (bdytail != 0.0) {
-                temp8len = scale_expansion_zeroelim(4, aa, -cdxtail, temp8);
+                temp8len = scale_expansion_zeroelim(aalen, aa, -cdxtail, temp8);
                 temp16alen = scale_expansion_zeroelim(temp8len, temp8, bdytail, temp16a);
                 finlength =
                     fast_expansion_sum_zeroelim(finlength, finnow, temp16alen, temp16a, finother);
@@ -1622,36 +1622,59 @@ typedef struct {
     uint32_t cur_stamp;
 } rdp_spatial_grid_t;
 
-static void rdp_grid_cell_range(const rdp_spatial_grid_t *g, double minx, double miny, double maxx,
-                                double maxy, uint32_t *ix0, uint32_t *iy0, uint32_t *ix1,
-                                uint32_t *iy1)
+static uint32_t wwal_clamp_grid_coord_double(double val, uint32_t max_coord)
 {
-    int64_t x0 = (int64_t)floor((minx - g->min_x) * g->inv_cell_w);
-    int64_t y0 = (int64_t)floor((miny - g->min_y) * g->inv_cell_h);
-    int64_t x1 = (int64_t)floor((maxx - g->min_x) * g->inv_cell_w);
-    int64_t y1 = (int64_t)floor((maxy - g->min_y) * g->inv_cell_h);
-    if (x0 < 0) {
-        x0 = 0;
+    /* Clamp in float64 prior to narrowing so NaN or out-of-range inputs cannot trigger UB. */
+    double max_d = (double)max_coord;
+    if (!(val > 0.0)) {
+        return 0u;
     }
-    if (y0 < 0) {
-        y0 = 0;
+    if (val >= max_d) {
+        return max_coord;
     }
-    if (x1 >= (int64_t)g->gx) {
-        x1 = (int64_t)g->gx - 1;
+    return (uint32_t)val;
+}
+
+static bool wwal_rdp_grid_cell_range_safe(const rdp_spatial_grid_t *g, double minx, double miny,
+                                          double maxx, double maxy, uint32_t *ix0, uint32_t *iy0,
+                                          uint32_t *ix1, uint32_t *iy1)
+{
+    *ix0 = 0u;
+    *iy0 = 0u;
+    *ix1 = 0u;
+    *iy1 = 0u;
+    if (!g || g->gx == 0u || g->gy == 0u || !isfinite(minx) || !isfinite(miny) || !isfinite(maxx) ||
+        !isfinite(maxy) || !isfinite(g->min_x) || !isfinite(g->min_y) || !isfinite(g->inv_cell_w) ||
+        !isfinite(g->inv_cell_h) || g->inv_cell_w <= 0.0 || g->inv_cell_h <= 0.0) {
+        return false;
     }
-    if (y1 >= (int64_t)g->gy) {
-        y1 = (int64_t)g->gy - 1;
+    if (minx > maxx) {
+        double tmp = minx;
+        minx = maxx;
+        maxx = tmp;
     }
-    if (x1 < x0) {
-        x1 = x0;
+    if (miny > maxy) {
+        double tmp = miny;
+        miny = maxy;
+        maxy = tmp;
     }
-    if (y1 < y0) {
-        y1 = y0;
+    uint32_t max_x = g->gx - 1u;
+    uint32_t max_y = g->gy - 1u;
+    uint32_t x0 = wwal_clamp_grid_coord_double(floor((minx - g->min_x) * g->inv_cell_w), max_x);
+    uint32_t y0 = wwal_clamp_grid_coord_double(floor((miny - g->min_y) * g->inv_cell_h), max_y);
+    uint32_t x1 = wwal_clamp_grid_coord_double(floor((maxx - g->min_x) * g->inv_cell_w), max_x);
+    uint32_t y1 = wwal_clamp_grid_coord_double(floor((maxy - g->min_y) * g->inv_cell_h), max_y);
+    if (x0 > x1) {
+        x0 = x1;
     }
-    *ix0 = (uint32_t)x0;
-    *iy0 = (uint32_t)y0;
-    *ix1 = (uint32_t)x1;
-    *iy1 = (uint32_t)y1;
+    if (y0 > y1) {
+        y0 = y1;
+    }
+    *ix0 = x0;
+    *iy0 = y0;
+    *ix1 = x1;
+    *iy1 = y1;
+    return true;
 }
 
 static bool rdp_grid_push_node(rdp_spatial_grid_t *g, int32_t *head_slot, uint32_t id)
@@ -1676,11 +1699,18 @@ static bool rdp_grid_insert_seg(rdp_spatial_grid_t *g, uint32_t seg_id, we_cdt_v
                                 we_cdt_vec2_t b)
 {
     uint32_t ix0, iy0, ix1, iy1;
-    rdp_grid_cell_range(g, fmin(a.x, b.x), fmin(a.y, b.y), fmax(a.x, b.x), fmax(a.y, b.y), &ix0,
-                        &iy0, &ix1, &iy1);
+    if (!wwal_rdp_grid_cell_range_safe(g, fmin(a.x, b.x), fmin(a.y, b.y), fmax(a.x, b.x),
+                                       fmax(a.y, b.y), &ix0, &iy0, &ix1, &iy1)) {
+        return false;
+    }
+    size_t total_cells = (size_t)g->gx * (size_t)g->gy;
     for (uint32_t cy = iy0; cy <= iy1; cy++) {
         for (uint32_t cx = ix0; cx <= ix1; cx++) {
-            if (!rdp_grid_push_node(g, &g->seg_heads[cy * g->gx + cx], seg_id)) {
+            size_t cell_idx = (size_t)cy * (size_t)g->gx + (size_t)cx;
+            if (cell_idx >= total_cells) {
+                return false;
+            }
+            if (!rdp_grid_push_node(g, &g->seg_heads[cell_idx], seg_id)) {
                 return false;
             }
         }
@@ -1691,8 +1721,14 @@ static bool rdp_grid_insert_seg(rdp_spatial_grid_t *g, uint32_t seg_id, we_cdt_v
 static bool rdp_grid_insert_vert(rdp_spatial_grid_t *g, uint32_t vert_id, we_cdt_vec2_t p)
 {
     uint32_t ix0, iy0, ix1, iy1;
-    rdp_grid_cell_range(g, p.x, p.y, p.x, p.y, &ix0, &iy0, &ix1, &iy1);
-    return rdp_grid_push_node(g, &g->vert_heads[iy0 * g->gx + ix0], vert_id);
+    if (!wwal_rdp_grid_cell_range_safe(g, p.x, p.y, p.x, p.y, &ix0, &iy0, &ix1, &iy1)) {
+        return false;
+    }
+    size_t cell_idx = (size_t)iy0 * (size_t)g->gx + (size_t)ix0;
+    if (cell_idx >= (size_t)g->gx * (size_t)g->gy) {
+        return false;
+    }
+    return rdp_grid_push_node(g, &g->vert_heads[cell_idx], vert_id);
 }
 
 static void rdp_grid_free(rdp_spatial_grid_t *g)
@@ -2082,27 +2118,33 @@ static bool tp_rdp_simplify_loops(const we_cdt_loop_t *in_loops, uint32_t in_cou
                         grid.stamp[vb] = s_mark;
 
                         uint32_t ix0, iy0, ix1, iy1;
-                        rdp_grid_cell_range(&grid, fmin(pa.x, pb.x), fmin(pa.y, pb.y),
-                                            fmax(pa.x, pb.x), fmax(pa.y, pb.y), &ix0, &iy0, &ix1,
-                                            &iy1);
-                        for (uint32_t cy = iy0; cy <= iy1 && can_collapse; cy++) {
-                            for (uint32_t cx = ix0; cx <= ix1 && can_collapse; cx++) {
-                                for (int32_t ni = grid.seg_heads[cy * grid.gx + cx]; ni >= 0;
-                                     ni = grid.pool[ni].next) {
-                                    uint32_t u = grid.pool[ni].id;
-                                    if (!verts[u].active || !verts[u].seg_active) {
-                                        continue;
-                                    }
-                                    if (grid.stamp[u] == s_mark) {
-                                        continue;
-                                    }
-                                    grid.stamp[u] = s_mark;
-                                    we_cdt_vec2_t su = {verts[u].x, verts[u].y};
-                                    uint32_t w = verts[u].next_v;
-                                    we_cdt_vec2_t sw = {verts[w].x, verts[w].y};
-                                    if (segments_intersect_or_touch(pa, pb, su, sw)) {
-                                        can_collapse = false;
+                        if (wwal_rdp_grid_cell_range_safe(&grid, fmin(pa.x, pb.x), fmin(pa.y, pb.y),
+                                                          fmax(pa.x, pb.x), fmax(pa.y, pb.y), &ix0,
+                                                          &iy0, &ix1, &iy1)) {
+                            size_t total_cells = (size_t)grid.gx * (size_t)grid.gy;
+                            for (uint32_t cy = iy0; cy <= iy1 && can_collapse; cy++) {
+                                for (uint32_t cx = ix0; cx <= ix1 && can_collapse; cx++) {
+                                    size_t cell_idx = (size_t)cy * (size_t)grid.gx + (size_t)cx;
+                                    if (cell_idx >= total_cells) {
                                         break;
+                                    }
+                                    for (int32_t ni = grid.seg_heads[cell_idx]; ni >= 0;
+                                         ni = grid.pool[ni].next) {
+                                        uint32_t u = grid.pool[ni].id;
+                                        if (!verts[u].active || !verts[u].seg_active) {
+                                            continue;
+                                        }
+                                        if (grid.stamp[u] == s_mark) {
+                                            continue;
+                                        }
+                                        grid.stamp[u] = s_mark;
+                                        we_cdt_vec2_t su = {verts[u].x, verts[u].y};
+                                        uint32_t w = verts[u].next_v;
+                                        we_cdt_vec2_t sw = {verts[w].x, verts[w].y};
+                                        if (segments_intersect_or_touch(pa, pb, su, sw)) {
+                                            can_collapse = false;
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -2130,25 +2172,31 @@ static bool tp_rdp_simplify_loops(const we_cdt_loop_t *in_loops, uint32_t in_cou
                         }
 
                         uint32_t ix0, iy0, ix1, iy1;
-                        rdp_grid_cell_range(&grid, bminx, bminy, bmaxx, bmaxy, &ix0, &iy0, &ix1,
-                                            &iy1);
-                        for (uint32_t cy = iy0; cy <= iy1 && can_collapse; cy++) {
-                            for (uint32_t cx = ix0; cx <= ix1 && can_collapse; cx++) {
-                                for (int32_t ni = grid.vert_heads[cy * grid.gx + cx]; ni >= 0;
-                                     ni = grid.pool[ni].next) {
-                                    uint32_t vid = grid.pool[ni].id;
-                                    if (!verts[vid].active || grid.stamp[vid] == v_mark) {
-                                        continue;
-                                    }
-                                    grid.stamp[vid] = v_mark;
-                                    we_cdt_vec2_t vp = {verts[vid].x, verts[vid].y};
-                                    if (vp.x < bminx || vp.x > bmaxx || vp.y < bminy ||
-                                        vp.y > bmaxy) {
-                                        continue;
-                                    }
-                                    if (point_in_or_on_polygon(vp, poly_buf, q_len)) {
-                                        can_collapse = false;
+                        if (wwal_rdp_grid_cell_range_safe(&grid, bminx, bminy, bmaxx, bmaxy, &ix0,
+                                                          &iy0, &ix1, &iy1)) {
+                            size_t total_cells = (size_t)grid.gx * (size_t)grid.gy;
+                            for (uint32_t cy = iy0; cy <= iy1 && can_collapse; cy++) {
+                                for (uint32_t cx = ix0; cx <= ix1 && can_collapse; cx++) {
+                                    size_t cell_idx = (size_t)cy * (size_t)grid.gx + (size_t)cx;
+                                    if (cell_idx >= total_cells) {
                                         break;
+                                    }
+                                    for (int32_t ni = grid.vert_heads[cell_idx]; ni >= 0;
+                                         ni = grid.pool[ni].next) {
+                                        uint32_t vid = grid.pool[ni].id;
+                                        if (!verts[vid].active || grid.stamp[vid] == v_mark) {
+                                            continue;
+                                        }
+                                        grid.stamp[vid] = v_mark;
+                                        we_cdt_vec2_t vp = {verts[vid].x, verts[vid].y};
+                                        if (vp.x < bminx || vp.x > bmaxx || vp.y < bminy ||
+                                            vp.y > bmaxy) {
+                                            continue;
+                                        }
+                                        if (point_in_or_on_polygon(vp, poly_buf, q_len)) {
+                                            can_collapse = false;
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -3122,6 +3170,110 @@ static void cdt_mark_edge_constrained(cdt_mesh_t *m, int32_t t, int e)
     }
 }
 
+static bool cdt_fan_locate_crossing(cdt_mesh_t *m, int32_t a, we_cdt_vec2_t pa, we_cdt_vec2_t pb,
+                                    double ab_len2, int32_t *out_walk_t, int32_t *out_opp_u,
+                                    int32_t *out_opp_w, int32_t *out_col_v)
+{
+    *out_walk_t = -1;
+    *out_opp_u = -1;
+    *out_opp_w = -1;
+    *out_col_v = -1;
+
+    int32_t start_t = m->verts[a].any_tri;
+    bool start_valid = false;
+    if (start_t >= 0 && (uint32_t)start_t < m->t_count && (m->tris[start_t].flags & TRI_ALIVE)) {
+        for (int j = 0; j < 3; j++) {
+            if (m->tris[start_t].v[j] == a) {
+                start_valid = true;
+                break;
+            }
+        }
+    }
+    if (!start_valid) {
+        start_t = -1;
+        for (uint32_t tid = 0u; tid < m->t_count; tid++) {
+            const cdt_tri_t *tr = &m->tris[tid];
+            if (!(tr->flags & TRI_ALIVE)) {
+                continue;
+            }
+            if (tr->v[0] == a || tr->v[1] == a || tr->v[2] == a) {
+                start_t = (int32_t)tid;
+                m->verts[a].any_tri = start_t;
+                break;
+            }
+        }
+    }
+    if (start_t < 0) {
+        return false;
+    }
+
+    bool closed_cycle = false;
+    for (int dir = 0; dir < 2; dir++) {
+        if (dir == 1 && closed_cycle) {
+            break;
+        }
+        int32_t t = start_t;
+        uint32_t guard = 0u;
+        while (t >= 0 && guard++ < m->t_count + 4u) {
+            const cdt_tri_t *tr = &m->tris[t];
+            if (!(tr->flags & TRI_ALIVE)) {
+                break;
+            }
+            int k = -1;
+            for (int j = 0; j < 3; j++) {
+                if (tr->v[j] == a) {
+                    k = j;
+                    break;
+                }
+            }
+            if (k < 0) {
+                break;
+            }
+            if (!(dir == 1 && t == start_t)) {
+                int32_t vp = tr->v[(k + 1) % 3];
+                int32_t vq = tr->v[(k + 2) % 3];
+                we_cdt_vec2_t pvp = cdt_vp(m, vp);
+                we_cdt_vec2_t pvq = cdt_vp(m, vq);
+                double o_apb = orient2d(pa, pvp, pb);
+                double o_abq = orient2d(pa, pb, pvq);
+                if (o_apb >= 0.0 && o_abq >= 0.0) {
+                    if (o_apb == 0.0) {
+                        double dot =
+                            (pvp.x - pa.x) * (pb.x - pa.x) + (pvp.y - pa.y) * (pb.y - pa.y);
+                        if (dot > 0.0 && dot < ab_len2) {
+                            *out_col_v = vp;
+                            return true;
+                        }
+                    }
+                    if (o_abq == 0.0) {
+                        double dot =
+                            (pvq.x - pa.x) * (pb.x - pa.x) + (pvq.y - pa.y) * (pb.y - pa.y);
+                        if (dot > 0.0 && dot < ab_len2) {
+                            *out_col_v = vq;
+                            return true;
+                        }
+                    }
+                    if (o_apb > 0.0 && o_abq > 0.0) {
+                        *out_walk_t = t;
+                        *out_opp_u = vp;
+                        *out_opp_w = vq;
+                        return true;
+                    }
+                }
+            }
+            int e_out = k;
+            int e_in = (k + 2) % 3;
+            int32_t next_t = (dir == 0) ? tr->adj[e_out] : tr->adj[e_in];
+            if (next_t == start_t) {
+                closed_cycle = true;
+                break;
+            }
+            t = next_t;
+        }
+    }
+    return false;
+}
+
 static bool cdt_recover_segment_sloan(cdt_mesh_t *m, int32_t va, int32_t vb)
 {
     typedef struct {
@@ -3163,53 +3315,14 @@ static bool cdt_recover_segment_sloan(cdt_mesh_t *m, int32_t va, int32_t vb)
 
         we_cdt_vec2_t pa = cdt_vp(m, a);
         we_cdt_vec2_t pb = cdt_vp(m, b);
+        double ab_len2 = dist2_pts(pa, pb);
 
-        /* Find first triangle around vertex a whose opposite edge crosses segment a->b */
+        /* Walk fan around vertex a to find first opposite edge crossing segment a->b. */
         int32_t walk_t = -1;
         int32_t opp_u = -1;
         int32_t opp_w = -1;
         int32_t col_v = -1;
-
-        for (uint32_t tid = 0u; tid < m->t_count; tid++) {
-            const cdt_tri_t *tr = &m->tris[tid];
-            if (!(tr->flags & TRI_ALIVE)) {
-                continue;
-            }
-            int k = -1;
-            for (int j = 0; j < 3; j++) {
-                if (tr->v[j] == a) {
-                    k = j;
-                    break;
-                }
-            }
-            if (k < 0) {
-                continue;
-            }
-            int32_t vp = tr->v[(k + 1) % 3];
-            int32_t vq = tr->v[(k + 2) % 3];
-            double o_apb = orient2d(pa, cdt_vp(m, vp), pb);
-            double o_abq = orient2d(pa, pb, cdt_vp(m, vq));
-            if (o_apb >= 0.0 && o_abq >= 0.0) {
-                if (o_apb == 0.0) {
-                    we_cdt_vec2_t pvp = cdt_vp(m, vp);
-                    if ((pvp.x - pa.x) * (pb.x - pa.x) + (pvp.y - pa.y) * (pb.y - pa.y) > 0.0) {
-                        col_v = vp;
-                        break;
-                    }
-                } else if (o_abq == 0.0) {
-                    we_cdt_vec2_t pvq = cdt_vp(m, vq);
-                    if ((pvq.x - pa.x) * (pb.x - pa.x) + (pvq.y - pa.y) * (pb.y - pa.y) > 0.0) {
-                        col_v = vq;
-                        break;
-                    }
-                } else {
-                    walk_t = (int32_t)tid;
-                    opp_u = vp;
-                    opp_w = vq;
-                    break;
-                }
-            }
-        }
+        (void)cdt_fan_locate_crossing(m, a, pa, pb, ab_len2, &walk_t, &opp_u, &opp_w, &col_v);
 
         if (col_v >= 0) {
             if (task_sp + 2u > task_cap) {
@@ -3282,7 +3395,13 @@ static bool cdt_recover_segment_sloan(cdt_mesh_t *m, int32_t va, int32_t vb)
             }
             double s = orient2d(pa, pb, cdt_vp(m, r));
             if (s == 0.0) {
-                col_v = r;
+                we_cdt_vec2_t pr = cdt_vp(m, r);
+                double dot = (pr.x - pa.x) * (pb.x - pa.x) + (pr.y - pa.y) * (pb.y - pa.y);
+                if (dot > 0.0 && dot < ab_len2) {
+                    col_v = r;
+                    break;
+                }
+                ok = false;
                 break;
             }
             cur_t = tn;
@@ -3564,12 +3683,29 @@ static uint64_t hash_grid_coord(int64_t gx, int64_t gy)
     return h;
 }
 
+static bool bridson_hash_coord(double val, double inv_cell, int64_t *out_coord)
+{
+    if (!isfinite(val) || !isfinite(inv_cell) || inv_cell <= 0.0) {
+        return false;
+    }
+    double scaled = floor(val * inv_cell);
+    const double lim = (double)(1LL << 52);
+    if (!isfinite(scaled) || scaled < -lim || scaled > lim) {
+        return false;
+    }
+    *out_coord = (int64_t)scaled;
+    return true;
+}
+
 static bool bridson_hash_insert(bridson_hash_t *h, double x, double y, int32_t vid)
 {
-    int64_t gx = (int64_t)floor(x * h->inv_cell);
-    int64_t gy = (int64_t)floor(y * h->inv_cell);
+    int64_t gx = 0;
+    int64_t gy = 0;
+    if (!bridson_hash_coord(x, h->inv_cell, &gx) || !bridson_hash_coord(y, h->inv_cell, &gy)) {
+        return false;
+    }
     uint32_t idx = (uint32_t)hash_grid_coord(gx, gy) & h->mask;
-    for (;;) {
+    for (uint32_t step = 0u; step <= h->mask; step++) {
         if (!h->slots[idx].occupied) {
             h->slots[idx].gx = gx;
             h->slots[idx].gy = gy;
@@ -3579,20 +3715,24 @@ static bool bridson_hash_insert(bridson_hash_t *h, double x, double y, int32_t v
         }
         idx = (idx + 1u) & h->mask;
     }
+    return false;
 }
 
 static bool bridson_hash_far_enough(const bridson_hash_t *h, const cdt_mesh_t *m, double x,
                                     double y, double r2)
 {
-    int64_t gx = (int64_t)floor(x * h->inv_cell);
-    int64_t gy = (int64_t)floor(y * h->inv_cell);
+    int64_t gx = 0;
+    int64_t gy = 0;
+    if (!bridson_hash_coord(x, h->inv_cell, &gx) || !bridson_hash_coord(y, h->inv_cell, &gy)) {
+        return false;
+    }
     we_cdt_vec2_t p = {x, y};
     for (int64_t dy = -2; dy <= 2; dy++) {
         for (int64_t dx = -2; dx <= 2; dx++) {
             int64_t cx = gx + dx;
             int64_t cy = gy + dy;
             uint32_t idx = (uint32_t)hash_grid_coord(cx, cy) & h->mask;
-            while (h->slots[idx].occupied) {
+            for (uint32_t step = 0u; step <= h->mask && h->slots[idx].occupied; step++) {
                 if (h->slots[idx].gx == cx && h->slots[idx].gy == cy) {
                     if (dist2_pts(p, cdt_vp(m, h->slots[idx].vid)) < r2) {
                         return false;
@@ -3628,14 +3768,23 @@ static bool cdt_seed_bridson_interior(cdt_mesh_t *m, double r_disk_in, double mi
         return true;
     }
     uint32_t avail = m->max_non_super_verts - v_cur;
-    uint32_t refine_reserve = (uint32_t)(0.40 * (double)m->max_non_super_verts);
+    uint32_t acute_corners = 0u;
+    for (uint32_t vi = 3u; vi < m->v_count; vi++) {
+        if (m->verts[vi].has_acute_corner) {
+            acute_corners++;
+        }
+    }
+    /* Reserve 15%-20% of remaining vertex headroom for Chew-Ruppert refinement & acute shells
+     * instead of a fixed 0.40 * budget subtraction so Bridson reaches requested spacing density. */
+    double acute_frac = (acute_corners > 0u && v_cur > 0u)
+                            ? fmin(1.0, (double)acute_corners / fmax(1.0, 0.25 * (double)v_cur))
+                            : 0.0;
+    double slack_ratio = 0.15 + 0.05 * acute_frac;
+    uint32_t refine_reserve = (avail >= 8u) ? (uint32_t)(slack_ratio * (double)avail) : 0u;
     if (avail <= refine_reserve) {
         return true;
     }
     uint32_t bridson_cap = avail - refine_reserve;
-    if (bridson_cap > (uint32_t)(0.60 * (double)avail)) {
-        bridson_cap = (uint32_t)(0.60 * (double)avail);
-    }
     if (bridson_cap == 0u) {
         return true;
     }
@@ -3662,7 +3811,9 @@ static bool cdt_seed_bridson_interior(cdt_mesh_t *m, double r_disk_in, double mi
     }
 
     double r_disk = fmax(r_disk_in, 2.0 * sqrt(m->min_edge_len2));
-    double est_needed_r = sqrt(domain_area / (0.85 * (double)bridson_cap));
+    /* Bridson Poisson-disk packing density in 2D averages ~0.64 pts per r_disk^2; size
+     * est_needed_r using that density so seeding uses bridson_cap evenly across domain_area. */
+    double est_needed_r = sqrt(0.64 * domain_area / (double)bridson_cap);
     if (est_needed_r > r_disk) {
         r_disk = est_needed_r;
     }
@@ -3760,16 +3911,20 @@ static bool cdt_seed_bridson_interior(cdt_mesh_t *m, double r_disk_in, double mi
     uint32_t rng = 0x9E3779B9u ^ seg_count;
     int32_t last_tri_hint = 0;
 
+    size_t sgrid_cells = (size_t)sgrid.gx * (size_t)sgrid.gy;
     bool ok = true;
     for (uint32_t tid = 0u;
          tid < m->t_count && seeded_count < bridson_cap && !m->hit_vertex_budget && ok; tid++) {
-        const cdt_tri_t *tr = &m->tris[tid];
-        if ((tr->flags & (TRI_ALIVE | TRI_INTERIOR)) != (TRI_ALIVE | TRI_INTERIOR)) {
+        uint8_t tri_flags = m->tris[tid].flags;
+        if ((tri_flags & (TRI_ALIVE | TRI_INTERIOR)) != (TRI_ALIVE | TRI_INTERIOR)) {
             continue;
         }
-        we_cdt_vec2_t p0 = cdt_vp(m, tr->v[0]);
-        we_cdt_vec2_t p1 = cdt_vp(m, tr->v[1]);
-        we_cdt_vec2_t p2 = cdt_vp(m, tr->v[2]);
+        int32_t tv0 = m->tris[tid].v[0];
+        int32_t tv1 = m->tris[tid].v[1];
+        int32_t tv2 = m->tris[tid].v[2];
+        we_cdt_vec2_t p0 = cdt_vp(m, tv0);
+        we_cdt_vec2_t p1 = cdt_vp(m, tv1);
+        we_cdt_vec2_t p2 = cdt_vp(m, tv2);
         we_cdt_vec2_t cand = {(p0.x + p1.x + p2.x) / 3.0, (p0.y + p1.y + p2.y) / 3.0};
 
         if (!bridson_hash_far_enough(&bhash, m, cand.x, cand.y, r2)) {
@@ -3777,18 +3932,22 @@ static bool cdt_seed_bridson_interior(cdt_mesh_t *m, double r_disk_in, double mi
         }
 
         uint32_t ix0, iy0, ix1, iy1;
-        rdp_grid_cell_range(&sgrid, cand.x - clear_dist, cand.y - clear_dist, cand.x + clear_dist,
-                            cand.y + clear_dist, &ix0, &iy0, &ix1, &iy1);
+        bool clear_ok = wwal_rdp_grid_cell_range_safe(&sgrid, cand.x - clear_dist,
+                                                      cand.y - clear_dist, cand.x + clear_dist,
+                                                      cand.y + clear_dist, &ix0, &iy0, &ix1, &iy1);
         uint32_t st = ++sgrid.cur_stamp;
         if (st == 0u) {
             memset(sgrid.stamp, 0, seg_count * sizeof(uint32_t));
             st = ++sgrid.cur_stamp;
         }
-        bool clear_ok = true;
         for (uint32_t cy = iy0; cy <= iy1 && clear_ok; cy++) {
             for (uint32_t cx = ix0; cx <= ix1 && clear_ok; cx++) {
-                for (int32_t ni = sgrid.seg_heads[cy * sgrid.gx + cx]; ni >= 0;
-                     ni = sgrid.pool[ni].next) {
+                size_t cell_idx = (size_t)cy * (size_t)sgrid.gx + (size_t)cx;
+                if (cell_idx >= sgrid_cells) {
+                    clear_ok = false;
+                    break;
+                }
+                for (int32_t ni = sgrid.seg_heads[cell_idx]; ni >= 0; ni = sgrid.pool[ni].next) {
                     uint32_t sid = sgrid.pool[ni].id;
                     if (sgrid.stamp[sid] == st) {
                         continue;
@@ -3819,7 +3978,7 @@ static bool cdt_seed_bridson_interior(cdt_mesh_t *m, double r_disk_in, double mi
             continue;
         }
         last_tri_hint = m->verts[vid].any_tri;
-        bridson_hash_insert(&bhash, cand.x, cand.y, vid);
+        (void)bridson_hash_insert(&bhash, cand.x, cand.y, vid);
         active[active_len++] = vid;
         seeded_count++;
 
@@ -3842,17 +4001,22 @@ static bool cdt_seed_bridson_interior(cdt_mesh_t *m, double r_disk_in, double mi
                 }
 
                 uint32_t cx0, cy0, cx1, cy1;
-                rdp_grid_cell_range(&sgrid, nc.x - clear_dist, nc.y - clear_dist, nc.x + clear_dist,
-                                    nc.y + clear_dist, &cx0, &cy0, &cx1, &cy1);
+                bool seg_ok = wwal_rdp_grid_cell_range_safe(
+                    &sgrid, nc.x - clear_dist, nc.y - clear_dist, nc.x + clear_dist,
+                    nc.y + clear_dist, &cx0, &cy0, &cx1, &cy1);
                 uint32_t cst = ++sgrid.cur_stamp;
                 if (cst == 0u) {
                     memset(sgrid.stamp, 0, seg_count * sizeof(uint32_t));
                     cst = ++sgrid.cur_stamp;
                 }
-                bool seg_ok = true;
                 for (uint32_t cy = cy0; cy <= cy1 && seg_ok; cy++) {
                     for (uint32_t cx = cx0; cx <= cx1 && seg_ok; cx++) {
-                        for (int32_t ni = sgrid.seg_heads[cy * sgrid.gx + cx]; ni >= 0;
+                        size_t cell_idx = (size_t)cy * (size_t)sgrid.gx + (size_t)cx;
+                        if (cell_idx >= sgrid_cells) {
+                            seg_ok = false;
+                            break;
+                        }
+                        for (int32_t ni = sgrid.seg_heads[cell_idx]; ni >= 0;
                              ni = sgrid.pool[ni].next) {
                             uint32_t sid = sgrid.pool[ni].id;
                             if (sgrid.stamp[sid] == cst) {
