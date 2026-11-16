@@ -1719,6 +1719,7 @@ struct DownloadManager::Impl {
 
     int m_epollFd{-1};
     int m_timerFd{-1};
+    std::mutex m_wakeMutex;
     int m_wakeEventFd{-1};
     CurlBinding::CURLM *m_multi{nullptr};
     std::unordered_map<int, uint32_t> m_socketEvents;
@@ -1867,6 +1868,7 @@ struct DownloadManager::Impl {
 
     void wakeReactor() noexcept
     {
+        std::lock_guard<std::mutex> lk(m_wakeMutex);
         if (m_wakeEventFd >= 0) {
             uint64_t one = 1;
             ssize_t r = ::write(m_wakeEventFd, &one, sizeof(one));
@@ -1941,8 +1943,12 @@ struct DownloadManager::Impl {
 
         m_epollFd = ::epoll_create1(EPOLL_CLOEXEC);
         m_timerFd = ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-        m_wakeEventFd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-        if (m_epollFd < 0 || m_timerFd < 0 || m_wakeEventFd < 0) {
+        const int wakeFd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        {
+            std::lock_guard<std::mutex> lk(m_wakeMutex);
+            m_wakeEventFd = wakeFd;
+        }
+        if (m_epollFd < 0 || m_timerFd < 0 || wakeFd < 0) {
             closeReactorFds();
             return false;
         }
@@ -1954,8 +1960,8 @@ struct DownloadManager::Impl {
 
         epoll_event evWake{};
         evWake.events = EPOLLIN;
-        evWake.data.fd = m_wakeEventFd;
-        ::epoll_ctl(m_epollFd, EPOLL_CTL_ADD, m_wakeEventFd, &evWake);
+        evWake.data.fd = wakeFd;
+        ::epoll_ctl(m_epollFd, EPOLL_CTL_ADD, wakeFd, &evWake);
 
         m_running.store(true, std::memory_order_release);
         m_reactorAlive.store(true, std::memory_order_release);
@@ -1970,9 +1976,12 @@ struct DownloadManager::Impl {
 
     void closeReactorFds()
     {
-        if (m_wakeEventFd >= 0) {
-            ::close(m_wakeEventFd);
-            m_wakeEventFd = -1;
+        {
+            std::lock_guard<std::mutex> lk(m_wakeMutex);
+            if (m_wakeEventFd >= 0) {
+                ::close(m_wakeEventFd);
+                m_wakeEventFd = -1;
+            }
         }
         if (m_timerFd >= 0) {
             ::close(m_timerFd);

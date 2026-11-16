@@ -8,7 +8,9 @@
 #include "waywal/wwpkg.h"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -16,6 +18,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -118,8 +122,11 @@ class LoopbackHttpServer {
 
     explicit LoopbackHttpServer(Handler handler) : m_handler(std::move(handler))
     {
-        m_listenFd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        m_listenFd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         assert(m_listenFd >= 0);
+
+        int pipeRc = ::pipe2(m_wakePipe, O_CLOEXEC | O_NONBLOCK);
+        assert(pipeRc == 0);
 
         int opt = 1;
         ::setsockopt(m_listenFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -153,16 +160,29 @@ class LoopbackHttpServer {
 
     void stop()
     {
-        if (m_stopped.exchange(true)) {
+        if (m_stopped.exchange(true, std::memory_order_acq_rel)) {
             return;
         }
+        if (m_wakePipe[1] >= 0) {
+            const uint8_t wake = 1;
+            ssize_t wr = ::write(m_wakePipe[1], &wake, sizeof(wake));
+            (void)wr;
+        }
+        // Join acceptLoop before closing fds so poll and accept4 never see a closed or reused fd.
+        if (m_acceptThread.joinable()) {
+            m_acceptThread.join();
+        }
         if (m_listenFd >= 0) {
-            ::shutdown(m_listenFd, SHUT_RDWR);
             ::close(m_listenFd);
             m_listenFd = -1;
         }
-        if (m_acceptThread.joinable()) {
-            m_acceptThread.join();
+        if (m_wakePipe[0] >= 0) {
+            ::close(m_wakePipe[0]);
+            m_wakePipe[0] = -1;
+        }
+        if (m_wakePipe[1] >= 0) {
+            ::close(m_wakePipe[1]);
+            m_wakePipe[1] = -1;
         }
         std::vector<std::thread> workers;
         {
@@ -196,23 +216,57 @@ class LoopbackHttpServer {
   private:
     void acceptLoop()
     {
-        while (!m_stopped.load()) {
-            sockaddr_in cli{};
-            socklen_t clen = sizeof(cli);
-            int cfd =
-                ::accept4(m_listenFd, reinterpret_cast<sockaddr *>(&cli), &clen, SOCK_CLOEXEC);
-            if (cfd < 0) {
+        const int listenFd = m_listenFd;
+        const int wakeFd = m_wakePipe[0];
+        while (!m_stopped.load(std::memory_order_acquire)) {
+            pollfd fds[2]{};
+            fds[0].fd = listenFd;
+            fds[0].events = POLLIN;
+            fds[1].fd = wakeFd;
+            fds[1].events = POLLIN;
+
+            int prc = ::poll(fds, 2, -1);
+            if (prc < 0) {
                 if (errno == EINTR) {
                     continue;
                 }
                 break;
             }
+            if (m_stopped.load(std::memory_order_acquire) ||
+                (fds[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) != 0) {
+                break;
+            }
+            if ((fds[0].revents & POLLIN) == 0) {
+                if ((fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+                    break;
+                }
+                continue;
+            }
 
-            std::lock_guard<std::mutex> lk(m_workersMutex);
-            m_clientThreads.emplace_back([this, cfd]() {
-                handleClient(cfd);
-                ::close(cfd);
-            });
+            for (;;) {
+                if (m_stopped.load(std::memory_order_acquire)) {
+                    return;
+                }
+                sockaddr_in cli{};
+                socklen_t clen = sizeof(cli);
+                int cfd =
+                    ::accept4(listenFd, reinterpret_cast<sockaddr *>(&cli), &clen, SOCK_CLOEXEC);
+                if (cfd < 0) {
+                    if (errno == EINTR || errno == ECONNABORTED || errno == EPROTO) {
+                        continue;
+                    }
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        break;
+                    }
+                    return;
+                }
+
+                std::lock_guard<std::mutex> lk(m_workersMutex);
+                m_clientThreads.emplace_back([this, cfd]() {
+                    handleClient(cfd);
+                    ::close(cfd);
+                });
+            }
         }
     }
 
@@ -222,6 +276,9 @@ class LoopbackHttpServer {
         char buf[2048];
         while (raw.find("\r\n\r\n") == std::string::npos && raw.size() < 16384) {
             ssize_t r = ::recv(cfd, buf, sizeof(buf), 0);
+            if (r < 0 && errno == EINTR) {
+                continue;
+            }
             if (r <= 0) {
                 break;
             }
@@ -266,6 +323,7 @@ class LoopbackHttpServer {
     }
 
     int m_listenFd{-1};
+    int m_wakePipe[2]{-1, -1};
     uint16_t m_port{0};
     std::atomic<bool> m_stopped{false};
     Handler m_handler;
