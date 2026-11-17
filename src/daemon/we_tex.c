@@ -9,8 +9,10 @@
 
 #include <ctype.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <limits.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 // clang-format off
@@ -179,12 +181,12 @@ static bool is_valid_texs_at(const uint8_t *buf, size_t size, size_t pos, uint32
         }
         uint32_t gw = read_u32_le(buf + c);
         uint32_t gh = read_u32_le(buf + c + 4u);
-        if (gw > 16384u || gh > 16384u) {
+        if (gw == 0u || gh == 0u || gw > 16384u || gh > 16384u) {
             return false;
         }
         c += 8u;
     }
-    if (c + (size_t)fcnt * 32u > size) {
+    if ((size_t)fcnt * 32u > size - c) {
         return false;
     }
     int32_t img_id = read_i32_le(buf + c);
@@ -193,7 +195,7 @@ static bool is_valid_texs_at(const uint8_t *buf, size_t size, size_t pos, uint32
         return false;
     }
     if (out_exact_end) {
-        *out_exact_end = (c + (size_t)fcnt * 32u == size);
+        *out_exact_end = ((size_t)fcnt * 32u == size - c);
     }
     return true;
 }
@@ -302,19 +304,25 @@ bool we_tex_read_magic(const uint8_t *buf, size_t size, size_t *inout_cursor, ch
 typedef int (*pfn_lz4_decompress_safe_t)(const char *src, char *dst, int compressed_size,
                                          int dst_capacity);
 
+static pthread_once_t s_lz4_once = PTHREAD_ONCE_INIT;
+static pfn_lz4_decompress_safe_t s_lz4_decompress_fn = NULL;
+
+static void init_system_lz4_once(void)
+{
+    /* Pin liblz4 with RTLD_NODELETE so concurrent or late callers never hit unmapped code. */
+    void *h = dlopen("liblz4.so.1", RTLD_LAZY | RTLD_LOCAL | RTLD_NODELETE);
+    if (h) {
+        void *sym = dlsym(h, "LZ4_decompress_safe");
+        if (sym) {
+            memcpy(&s_lz4_decompress_fn, &sym, sizeof(s_lz4_decompress_fn));
+        }
+    }
+}
+
 static pfn_lz4_decompress_safe_t get_system_lz4_decompress(void)
 {
-    static int s_init = 0;
-    static pfn_lz4_decompress_safe_t s_fn = NULL;
-    if (!s_init) {
-        void *h = dlopen("liblz4.so.1", RTLD_LAZY | RTLD_LOCAL);
-        if (h) {
-            void *sym = dlsym(h, "LZ4_decompress_safe");
-            memcpy(&s_fn, &sym, sizeof(s_fn));
-        }
-        s_init = 1;
-    }
-    return s_fn;
+    (void)pthread_once(&s_lz4_once, init_system_lz4_once);
+    return s_lz4_decompress_fn;
 }
 
 int we_lz4_decompress_safe(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_cap)
@@ -1112,7 +1120,7 @@ we_tex_t *we_tex_parse_cpu(const uint8_t *data, size_t size)
             if (mip->width == 0 || mip->height == 0 || mip->width > 16384u ||
                 mip->height > 16384u || mip->byte_count == 0 ||
                 mip->byte_count > WE_TEX_MAX_DECOMP_SIZE ||
-                mip->decomp_size > WE_TEX_MAX_DECOMP_SIZE || cursor + mip->byte_count > size) {
+                mip->decomp_size > WE_TEX_MAX_DECOMP_SIZE || mip->byte_count > size - cursor) {
                 we_tex_destroy(tex);
                 return NULL;
             }
@@ -1213,12 +1221,17 @@ we_tex_t *we_tex_parse_cpu(const uint8_t *data, size_t size)
             tex->gif_width = read_u32_le(data + cursor);
             tex->gif_height = read_u32_le(data + cursor + 4u);
             cursor += 8u;
+            if (tex->gif_width == 0u || tex->gif_height == 0u || tex->gif_width > 16384u ||
+                tex->gif_height > 16384u) {
+                we_tex_destroy(tex);
+                return NULL;
+            }
         } else {
             tex->gif_width = tex->image_width;
             tex->gif_height = tex->image_height;
         }
 
-        if (cursor + (size_t)frame_count * 32u > size) {
+        if ((size_t)frame_count * 32u > size - cursor) {
             we_tex_destroy(tex);
             return NULL;
         }
@@ -1234,7 +1247,12 @@ we_tex_t *we_tex_parse_cpu(const uint8_t *data, size_t size)
             we_tex_frame_t *fr = &tex->frames[f];
             fr->image_id = read_i32_le(data + cursor);
             fr->frametime = read_f32_le(data + cursor + 4u);
-            if (fr->frametime <= 0.0f) {
+            if (fr->image_id < 0 || (uint32_t)fr->image_id >= tex->image_count ||
+                !isfinite(fr->frametime) || fr->frametime < 0.0f || fr->frametime > 3600.0f) {
+                we_tex_destroy(tex);
+                return NULL;
+            }
+            if (!(fr->frametime > 0.0f)) {
                 fr->frametime = 1.0f / 30.0f;
             }
             if (texs_ver == 1u) {
@@ -1251,6 +1269,14 @@ we_tex_t *we_tex_parse_cpu(const uint8_t *data, size_t size)
                 fr->width_y = read_f32_le(data + cursor + 20u);
                 fr->height_x = read_f32_le(data + cursor + 24u);
                 fr->height = read_f32_le(data + cursor + 28u);
+            }
+            if (!isfinite(fr->x) || !isfinite(fr->y) || !isfinite(fr->width) ||
+                !isfinite(fr->width_y) || !isfinite(fr->height_x) || !isfinite(fr->height) ||
+                fabsf(fr->x) > 16384.0f || fabsf(fr->y) > 16384.0f || fabsf(fr->width) > 16384.0f ||
+                fabsf(fr->width_y) > 16384.0f || fabsf(fr->height_x) > 16384.0f ||
+                fabsf(fr->height) > 16384.0f) {
+                we_tex_destroy(tex);
+                return NULL;
             }
             cursor += 32u;
         }
@@ -1586,17 +1612,44 @@ bool we_tex_upload_gl(we_tex_t *tex)
     bool has_bptc = exts && (strstr(exts, "GL_EXT_texture_compression_bptc") != NULL);
 
     if (tex->image_count > 1u) {
+        if (tex->frame_gl_texs) {
+            for (uint32_t i = 0; i < tex->image_count; ++i) {
+                if (tex->frame_gl_texs[i] != 0u) {
+                    GLuint t = tex->frame_gl_texs[i];
+                    glDeleteTextures(1, &t);
+                }
+            }
+            free(tex->frame_gl_texs);
+            tex->frame_gl_texs = NULL;
+        }
         tex->frame_gl_texs = (uint32_t *)calloc(tex->image_count, sizeof(uint32_t));
         if (!tex->frame_gl_texs) {
             glPixelStorei(GL_UNPACK_ALIGNMENT, prev_unpack_align);
             glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex2d);
             return false;
         }
+        bool all_ok = true;
         for (uint32_t i = 0; i < tex->image_count; ++i) {
-            tex->frame_gl_texs[i] =
-                upload_single_image_gl(tex, &tex->images[i], has_s3tc, has_bptc);
+            GLuint t = upload_single_image_gl(tex, &tex->images[i], has_s3tc, has_bptc);
+            if (t == 0u) {
+                all_ok = false;
+                break;
+            }
+            tex->frame_gl_texs[i] = t;
         }
-        tex->gl_tex = tex->frame_gl_texs[0];
+        if (!all_ok) {
+            for (uint32_t i = 0; i < tex->image_count; ++i) {
+                if (tex->frame_gl_texs[i] != 0u) {
+                    GLuint t = tex->frame_gl_texs[i];
+                    glDeleteTextures(1, &t);
+                }
+            }
+            free(tex->frame_gl_texs);
+            tex->frame_gl_texs = NULL;
+            tex->gl_tex = 0u;
+        } else {
+            tex->gl_tex = tex->frame_gl_texs[0];
+        }
     } else {
         tex->gl_tex = upload_single_image_gl(tex, &tex->images[0], has_s3tc, has_bptc);
     }
@@ -1688,12 +1741,19 @@ void we_tex_advance_spritesheet(we_tex_t *tex, float dt_sec, float out_translati
         return;
     }
 
-    if (dt_sec > 0.0f) {
+    if (tex->current_frame_idx >= tex->frame_count) {
+        tex->current_frame_idx = 0u;
+    }
+    if (!isfinite(tex->frame_time_accum) || tex->frame_time_accum < 0.0f) {
+        tex->frame_time_accum = 0.0f;
+    }
+
+    if (dt_sec > 0.0f && isfinite(dt_sec)) {
         tex->frame_time_accum += dt_sec;
         uint32_t safety = 0;
-        while (safety++ < 256u) {
+        while (safety < 256u) {
             float cur_dur = tex->frames[tex->current_frame_idx].frametime;
-            if (cur_dur <= 1e-4f) {
+            if (!(cur_dur > 1e-4f && isfinite(cur_dur))) {
                 cur_dur = 1.0f / 30.0f;
             }
             if (tex->frame_time_accum < cur_dur) {
@@ -1701,6 +1761,7 @@ void we_tex_advance_spritesheet(we_tex_t *tex, float dt_sec, float out_translati
             }
             tex->frame_time_accum -= cur_dur;
             tex->current_frame_idx = (tex->current_frame_idx + 1u) % tex->frame_count;
+            safety++;
         }
         if (safety >= 256u) {
             tex->frame_time_accum = 0.0f;
@@ -1718,10 +1779,6 @@ void we_tex_advance_spritesheet(we_tex_t *tex, float dt_sec, float out_translati
 
 #ifdef HAVE_FFMPEG_SWDEC
 typedef struct {
-    void *lib_avcodec;
-    void *lib_avutil;
-    void *lib_swscale;
-
     const AVCodec *(*p_avcodec_find_decoder)(enum AVCodecID id);
     AVCodecContext *(*p_avcodec_alloc_context3)(const AVCodec *codec);
     void (*p_avcodec_free_context)(AVCodecContext **avctx);
@@ -1733,6 +1790,7 @@ typedef struct {
     AVPacket *(*p_av_packet_alloc)(void);
     void (*p_av_packet_free)(AVPacket **pkt);
     void (*p_av_packet_unref)(AVPacket *pkt);
+    int (*p_av_new_packet)(AVPacket *pkt, int size);
     AVFrame *(*p_av_frame_alloc)(void);
     void (*p_av_frame_free)(AVFrame **frame);
     void (*p_av_frame_unref)(AVFrame *frame);
@@ -1745,7 +1803,9 @@ typedef struct {
     int (*p_sws_scale)(struct SwsContext *c, const uint8_t *const srcSlice[], const int srcStride[],
                        int srcSliceY, int srcSliceH, uint8_t *const dst[], const int dstStride[]);
     void (*p_sws_freeContext)(struct SwsContext *swsContext);
+} we_tex_swdec_api_t;
 
+typedef struct {
     AVCodecContext *codec_ctx;
     AVPacket *pkt;
     AVFrame *frame;
@@ -1755,13 +1815,19 @@ typedef struct {
     uint32_t gl_alloc_w;
     uint32_t gl_alloc_h;
     int last_src_fmt;
+    bool eof_flushing;
     bool init_failed;
 } we_tex_swdec_t;
+
+static pthread_once_t s_we_tex_swdec_once = PTHREAD_ONCE_INIT;
+static we_tex_swdec_api_t s_we_tex_swdec_api;
+static bool s_we_tex_swdec_api_ok = false;
 
 static void *we_tex_dlopen_any(const char *const *names, size_t count)
 {
     for (size_t i = 0; i < count; ++i) {
-        void *h = dlopen(names[i], RTLD_LAZY | RTLD_LOCAL);
+        /* Pin FFmpeg DSOs with RTLD_NODELETE so codec worker threads never run unmapped code. */
+        void *h = dlopen(names[i], RTLD_LAZY | RTLD_LOCAL | RTLD_NODELETE);
         if (h) {
             return h;
         }
@@ -1769,32 +1835,96 @@ static void *we_tex_dlopen_any(const char *const *names, size_t count)
     return NULL;
 }
 
+static void we_tex_swdec_probe_once(void)
+{
+    static const char *const avcodec_names[] = {"libavcodec.so.63", "libavcodec.so.62",
+                                                "libavcodec.so.61", "libavcodec.so.60",
+                                                "libavcodec.so.59", "libavcodec.so"};
+    static const char *const avutil_names[] = {"libavutil.so.61", "libavutil.so.60",
+                                               "libavutil.so.59", "libavutil.so.58",
+                                               "libavutil.so.57", "libavutil.so"};
+    static const char *const swscale_names[] = {"libswscale.so.10", "libswscale.so.9",
+                                                "libswscale.so.8",  "libswscale.so.7",
+                                                "libswscale.so.6",  "libswscale.so"};
+
+    memset(&s_we_tex_swdec_api, 0, sizeof(s_we_tex_swdec_api));
+    void *lib_avutil =
+        we_tex_dlopen_any(avutil_names, sizeof(avutil_names) / sizeof(avutil_names[0]));
+    void *lib_avcodec =
+        we_tex_dlopen_any(avcodec_names, sizeof(avcodec_names) / sizeof(avcodec_names[0]));
+    void *lib_swscale =
+        we_tex_dlopen_any(swscale_names, sizeof(swscale_names) / sizeof(swscale_names[0]));
+    if (!lib_avutil || !lib_avcodec || !lib_swscale) {
+        return;
+    }
+
+#define WE_TEX_RESOLVE_SYM(handle, field, sym)                                                     \
+    do {                                                                                           \
+        void *sym_ptr = dlsym(handle, sym);                                                        \
+        if (!sym_ptr) {                                                                            \
+            return;                                                                                \
+        }                                                                                          \
+        memcpy(&s_we_tex_swdec_api.field, &sym_ptr, sizeof(s_we_tex_swdec_api.field));             \
+    } while (0)
+
+    WE_TEX_RESOLVE_SYM(lib_avcodec, p_avcodec_find_decoder, "avcodec_find_decoder");
+    WE_TEX_RESOLVE_SYM(lib_avcodec, p_avcodec_alloc_context3, "avcodec_alloc_context3");
+    WE_TEX_RESOLVE_SYM(lib_avcodec, p_avcodec_free_context, "avcodec_free_context");
+    WE_TEX_RESOLVE_SYM(lib_avcodec, p_avcodec_open2, "avcodec_open2");
+    WE_TEX_RESOLVE_SYM(lib_avcodec, p_avcodec_send_packet, "avcodec_send_packet");
+    WE_TEX_RESOLVE_SYM(lib_avcodec, p_avcodec_receive_frame, "avcodec_receive_frame");
+    WE_TEX_RESOLVE_SYM(lib_avcodec, p_avcodec_flush_buffers, "avcodec_flush_buffers");
+    WE_TEX_RESOLVE_SYM(lib_avcodec, p_av_packet_alloc, "av_packet_alloc");
+    WE_TEX_RESOLVE_SYM(lib_avcodec, p_av_packet_free, "av_packet_free");
+    WE_TEX_RESOLVE_SYM(lib_avcodec, p_av_packet_unref, "av_packet_unref");
+    WE_TEX_RESOLVE_SYM(lib_avcodec, p_av_new_packet, "av_new_packet");
+
+    WE_TEX_RESOLVE_SYM(lib_avutil, p_av_frame_alloc, "av_frame_alloc");
+    WE_TEX_RESOLVE_SYM(lib_avutil, p_av_frame_free, "av_frame_free");
+    WE_TEX_RESOLVE_SYM(lib_avutil, p_av_frame_unref, "av_frame_unref");
+    WE_TEX_RESOLVE_SYM(lib_avutil, p_av_mallocz, "av_mallocz");
+
+    WE_TEX_RESOLVE_SYM(lib_swscale, p_sws_getContext, "sws_getContext");
+    WE_TEX_RESOLVE_SYM(lib_swscale, p_sws_scale, "sws_scale");
+    WE_TEX_RESOLVE_SYM(lib_swscale, p_sws_freeContext, "sws_freeContext");
+
+#undef WE_TEX_RESOLVE_SYM
+    s_we_tex_swdec_api_ok = true;
+}
+
+static bool we_tex_swdec_load_api(void)
+{
+    (void)pthread_once(&s_we_tex_swdec_once, we_tex_swdec_probe_once);
+    return s_we_tex_swdec_api_ok;
+}
+
+static void we_tex_swdec_release_codec(we_tex_swdec_t *sw)
+{
+    if (!sw || !s_we_tex_swdec_api_ok) {
+        return;
+    }
+    const we_tex_swdec_api_t *api = &s_we_tex_swdec_api;
+    if (sw->sws_ctx && api->p_sws_freeContext) {
+        api->p_sws_freeContext(sw->sws_ctx);
+        sw->sws_ctx = NULL;
+    }
+    if (sw->frame && api->p_av_frame_free) {
+        api->p_av_frame_free(&sw->frame);
+    }
+    if (sw->pkt && api->p_av_packet_free) {
+        api->p_av_packet_free(&sw->pkt);
+    }
+    if (sw->codec_ctx && api->p_avcodec_free_context) {
+        api->p_avcodec_free_context(&sw->codec_ctx);
+    }
+}
+
 static void we_tex_swdec_destroy(we_tex_swdec_t *sw)
 {
     if (!sw) {
         return;
     }
-    if (sw->sws_ctx && sw->p_sws_freeContext) {
-        sw->p_sws_freeContext(sw->sws_ctx);
-    }
-    if (sw->frame && sw->p_av_frame_free) {
-        sw->p_av_frame_free(&sw->frame);
-    }
-    if (sw->pkt && sw->p_av_packet_free) {
-        sw->p_av_packet_free(&sw->pkt);
-    }
-    if (sw->codec_ctx && sw->p_avcodec_free_context) {
-        sw->p_avcodec_free_context(&sw->codec_ctx);
-    }
-    if (sw->lib_swscale) {
-        dlclose(sw->lib_swscale);
-    }
-    if (sw->lib_avcodec) {
-        dlclose(sw->lib_avcodec);
-    }
-    if (sw->lib_avutil) {
-        dlclose(sw->lib_avutil);
-    }
+    we_tex_swdec_release_codec(sw);
     free(sw);
 }
 
@@ -1806,6 +1936,9 @@ static bool we_tex_swdec_init(we_tex_t *tex)
     if (tex->video_swdec) {
         we_tex_swdec_t *existing = (we_tex_swdec_t *)tex->video_swdec;
         return !existing->init_failed;
+    }
+    if (!we_tex_swdec_load_api()) {
+        return false;
     }
 
     we_tex_swdec_t *sw = (we_tex_swdec_t *)calloc(1, sizeof(we_tex_swdec_t));
@@ -1838,64 +1971,20 @@ static bool we_tex_swdec_init(we_tex_t *tex)
         return false;
     }
 
-    static const char *const avcodec_names[] = {"libavcodec.so.61", "libavcodec.so.60",
-                                                "libavcodec.so.59", "libavcodec.so"};
-    static const char *const avutil_names[] = {"libavutil.so.59", "libavutil.so.58",
-                                               "libavutil.so.57", "libavutil.so"};
-    static const char *const swscale_names[] = {"libswscale.so.8", "libswscale.so.7",
-                                                "libswscale.so.6", "libswscale.so"};
-
-    sw->lib_avutil =
-        we_tex_dlopen_any(avutil_names, sizeof(avutil_names) / sizeof(avutil_names[0]));
-    sw->lib_avcodec =
-        we_tex_dlopen_any(avcodec_names, sizeof(avcodec_names) / sizeof(avcodec_names[0]));
-    sw->lib_swscale =
-        we_tex_dlopen_any(swscale_names, sizeof(swscale_names) / sizeof(swscale_names[0]));
-    if (!sw->lib_avutil || !sw->lib_avcodec || !sw->lib_swscale) {
-        return false;
-    }
-
-#define WE_TEX_RESOLVE_SYM(handle, field, sym)                                                     \
-    do {                                                                                           \
-        *(void **)(&sw->field) = dlsym(handle, sym);                                               \
-        if (!sw->field)                                                                            \
-            return false;                                                                          \
-    } while (0)
-
-    WE_TEX_RESOLVE_SYM(sw->lib_avcodec, p_avcodec_find_decoder, "avcodec_find_decoder");
-    WE_TEX_RESOLVE_SYM(sw->lib_avcodec, p_avcodec_alloc_context3, "avcodec_alloc_context3");
-    WE_TEX_RESOLVE_SYM(sw->lib_avcodec, p_avcodec_free_context, "avcodec_free_context");
-    WE_TEX_RESOLVE_SYM(sw->lib_avcodec, p_avcodec_open2, "avcodec_open2");
-    WE_TEX_RESOLVE_SYM(sw->lib_avcodec, p_avcodec_send_packet, "avcodec_send_packet");
-    WE_TEX_RESOLVE_SYM(sw->lib_avcodec, p_avcodec_receive_frame, "avcodec_receive_frame");
-    WE_TEX_RESOLVE_SYM(sw->lib_avcodec, p_avcodec_flush_buffers, "avcodec_flush_buffers");
-    WE_TEX_RESOLVE_SYM(sw->lib_avcodec, p_av_packet_alloc, "av_packet_alloc");
-    WE_TEX_RESOLVE_SYM(sw->lib_avcodec, p_av_packet_free, "av_packet_free");
-    WE_TEX_RESOLVE_SYM(sw->lib_avcodec, p_av_packet_unref, "av_packet_unref");
-
-    WE_TEX_RESOLVE_SYM(sw->lib_avutil, p_av_frame_alloc, "av_frame_alloc");
-    WE_TEX_RESOLVE_SYM(sw->lib_avutil, p_av_frame_free, "av_frame_free");
-    WE_TEX_RESOLVE_SYM(sw->lib_avutil, p_av_frame_unref, "av_frame_unref");
-    WE_TEX_RESOLVE_SYM(sw->lib_avutil, p_av_mallocz, "av_mallocz");
-
-    WE_TEX_RESOLVE_SYM(sw->lib_swscale, p_sws_getContext, "sws_getContext");
-    WE_TEX_RESOLVE_SYM(sw->lib_swscale, p_sws_scale, "sws_scale");
-    WE_TEX_RESOLVE_SYM(sw->lib_swscale, p_sws_freeContext, "sws_freeContext");
-
-#undef WE_TEX_RESOLVE_SYM
-
-    const AVCodec *codec = sw->p_avcodec_find_decoder(cid);
+    const we_tex_swdec_api_t *api = &s_we_tex_swdec_api;
+    const AVCodec *codec = api->p_avcodec_find_decoder(cid);
     if (!codec) {
         return false;
     }
 
-    sw->codec_ctx = sw->p_avcodec_alloc_context3(codec);
-    sw->pkt = sw->p_av_packet_alloc();
-    sw->frame = sw->p_av_frame_alloc();
+    sw->codec_ctx = api->p_avcodec_alloc_context3(codec);
+    sw->pkt = api->p_av_packet_alloc();
+    sw->frame = api->p_av_frame_alloc();
     sw->width = demux->width;
     sw->height = demux->height;
     sw->last_src_fmt = -1;
     if (!sw->codec_ctx || !sw->pkt || !sw->frame) {
+        we_tex_swdec_release_codec(sw);
         return false;
     }
 
@@ -1904,15 +1993,22 @@ static bool we_tex_swdec_init(we_tex_t *tex)
     sw->codec_ctx->thread_count = 1;
 
     if (demux->extradata && demux->extradata_size > 0) {
-        sw->codec_ctx->extradata =
-            (uint8_t *)sw->p_av_mallocz(demux->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
-        if (sw->codec_ctx->extradata) {
-            memcpy(sw->codec_ctx->extradata, demux->extradata, demux->extradata_size);
-            sw->codec_ctx->extradata_size = (int)demux->extradata_size;
+        if (demux->extradata_size > (size_t)(INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE)) {
+            we_tex_swdec_release_codec(sw);
+            return false;
         }
+        sw->codec_ctx->extradata =
+            (uint8_t *)api->p_av_mallocz(demux->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+        if (!sw->codec_ctx->extradata) {
+            we_tex_swdec_release_codec(sw);
+            return false;
+        }
+        memcpy(sw->codec_ctx->extradata, demux->extradata, demux->extradata_size);
+        sw->codec_ctx->extradata_size = (int)demux->extradata_size;
     }
 
-    if (sw->p_avcodec_open2(sw->codec_ctx, codec, NULL) < 0) {
+    if (api->p_avcodec_open2(sw->codec_ctx, codec, NULL) < 0) {
+        we_tex_swdec_release_codec(sw);
         return false;
     }
 
@@ -1946,63 +2042,102 @@ bool we_tex_advance_video(we_tex_t *tex, float dt_sec)
 #ifdef HAVE_FFMPEG_SWDEC
     if (we_tex_swdec_init(tex)) {
         we_tex_swdec_t *sw = (we_tex_swdec_t *)tex->video_swdec;
-        for (int tries = 0; tries < 8; ++tries) {
-            if (sw->p_avcodec_receive_frame(sw->codec_ctx, sw->frame) == 0) {
-                if (sw->frame->format != sw->last_src_fmt || !sw->sws_ctx) {
+        const we_tex_swdec_api_t *api = &s_we_tex_swdec_api;
+        bool rewound_this_step = false;
+        for (int tries = 0; tries < 256; ++tries) {
+            int rret = api->p_avcodec_receive_frame(sw->codec_ctx, sw->frame);
+            if (rret == 0) {
+                if (sw->frame->width <= 0 || sw->frame->height <= 0 || sw->frame->width > 8192 ||
+                    sw->frame->height > 8192) {
+                    api->p_av_frame_unref(sw->frame);
+                    return false;
+                }
+                uint32_t fw = (uint32_t)sw->frame->width;
+                uint32_t fh = (uint32_t)sw->frame->height;
+                if ((uint64_t)fw * (uint64_t)fh * 4u > WE_TEX_MAX_DECOMP_SIZE) {
+                    api->p_av_frame_unref(sw->frame);
+                    return false;
+                }
+                if (fw != sw->width || fh != sw->height || sw->frame->format != sw->last_src_fmt ||
+                    !sw->sws_ctx) {
                     if (sw->sws_ctx) {
-                        sw->p_sws_freeContext(sw->sws_ctx);
+                        api->p_sws_freeContext(sw->sws_ctx);
+                        sw->sws_ctx = NULL;
                     }
-                    sw->sws_ctx = sw->p_sws_getContext(
-                        (int)sw->width, (int)sw->height, (enum AVPixelFormat)sw->frame->format,
-                        (int)sw->width, (int)sw->height, AV_PIX_FMT_RGBA, SWS_BILINEAR, NULL, NULL,
-                        NULL);
+                    sw->sws_ctx = api->p_sws_getContext(
+                        (int)fw, (int)fh, (enum AVPixelFormat)sw->frame->format, (int)fw, (int)fh,
+                        AV_PIX_FMT_RGBA, SWS_BILINEAR, NULL, NULL, NULL);
+                    if (!sw->sws_ctx) {
+                        sw->last_src_fmt = -1;
+                        api->p_av_frame_unref(sw->frame);
+                        return false;
+                    }
+                    sw->width = fw;
+                    sw->height = fh;
                     sw->last_src_fmt = sw->frame->format;
                 }
-                if (sw->sws_ctx && tex->image_count > 0 && tex->images &&
-                    tex->images[0].mip_count > 0 && tex->images[0].mips) {
+                if (tex->image_count > 0 && tex->images && tex->images[0].mip_count > 0 &&
+                    tex->images[0].mips) {
                     we_tex_mip_t *mip0 = &tex->images[0].mips[0];
                     size_t req_bytes = (size_t)sw->width * (size_t)sw->height * 4u;
                     if (!mip0->rgba8 || mip0->width != sw->width || mip0->height != sw->height) {
                         if (mip0->rgba8) {
                             image_free(mip0->rgba8);
+                            mip0->rgba8 = NULL;
                         }
                         mip0->rgba8 = (uint8_t *)malloc(req_bytes);
-                    }
-                    if (mip0->rgba8) {
-                        mip0->width = sw->width;
-                        mip0->height = sw->height;
-                        mip0->is_bgra_swiz = false;
-                        tex->image_width = sw->width;
-                        tex->image_height = sw->height;
-                        tex->texture_width = sw->width;
-                        tex->texture_height = sw->height;
-
-                        uint8_t *dst_planes[4] = {mip0->rgba8, NULL, NULL, NULL};
-                        int dst_strides[4] = {(int)(sw->width * 4u), 0, 0, 0};
-                        sw->p_sws_scale(sw->sws_ctx, (const uint8_t *const *)sw->frame->data,
-                                        sw->frame->linesize, 0, (int)sw->height, dst_planes,
-                                        dst_strides);
-
-                        if (tex->gl_tex != 0) {
-                            glActiveTexture(GL_TEXTURE0);
-                            glBindTexture(GL_TEXTURE_2D, (GLuint)tex->gl_tex);
-                            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-                            if (sw->gl_alloc_w != sw->width || sw->gl_alloc_h != sw->height) {
-                                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)sw->width,
-                                             (GLsizei)sw->height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-                                             mip0->rgba8);
-                                sw->gl_alloc_w = sw->width;
-                                sw->gl_alloc_h = sw->height;
-                            } else {
-                                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)sw->width,
-                                                (GLsizei)sw->height, GL_RGBA, GL_UNSIGNED_BYTE,
-                                                mip0->rgba8);
-                            }
+                        if (!mip0->rgba8) {
+                            mip0->width = 0u;
+                            mip0->height = 0u;
+                            api->p_av_frame_unref(sw->frame);
+                            return false;
                         }
+                    }
+                    mip0->width = sw->width;
+                    mip0->height = sw->height;
+                    mip0->is_bgra_swiz = false;
+                    tex->image_width = sw->width;
+                    tex->image_height = sw->height;
+                    tex->texture_width = sw->width;
+                    tex->texture_height = sw->height;
+
+                    uint8_t *dst_planes[4] = {mip0->rgba8, NULL, NULL, NULL};
+                    int dst_strides[4] = {(int)(sw->width * 4u), 0, 0, 0};
+                    if (api->p_sws_scale(sw->sws_ctx, (const uint8_t *const *)sw->frame->data,
+                                         sw->frame->linesize, 0, (int)sw->height, dst_planes,
+                                         dst_strides) <= 0) {
+                        api->p_av_frame_unref(sw->frame);
+                        return false;
+                    }
+
+                    if (tex->gl_tex != 0) {
+                        GLint prev_unpack_align = 4;
+                        GLint prev_active_tex = GL_TEXTURE0;
+                        GLint prev_tex2d = 0;
+                        glGetIntegerv(GL_UNPACK_ALIGNMENT, &prev_unpack_align);
+                        glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active_tex);
+                        glActiveTexture(GL_TEXTURE0);
+                        glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex2d);
+                        glBindTexture(GL_TEXTURE_2D, (GLuint)tex->gl_tex);
+                        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+                        if (sw->gl_alloc_w != sw->width || sw->gl_alloc_h != sw->height) {
+                            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)sw->width,
+                                         (GLsizei)sw->height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                                         mip0->rgba8);
+                            sw->gl_alloc_w = sw->width;
+                            sw->gl_alloc_h = sw->height;
+                        } else {
+                            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)sw->width,
+                                            (GLsizei)sw->height, GL_RGBA, GL_UNSIGNED_BYTE,
+                                            mip0->rgba8);
+                        }
+                        glPixelStorei(GL_UNPACK_ALIGNMENT, prev_unpack_align);
+                        glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex2d);
+                        glActiveTexture((GLenum)prev_active_tex);
                     }
                 }
                 int64_t f_pts_us = sw->frame->pts;
-                sw->p_av_frame_unref(sw->frame);
+                api->p_av_frame_unref(sw->frame);
                 if (f_pts_us > 0) {
                     tex->video_next_pts_sec = (double)f_pts_us * 1e-6 + frame_dur;
                 } else {
@@ -2014,38 +2149,78 @@ bool we_tex_advance_video(we_tex_t *tex, float dt_sec)
                 tex->video_has_first_frame = true;
                 return true;
             }
-
-            demux_packet_t pkt;
-            if (!tex->demuxer->read_packet(tex->demuxer, &pkt)) {
-                if (tex->demuxer->seek_us) {
-                    (void)tex->demuxer->seek_us(tex->demuxer, 0);
-                    tex->video_pts_sec = 0.0;
-                    tex->video_next_pts_sec = 0.0;
+            if (rret == AVERROR_EOF || (rret == AVERROR(EAGAIN) && sw->eof_flushing)) {
+                sw->eof_flushing = false;
+                if (rewound_this_step || !tex->demuxer->seek_us) {
+                    break;
                 }
-                sw->p_avcodec_flush_buffers(sw->codec_ctx);
-                if (!tex->demuxer->read_packet(tex->demuxer, &pkt)) {
+                rewound_this_step = true;
+                if (!tex->demuxer->seek_us(tex->demuxer, 0)) {
+                    break;
+                }
+                tex->video_pts_sec = 0.0;
+                tex->video_next_pts_sec = 0.0;
+                api->p_avcodec_flush_buffers(sw->codec_ctx);
+                continue;
+            }
+            if (rret != AVERROR(EAGAIN)) {
+                break;
+            }
+
+            demux_packet_t pkt = {0};
+            if (!tex->demuxer->read_packet(tex->demuxer, &pkt)) {
+                sw->eof_flushing = true;
+                int dret = api->p_avcodec_send_packet(sw->codec_ctx, NULL);
+                if (dret < 0 && dret != AVERROR_EOF && dret != AVERROR(EAGAIN)) {
+                    sw->eof_flushing = false;
+                    break;
+                }
+                continue;
+            }
+
+            if (!pkt.data || pkt.size == 0 ||
+                pkt.size > (size_t)(INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE)) {
+                break;
+            }
+
+            api->p_av_packet_unref(sw->pkt);
+            if (api->p_av_new_packet(sw->pkt, (int)pkt.size) < 0) {
+                break;
+            }
+            memcpy(sw->pkt->data, pkt.data, pkt.size);
+            memset(sw->pkt->data + pkt.size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+            sw->pkt->pts = pkt.pts_us;
+            sw->pkt->dts = pkt.dts_us;
+            if (pkt.is_keyframe) {
+                sw->pkt->flags |= AV_PKT_FLAG_KEY;
+            }
+
+            int sret = api->p_avcodec_send_packet(sw->codec_ctx, sw->pkt);
+            api->p_av_packet_unref(sw->pkt);
+            if (sret == AVERROR_EOF) {
+                api->p_avcodec_flush_buffers(sw->codec_ctx);
+                continue;
+            }
+            if (sret < 0 && sret != AVERROR(EAGAIN)) {
+                if (sret == AVERROR(ENOMEM) || sret == AVERROR(EINVAL)) {
                     break;
                 }
             }
-            sw->p_av_packet_unref(sw->pkt);
-            sw->pkt->data = (uint8_t *)(uintptr_t)pkt.data;
-            sw->pkt->size = (int)pkt.size;
-            sw->pkt->pts = pkt.pts_us;
-            sw->pkt->dts = pkt.dts_us;
-            (void)sw->p_avcodec_send_packet(sw->codec_ctx, sw->pkt);
         }
-        return true;
+        return false;
     }
 #endif
 
-    demux_packet_t pkt;
-    if (!tex->demuxer->read_packet(tex->demuxer, &pkt)) {
-        if (tex->demuxer->seek_us) {
-            (void)tex->demuxer->seek_us(tex->demuxer, 0);
-            tex->video_pts_sec = 0.0;
-            tex->video_next_pts_sec = 0.0;
-            (void)tex->demuxer->read_packet(tex->demuxer, &pkt);
-        }
+    demux_packet_t pkt = {0};
+    bool got_pkt = tex->demuxer->read_packet(tex->demuxer, &pkt);
+    if (!got_pkt && tex->demuxer->seek_us) {
+        (void)tex->demuxer->seek_us(tex->demuxer, 0);
+        tex->video_pts_sec = 0.0;
+        tex->video_next_pts_sec = 0.0;
+        got_pkt = tex->demuxer->read_packet(tex->demuxer, &pkt);
+    }
+    if (!got_pkt) {
+        return false;
     }
     if (pkt.pts_us > 0) {
         tex->video_next_pts_sec = (double)pkt.pts_us * 1e-6 + frame_dur;

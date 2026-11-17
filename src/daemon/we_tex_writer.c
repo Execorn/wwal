@@ -136,6 +136,16 @@ static bool validate_spec(const we_tex_encode_spec_t *spec, size_t bpp,
                         !mip->pixels ? WE_WRITER_ERR_INVALID_ARG : WE_WRITER_ERR_LIMIT_EXCEEDED);
                 return false;
             }
+            if (m > 0u) {
+                uint32_t prev_w = img->mips[m - 1u].width;
+                uint32_t prev_h = img->mips[m - 1u].height;
+                uint32_t exp_w = (prev_w > 1u) ? (prev_w >> 1u) : 1u;
+                uint32_t exp_h = (prev_h > 1u) ? (prev_h >> 1u) : 1u;
+                if (mip->width != exp_w || mip->height != exp_h) {
+                    set_err(out_err, WE_WRITER_ERR_INVALID_ARG);
+                    return false;
+                }
+            }
             uint64_t expected = (uint64_t)mip->width * (uint64_t)mip->height * (uint64_t)bpp;
             /* Reject payloads above the parser decompression ceiling so output always loads back.
              */
@@ -344,6 +354,119 @@ bool we_tex_write_v5_file(const char *out_path, const we_tex_encode_spec_t *spec
     return ok;
 }
 
+static inline uint8_t norm_f32_to_u8(float v)
+{
+    if (!(v > 0.0f)) {
+        return 0u;
+    }
+    if (v >= 1.0f) {
+        return 255u;
+    }
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+static inline uint8_t linear_f32_to_srgb_u8(float lin)
+{
+    if (!(lin > 0.0f)) {
+        return 0u;
+    }
+    if (lin >= 1.0f) {
+        return 255u;
+    }
+    float s = (lin <= 0.0031308f) ? (lin * 12.92f) : (1.055f * powf(lin, 1.0f / 2.4f) - 0.055f);
+    return norm_f32_to_u8(s);
+}
+
+static void init_srgb_to_linear_lut(float lut[256])
+{
+    for (uint32_t i = 0u; i < 256u; ++i) {
+        float u = (float)i * (1.0f / 255.0f);
+        lut[i] = (u <= 0.04045f) ? (u / 12.92f) : powf((u + 0.055f) / 1.055f, 2.4f);
+    }
+}
+
+static void downsample_mip_2x2(we_tex_format_t format, size_t bpp, const float srgb_lut[256],
+                               const uint8_t *src, uint32_t pw, uint32_t ph, uint8_t *dst,
+                               uint32_t nw, uint32_t nh)
+{
+    for (uint32_t y = 0u; y < nh; ++y) {
+        uint32_t sy0 = y * 2u;
+        uint32_t sy1 = (sy0 + 1u < ph) ? (sy0 + 1u) : sy0;
+        const uint8_t *row0 = src + (size_t)sy0 * (size_t)pw * bpp;
+        const uint8_t *row1 = src + (size_t)sy1 * (size_t)pw * bpp;
+        uint8_t *drow = dst + (size_t)y * (size_t)nw * bpp;
+
+        for (uint32_t x = 0u; x < nw; ++x) {
+            uint32_t sx0 = x * 2u;
+            uint32_t sx1 = (sx0 + 1u < pw) ? (sx0 + 1u) : sx0;
+            const uint8_t *samples[4] = {
+                row0 + (size_t)sx0 * bpp,
+                row0 + (size_t)sx1 * bpp,
+                row1 + (size_t)sx0 * bpp,
+                row1 + (size_t)sx1 * bpp,
+            };
+            uint8_t *dp = drow + (size_t)x * bpp;
+
+            if (format == WE_TEX_FMT_RGBA8888) {
+                float sum_a = 0.0f;
+                float sum_r = 0.0f, sum_g = 0.0f, sum_b = 0.0f;
+                float unprem_r = 0.0f, unprem_g = 0.0f, unprem_b = 0.0f;
+                for (uint32_t k = 0u; k < 4u; ++k) {
+                    const uint8_t *p = samples[k];
+                    float a = (float)p[3] * (1.0f / 255.0f);
+                    float lr = srgb_lut[p[0]];
+                    float lg = srgb_lut[p[1]];
+                    float lb = srgb_lut[p[2]];
+                    sum_a += a;
+                    sum_r += lr * a;
+                    sum_g += lg * a;
+                    sum_b += lb * a;
+                    unprem_r += lr;
+                    unprem_g += lg;
+                    unprem_b += lb;
+                }
+                if (sum_a > 1e-6f) {
+                    /* Divide by sum_a to un-premultiply in linear light without bleeding
+                     * transparent border pixels into visible fringes. */
+                    float inv_a = 1.0f / sum_a;
+                    dp[0] = linear_f32_to_srgb_u8(sum_r * inv_a);
+                    dp[1] = linear_f32_to_srgb_u8(sum_g * inv_a);
+                    dp[2] = linear_f32_to_srgb_u8(sum_b * inv_a);
+                    dp[3] = norm_f32_to_u8(sum_a * 0.25f);
+                } else {
+                    dp[0] = linear_f32_to_srgb_u8(unprem_r * 0.25f);
+                    dp[1] = linear_f32_to_srgb_u8(unprem_g * 0.25f);
+                    dp[2] = linear_f32_to_srgb_u8(unprem_b * 0.25f);
+                    dp[3] = 0u;
+                }
+            } else if (format == WE_TEX_FMT_RG88) {
+                float sum_a = 0.0f;
+                float sum_r = 0.0f;
+                float unprem_r = 0.0f;
+                for (uint32_t k = 0u; k < 4u; ++k) {
+                    const uint8_t *p = samples[k];
+                    float a = (float)p[1] * (1.0f / 255.0f);
+                    float lr = srgb_lut[p[0]];
+                    sum_a += a;
+                    sum_r += lr * a;
+                    unprem_r += lr;
+                }
+                if (sum_a > 1e-6f) {
+                    dp[0] = linear_f32_to_srgb_u8(sum_r / sum_a);
+                    dp[1] = norm_f32_to_u8(sum_a * 0.25f);
+                } else {
+                    dp[0] = linear_f32_to_srgb_u8(unprem_r * 0.25f);
+                    dp[1] = 0u;
+                }
+            } else {
+                uint32_t sum = (uint32_t)samples[0][0] + (uint32_t)samples[1][0] +
+                               (uint32_t)samples[2][0] + (uint32_t)samples[3][0] + 2u;
+                dp[0] = (uint8_t)(sum >> 2u);
+            }
+        }
+    }
+}
+
 bool we_tex_generate_mips(we_tex_format_t format, uint32_t width, uint32_t height,
                           const uint8_t *level0_pixels, we_tex_encode_mip_t **out_mips,
                           uint32_t *out_mip_count)
@@ -393,6 +516,11 @@ bool we_tex_generate_mips(we_tex_format_t format, uint32_t width, uint32_t heigh
     mips[0].pixels = l0_copy;
     mips[0].byte_size = (size_t)l0_bytes;
 
+    float srgb_lut[256];
+    if (count > 1u && format != WE_TEX_FMT_R8) {
+        init_srgb_to_linear_lut(srgb_lut);
+    }
+
     for (uint32_t level = 1u; level < count; ++level) {
         const we_tex_encode_mip_t *prev = &mips[level - 1u];
         uint32_t pw = prev->width;
@@ -407,29 +535,7 @@ bool we_tex_generate_mips(we_tex_format_t format, uint32_t width, uint32_t heigh
             return false;
         }
 
-        for (uint32_t y = 0u; y < nh; ++y) {
-            uint32_t sy0 = y * 2u;
-            uint32_t sy1 = (sy0 + 1u < ph) ? (sy0 + 1u) : sy0;
-            const uint8_t *row0 = prev->pixels + (size_t)sy0 * (size_t)pw * bpp;
-            const uint8_t *row1 = prev->pixels + (size_t)sy1 * (size_t)pw * bpp;
-            uint8_t *drow = dst + (size_t)y * (size_t)nw * bpp;
-
-            for (uint32_t x = 0u; x < nw; ++x) {
-                uint32_t sx0 = x * 2u;
-                uint32_t sx1 = (sx0 + 1u < pw) ? (sx0 + 1u) : sx0;
-                const uint8_t *p00 = row0 + (size_t)sx0 * bpp;
-                const uint8_t *p10 = row0 + (size_t)sx1 * bpp;
-                const uint8_t *p01 = row1 + (size_t)sx0 * bpp;
-                const uint8_t *p11 = row1 + (size_t)sx1 * bpp;
-                uint8_t *dp = drow + (size_t)x * bpp;
-
-                for (size_t c = 0u; c < bpp; ++c) {
-                    uint32_t sum = (uint32_t)p00[c] + (uint32_t)p10[c] + (uint32_t)p01[c] +
-                                   (uint32_t)p11[c] + 2u;
-                    dp[c] = (uint8_t)(sum >> 2u);
-                }
-            }
-        }
+        downsample_mip_2x2(format, bpp, srgb_lut, prev->pixels, pw, ph, dst, nw, nh);
 
         mips[level].width = nw;
         mips[level].height = nh;
