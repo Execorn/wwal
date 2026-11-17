@@ -9,15 +9,18 @@
  * and GLSL shader metadata parser, while asserting critical struct layout invariants.
  */
 
-#include <iostream>
-#include <vector>
-#include <string_view>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
+#include <string_view>
+#include <type_traits>
+#include <vector>
 
-// Include every public waywal/*.h header to verify C++23 compatibility
+// Include every public waywal/*.h header (57/57) to verify C++23 compatibility
 #include "waywal/anim_engine.h"
 #include "waywal/arena.h"
 #include "waywal/audio_fft.h"
@@ -27,6 +30,9 @@
 #include "waywal/gif_transcode.h"
 #include "waywal/image_loader.h"
 #include "waywal/ipc_proto.h"
+#include "waywal/ipc_proto_authoring.h"
+#include "waywal/ipc_proto_phase3.h"
+#include "waywal/ipc_proto_rigging.h"
 #include "waywal/log.h"
 #include "waywal/mpris.h"
 #include "waywal/os_compat.h"
@@ -39,6 +45,7 @@
 #include "waywal/render_engine.h"
 #include "waywal/security.h"
 #include "waywal/shader_engine.h"
+#include "waywal/shader_graph.h"
 #include "waywal/shader_parser.h"
 #include "waywal/slideshow.h"
 #include "waywal/solar_schedule.h"
@@ -50,8 +57,18 @@
 #include "waywal/vaapi_dec.h"
 #include "waywal/video_decoder.h"
 #include "waywal/video_engine.h"
+#include "waywal/we_appworkshop.h"
+#include "waywal/we_asset_writer.h"
+#include "waywal/we_builtin_effects.h"
+#include "waywal/we_camera3d.h"
+#include "waywal/we_compat_scanner.h"
+#include "waywal/we_gpu_brush.h"
 #include "waywal/we_json.h"
+#include "waywal/we_mdl_writer.h"
+#include "waywal/we_mesh_cdt.h"
+#include "waywal/we_mesh_rig.h"
 #include "waywal/we_particle.h"
+#include "waywal/we_physics.h"
 #include "waywal/we_pkg.h"
 #include "waywal/we_project.h"
 #include "waywal/we_puppet.h"
@@ -60,9 +77,7 @@
 #include "waywal/we_shader.h"
 #include "waywal/we_tex.h"
 #include "waywal/we_vdf.h"
-#include "waywal/we_appworkshop.h"
 #include "waywal/wwpkg.h"
-#include "waywal/we_compat_scanner.h"
 
 // ----------------------------------------------------------------------------
 // Compile-time Struct Packing & Offset Assertions
@@ -89,6 +104,36 @@ static_assert(sizeof(waywal_ipc_req_scan_compat_t) == 1028, "Must be 1028 bytes"
 static_assert(sizeof(waywal_ipc_resp_scan_compat_t) == 1052, "Must be 1052 bytes");
 
 static_assert(sizeof(wwpkg_signature_t) == 216, "Must be 216 bytes with zero hidden padding");
+
+// C++23 ABI and layout invariants across authoring, shader-graph, rigging, and engine public
+// headers
+static_assert(std::is_standard_layout_v<waywal_ipc_hdr_t>);
+static_assert(std::is_trivially_copyable_v<waywal_ipc_hdr_t>);
+static_assert(std::is_standard_layout_v<waywal_img_metadata_t>);
+static_assert(std::is_trivially_copyable_v<waywal_img_metadata_t>);
+static_assert(std::is_standard_layout_v<waywal_ipc_req_scene_mutate_t>);
+static_assert(std::is_trivially_copyable_v<waywal_ipc_req_scene_mutate_t>);
+static_assert(std::is_standard_layout_v<waywal_ipc_req_compile_shader_graph_t>);
+static_assert(std::is_trivially_copyable_v<waywal_ipc_req_compile_shader_graph_t>);
+static_assert(std::is_standard_layout_v<waywal_ipc_puppet_preview_ik_ext_t>);
+static_assert(std::is_trivially_copyable_v<waywal_ipc_puppet_preview_ik_ext_t>);
+static_assert(std::is_standard_layout_v<waywal_shader_graph_t>);
+static_assert(std::is_standard_layout_v<we_builtin_effect_desc_t>);
+static_assert(std::is_standard_layout_v<we_camera3d_t>);
+static_assert(std::is_standard_layout_v<we_brush_params_t>);
+static_assert(std::is_standard_layout_v<we_bone_sim_config_t>);
+static_assert(std::is_standard_layout_v<we_tex_encode_spec_t>);
+static_assert(std::is_standard_layout_v<we_mesh_gen_cfg_t>);
+static_assert(std::is_standard_layout_v<we_heat_skin_cfg_t>);
+static_assert(std::is_standard_layout_v<we_mdl_write_opts_t>);
+static_assert(std::is_same_v<std::underlying_type_t<waywal_pin_type_t>, uint32_t>);
+static_assert(std::is_same_v<std::underlying_type_t<we_asset_writer_err_t>, uint32_t>);
+static_assert(std::is_same_v<std::underlying_type_t<we_builtin_effect_id_t>, uint32_t>);
+static_assert(std::is_same_v<std::underlying_type_t<we_projection_mode_t>, uint32_t>);
+static_assert(std::is_same_v<std::underlying_type_t<we_brush_channel_t>, uint32_t>);
+static_assert(std::is_same_v<std::underlying_type_t<we_bone_phys_flags_t>, uint32_t>);
+static_assert(std::is_same_v<std::underlying_type_t<we_bone_drive_mode_t>, uint32_t>);
+static_assert(std::is_same_v<std::underlying_type_t<we_scene_mutate_op_t>, uint32_t>);
 
 static void test_bezier_solver()
 {
@@ -332,6 +377,92 @@ static void test_workshop_and_wwpkg_cxx23_interop()
     std::cout << "  -> Workshop & WWPKG C23 Modules interop passed." << std::endl;
 }
 
+static void test_authoring_graph_rigging_cxx23_interop()
+{
+    std::cout << "[Core C++23] Testing Shader Graph, Asset Writer, Camera3D & Rigging IPC..."
+              << std::endl;
+
+    // 1. Shader Graph C23 API interop
+    waywal_shader_graph_t *graph = waywal_shader_graph_create();
+    assert(graph != nullptr && "waywal_shader_graph_create must succeed");
+    const int32_t n_uv = waywal_shader_graph_add_node(graph, WAYWAL_NODE_IN_UV, "UV", 0.0f, 0.0f);
+    const int32_t n_out =
+        waywal_shader_graph_add_node(graph, WAYWAL_NODE_OUT_IMAGE_PASS, "Out", 200.0f, 0.0f);
+    assert(n_uv > 0 && n_out > 0);
+    const int32_t edge = waywal_shader_graph_connect(graph, static_cast<uint32_t>(n_uv), 0u,
+                                                     static_cast<uint32_t>(n_out), 0u);
+    assert(edge > 0);
+
+    waywal_graph_schedule_t sched{};
+    assert(waywal_shader_graph_analyze(graph, &sched));
+    assert(sched.has_cycle_error == 0u);
+    size_t glsl_len = 0;
+    char *glsl = waywal_shader_graph_compile_glsl(graph, &sched, &glsl_len);
+    assert(glsl != nullptr && glsl_len > 0);
+    std::free(glsl);
+    waywal_shader_graph_destroy(graph);
+
+    // 2. Asset Writer path normalization, LZ4 compression, and PKGV0022 round-trip
+    char norm_path[WE_PKG_MAX_PATH_LEN]{};
+    uint32_t norm_len = 0;
+    assert(we_normalize_rel_path("Shaders\\Effect.FRAG", norm_path, sizeof(norm_path), &norm_len));
+    assert(std::string_view(norm_path, norm_len) == "shaders/effect.frag");
+    assert(!we_normalize_rel_path("../escape.frag", norm_path, sizeof(norm_path), &norm_len));
+
+    const uint8_t payload[] = "waywal_cxx23_lz4_payload_waywal_cxx23_lz4_payload";
+    const size_t bound = we_lz4_compress_bound(sizeof(payload) - 1u);
+    assert(bound > 0);
+    std::vector<uint8_t> lz4_buf(bound);
+    const size_t comp_sz =
+        we_lz4_compress_block(payload, sizeof(payload) - 1u, lz4_buf.data(), lz4_buf.size());
+    assert(comp_sz > 0 && comp_sz <= bound);
+
+    const we_pkg_write_entry_t entries[] = {
+        {norm_path, payload, sizeof(payload) - 1u},
+    };
+    uint8_t *pkg_bytes = nullptr;
+    size_t pkg_size = 0;
+    we_asset_writer_err_t werr = WE_WRITER_ERR_IO;
+    assert(we_pkg_write_mem(entries, 1u, &pkg_bytes, &pkg_size, &werr));
+    assert(werr == WE_WRITER_OK && pkg_bytes != nullptr && pkg_size > 0);
+
+    we_pkg_t *opened = we_pkg_open_mem(pkg_bytes, pkg_size, nullptr);
+    assert(opened != nullptr && opened->entry_count == 1u);
+    size_t found_sz = 0;
+    const uint8_t *found = we_pkg_find(opened, "shaders/effect.frag", &found_sz);
+    assert(found != nullptr && found_sz == sizeof(payload) - 1u);
+    assert(std::memcmp(found, payload, found_sz) == 0);
+    we_pkg_close(opened);
+    std::free(pkg_bytes);
+
+    // 3. Authoring, Camera3D & Rigging header interop
+    waywal_ipc_hdr_t hdr{};
+    waywal_ipc_req_set_camera_3d_t cam_req{};
+    const float eye[3] = {0.0f, 0.0f, 5.0f};
+    const float tgt[3] = {0.0f, 0.0f, 0.0f};
+    const float up[3] = {0.0f, 1.0f, 0.0f};
+    const float par[2] = {0.1f, 0.1f};
+    assert(waywal_ipc_serialize_req_set_camera_3d(
+        "*", WE_PROJ_PERSPECTIVE_3D, WAYWAL_CAMERA_FLAG_ENABLE_DOF, eye, tgt, up, 60.0f, 0.1f,
+        100.0f, par, 0.2f, 5.0f, 1.0f, 2.0f, &hdr, &cam_req));
+    assert(hdr.opcode == WAYWAL_REQ_SET_CAMERA_3D);
+    assert(waywal_ipc_validate_req_set_camera_3d(&cam_req, hdr.payload_size));
+
+    uint64_t mesh_bytes = 0;
+    assert(waywal_ipc_rigging_calc_mesh_bytes(64u, 96u, &mesh_bytes));
+    assert(mesh_bytes == sizeof(waywal_ipc_puppet_set_mesh_t) +
+                             64ull * sizeof(waywal_ipc_mdl_vertex_t) + 96ull * 6ull);
+    assert(waywal_ipc_rigging_expects_generic_ok(WAYWAL_REQ_PUPPET_SCRUB_TIME));
+    assert(!waywal_ipc_rigging_expects_generic_ok(WAYWAL_REQ_PUPPET_SOLVE_WEIGHTS));
+
+    uint8_t flow_r = 0;
+    uint8_t flow_g = 0;
+    we_brush_encode_flow_u8(0.0f, 0.0f, &flow_r, &flow_g);
+    assert(flow_r == WE_BRUSH_FLOW_NEUTRAL_U8 && flow_g == WE_BRUSH_FLOW_NEUTRAL_U8);
+
+    std::cout << "  -> Shader Graph, Asset Writer, Camera3D & Rigging interop passed." << std::endl;
+}
+
 int main()
 {
     std::cout << "==========================================================" << std::endl;
@@ -343,6 +474,7 @@ int main()
     test_we_json_parser();
     test_shader_parser();
     test_workshop_and_wwpkg_cxx23_interop();
+    test_authoring_graph_rigging_cxx23_interop();
 
     std::cout << "==========================================================" << std::endl;
     std::cout << "  >>> CORE C++23 COMPATIBILITY PASSED CLEANLY (100%) <<<  " << std::endl;

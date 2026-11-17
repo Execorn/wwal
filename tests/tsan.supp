@@ -1,0 +1,43 @@
+# TSan suppressions for uninstrumented external third-party libraries.
+# Keep all waywal, wwal*, and we_* symbols unsuppressed.
+
+# Uninstrumented GPU, EGL/GL, DRI, VA-API, and DRM driver libraries synchronize
+# internally via driver locks and kernel fences without TSan instrumentation.
+race:libnvidia*.so*
+race:libGL*.so*
+race:libEGL*.so*
+race:libgallium*.so*
+race:radeonsi*.so*
+race:iris*.so*
+race:swrast_dri.so*
+race:libva*.so*
+race:libdrm*.so*
+
+# Uninstrumented Qt6, desktop theme plugins, GLib, DBus, and SQLite synchronize
+# internally via futexes and native atomics invisible to TSan happens-before tracking.
+race:libQt6*.so*
+race:libqt6engine*.so*
+race:libKF6*.so*
+race:libglib*.so*
+race:libgobject*.so*
+race:libgio*.so*
+race:libdbus*.so*
+race:libsqlite3*.so*
+
+# DBus internal connection teardown triggers a benign lock-order-inversion report.
+deadlock:libdbus*.so*
+
+# Qt6 (QDBusConnectionManager, QThreadPool), GLib (gmain), and Mesa Gallium
+# keep process-global background worker threads alive past main() exit.
+thread:libQt6Core.so*
+thread:libQt6DBus.so*
+thread:libQt6Gui.so*
+thread:libQt6Widgets.so*
+thread:libglib*.so*
+thread:libgio*.so*
+thread:libdbus*.so*
+thread:libgallium*.so*
+thread:swrast_dri.so*
+
+# GCC libgomp uses uninstrumented futex fork/join barriers when OMP_NUM_THREADS > 1.
+race:libgomp*.so*
