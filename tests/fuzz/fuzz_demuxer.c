@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "fuzz_harness.h"
 #include "waywal/demuxer.h"
 
 #include <fcntl.h>
-#include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -12,7 +12,7 @@
 #include <unistd.h>
 
 #ifndef WWAL_FUZZ_VERBOSE
-static void silence_stdio_once(void)
+static void silence_stderr_once(void)
 {
     static bool silenced = false;
     if (silenced)
@@ -20,77 +20,20 @@ static void silence_stdio_once(void)
     silenced = true;
     int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
     if (null_fd >= 0) {
-        dup2(null_fd, STDOUT_FILENO);
         dup2(null_fd, STDERR_FILENO);
         close(null_fd);
     }
 }
 #endif
 
-static bool read_vint_checked(const uint8_t *data, size_t limit, size_t *off, uint64_t *val,
-                              bool mask)
-{
-    if (*off >= limit)
-        return false;
-    uint8_t first = data[*off];
-    if (first == 0)
-        return false;
-    uint32_t len = 1;
-    uint8_t m = 0x80;
-    while (!(first & m)) {
-        len++;
-        m >>= 1;
-        if (len > 8)
-            return false;
-    }
-    if (*off + len > limit)
-        return false;
-    uint64_t v = mask ? (first & (m - 1)) : first;
-    for (uint32_t i = 1; i < len; ++i) {
-        v = (v << 8) | data[*off + i];
-    }
-    *off += len;
-    *val = v;
-    return true;
-}
-
-static bool ebml_subelements_within_bounds(const uint8_t *data, size_t start, size_t end, int depth)
-{
-    if (depth > 4)
-        return true;
-    size_t off = start;
-    while (off < end) {
-        uint64_t id = 0, sz = 0;
-        if (!read_vint_checked(data, end, &off, &id, false))
-            return false;
-        if (!read_vint_checked(data, end, &off, &sz, true))
-            return false;
-        if (sz > end - off)
-            return false;
-        if (id == 0x18538067ULL || id == 0x1549A966ULL || id == 0x1654AE6BULL || id == 0xAEULL ||
-            id == 0xE0ULL || id == 0x1F43B675ULL) {
-            if (!ebml_subelements_within_bounds(data, off, off + (size_t)sz, depth + 1))
-                return false;
-        }
-        off += (size_t)sz;
-    }
-    return off == end;
-}
-
-int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
-    if (!data || size > 65536)
+    if (!data)
         return 0;
 
 #ifndef WWAL_FUZZ_VERBOSE
-    silence_stdio_once();
+    silence_stderr_once();
 #endif
-
-    if (size >= 4 && data[0] == 0x1A && data[1] == 0x45 && data[2] == 0xDF && data[3] == 0xA3) {
-        if (!ebml_subelements_within_bounds(data, 0, size, 0))
-            return 0;
-    }
 
     demuxer_t *d = demuxer_open_mem(data, size);
     if (!d)
@@ -339,80 +282,70 @@ static size_t build_seed_webm(uint8_t *buf, size_t max_size)
     return sizeof(tpl);
 }
 
-static uint32_t xorshift32(uint32_t *state)
+static size_t build_seed_mp4_wraparound_68b(uint8_t *buf, size_t cap)
 {
-    uint32_t x = *state;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    *state = x;
-    return x;
+    if (cap < 68u) {
+        return 0u;
+    }
+    memset(buf, 0, 68u);
+    /* ftyp box + nested moov/trak with 64-bit box_size=1 wraparound trigger. */
+    write_u32_be(buf + 0, 20u);
+    write_u32_be(buf + 4, FOURCC('f', 't', 'y', 'p'));
+    write_u32_be(buf + 8, FOURCC('i', 's', 'o', 'm'));
+    write_u32_be(buf + 12, 0x200u);
+    write_u32_be(buf + 16, FOURCC('m', 'p', '4', '1'));
+
+    write_u32_be(buf + 20, 48u);
+    write_u32_be(buf + 24, FOURCC('m', 'o', 'o', 'v'));
+    write_u32_be(buf + 28, 1u);
+    write_u32_be(buf + 32, FOURCC('t', 'r', 'a', 'k'));
+    /* 64-bit largesize near UINT64_MAX to stress offset+size overflow checks. */
+    memset(buf + 36, 0xFF, 7);
+    buf[43] = 0xFCu;
+    return 68u;
 }
 
-int main(int argc, char **argv)
+static void run_builtin_demuxer_corpus(void)
 {
-    if (argc > 1) {
-        for (int i = 1; i < argc; ++i) {
-            FILE *fp = fopen(argv[i], "rb");
-            if (!fp)
-                continue;
-            fseek(fp, 0, SEEK_END);
-            long len = ftell(fp);
-            fseek(fp, 0, SEEK_SET);
-            if (len >= 0 && len <= 65536) {
-                uint8_t *buf = (uint8_t *)malloc((size_t)len + 1);
-                if (buf) {
-                    size_t n = fread(buf, 1, (size_t)len, fp);
-                    LLVMFuzzerTestOneInput(buf, n);
-                    free(buf);
-                }
-            }
-            fclose(fp);
-        }
-        return 0;
-    }
-
-    int saved_stdout = dup(STDOUT_FILENO);
-
-    uint8_t empty = 0;
-    LLVMFuzzerTestOneInput(&empty, 0);
-    LLVMFuzzerTestOneInput(&empty, 1);
+    uint8_t empty = 0u;
+    (void)LLVMFuzzerTestOneInput(&empty, 0u);
+    (void)LLVMFuzzerTestOneInput(&empty, 1u);
 
     uint8_t seed_mp4[2048];
     size_t mp4_len = build_seed_mp4(seed_mp4, sizeof(seed_mp4));
-    LLVMFuzzerTestOneInput(seed_mp4, mp4_len);
-
-    for (size_t cut = 1; cut < mp4_len; cut += 7) {
-        LLVMFuzzerTestOneInput(seed_mp4, cut);
+    for (size_t cut = 1u; cut < mp4_len; cut += 7u) {
+        (void)LLVMFuzzerTestOneInput(seed_mp4, cut);
     }
 
     uint8_t seed_webm[512];
     size_t webm_len = build_seed_webm(seed_webm, sizeof(seed_webm));
-    LLVMFuzzerTestOneInput(seed_webm, webm_len);
-
-    for (size_t cut = 1; cut < webm_len; cut += 3) {
-        LLVMFuzzerTestOneInput(seed_webm, cut);
+    for (size_t cut = 1u; cut < webm_len; cut += 3u) {
+        (void)LLVMFuzzerTestOneInput(seed_webm, cut);
     }
 
-    uint32_t rng = 0xC0FFEE11U;
-    uint8_t mutated[2048];
-    for (int iter = 0; iter < 512; ++iter) {
-        bool use_mp4 = (iter & 1) == 0;
-        const uint8_t *src = use_mp4 ? seed_mp4 : seed_webm;
-        size_t len = use_mp4 ? mp4_len : webm_len;
-        memcpy(mutated, src, len);
-        uint32_t flips = (xorshift32(&rng) % 6U) + 1U;
-        for (uint32_t f = 0; f < flips; ++f) {
-            size_t pos = xorshift32(&rng) % len;
-            mutated[pos] ^= (uint8_t)(xorshift32(&rng) & 0xFFU);
-        }
-        LLVMFuzzerTestOneInput(mutated, len);
-    }
+    /* Include truncated EBML sizes and oversized MP4 box regression seed. */
+    static const uint8_t bad_ebml[] = {
+        0x1Au, 0x45u, 0xDFu, 0xA3u, 0xFFu, 0x18u, 0x53u, 0x80u, 0x67u, 0x01u, 0xFFu, 0xFFu,
+        0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0x1Fu, 0x43u, 0xB6u, 0x75u, 0x84u, 0xE7u, 0x81u,
+    };
+    uint8_t wrap_mp4[68];
+    size_t wrap_len = build_seed_mp4_wraparound_68b(wrap_mp4, sizeof(wrap_mp4));
 
-    if (saved_stdout >= 0) {
-        dprintf(saved_stdout, "[FUZZ] fuzz_demuxer standalone corpus smoke test PASSED.\n");
-        close(saved_stdout);
+    wwal_fuzz_sample_t seeds[4];
+    size_t seed_count = 0u;
+    if (mp4_len > 0u) {
+        seeds[seed_count++] = (wwal_fuzz_sample_t){seed_mp4, mp4_len};
     }
-    return 0;
+    if (webm_len > 0u) {
+        seeds[seed_count++] = (wwal_fuzz_sample_t){seed_webm, webm_len};
+    }
+    if (wrap_len > 0u) {
+        seeds[seed_count++] = (wwal_fuzz_sample_t){wrap_mp4, wrap_len};
+    }
+    seeds[seed_count++] = (wwal_fuzz_sample_t){bad_ebml, sizeof(bad_ebml)};
+
+    wwal_fuzz_run_mutations(seeds, seed_count, 0xC0FFEE11u, 512u, 2048u);
 }
+
+WWAL_FUZZ_HARNESS_MAIN("fuzz_demuxer", NULL, run_builtin_demuxer_corpus, NULL)
 #endif

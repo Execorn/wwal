@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "fuzz_harness.h"
 #include "waywal/ipc_proto.h"
 #include "waywal/ipc_proto_rigging.h"
 #include "waywal/we_mdl_writer.h"
@@ -302,8 +303,6 @@ static void fuzz_rigging_ipc_validators(const uint8_t *data, size_t size)
         &(const waywal_ipc_puppet_mesh_ack_t *){NULL});
 }
 
-int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
-
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     if (!data || size == 0u) {
@@ -318,21 +317,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 }
 
 #ifdef WWAL_FUZZ_STANDALONE
-
-typedef struct {
-    const uint8_t *bytes;
-    size_t len;
-} fuzz_seed_t;
-
-static uint32_t xorshift32(uint32_t *state)
-{
-    uint32_t x = *state;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    *state = x;
-    return x;
-}
 
 static void build_seed_mdl(uint8_t **out_bytes, size_t *out_len)
 {
@@ -418,10 +402,8 @@ static void build_seed_mdl(uint8_t **out_bytes, size_t *out_len)
     }
 }
 
-int main(void)
+static void run_builtin_rigging_corpus(void)
 {
-    printf("[FUZZ] Starting fuzz_rigging_parsers standalone fuzzing harness...\n");
-
     uint8_t *mdl_seed = NULL;
     size_t mdl_seed_len = 0u;
     build_seed_mdl(&mdl_seed, &mdl_seed_len);
@@ -460,54 +442,35 @@ int main(void)
         "{\"stiffness\":\"bad\",\"mass\":1e99,\"nested\":[[[[1,2,3]]]]}";
     static const uint8_t seed_mdl_hdr[] = "MDLV0023\x00\x02\x00\x00\x00\xff\xff\xff\xff";
     static const uint8_t seed_mdl_alt[] = "MDLV0013\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    /* 24-byte CDT regression input stressing hole loops, Bridson seeding, and grid clamping. */
+    static const uint8_t seed_cdt_24b[24] = {
+        0x35u, 0x03u, 0xFFu, 0x00u, 0xFFu, 0x7Fu, 0xFEu, 0xFFu, 0x80u, 0xFFu, 0x00u, 0xFEu,
+        0x01u, 0x40u, 0x00u, 0x01u, 0xFFu, 0x00u, 0xFFu, 0xFFu, 0x00u, 0x80u, 0xFFu, 0x00u,
+    };
+    _Static_assert(sizeof(seed_cdt_24b) == 24u, "24B CDT regression seed must stay 24 bytes");
     static const uint8_t seed_zeros[64] = {0};
 
-    fuzz_seed_t corpus[8];
+    wwal_fuzz_sample_t corpus[9];
     size_t corpus_count = 0u;
     if (mdl_seed && mdl_seed_len > 0u) {
-        corpus[corpus_count++] = (fuzz_seed_t){mdl_seed, mdl_seed_len};
+        corpus[corpus_count++] = (wwal_fuzz_sample_t){mdl_seed, mdl_seed_len};
     }
     if (ipc_mesh_len > 0u) {
-        corpus[corpus_count++] = (fuzz_seed_t){ipc_mesh_buf, ipc_mesh_len};
+        corpus[corpus_count++] = (wwal_fuzz_sample_t){ipc_mesh_buf, ipc_mesh_len};
     }
     if (ipc_skel_len > 0u) {
-        corpus[corpus_count++] = (fuzz_seed_t){ipc_skel_buf, ipc_skel_len};
+        corpus[corpus_count++] = (wwal_fuzz_sample_t){ipc_skel_buf, ipc_skel_len};
     }
-    corpus[corpus_count++] = (fuzz_seed_t){seed_json0, sizeof(seed_json0) - 1u};
-    corpus[corpus_count++] = (fuzz_seed_t){seed_json1, sizeof(seed_json1) - 1u};
-    corpus[corpus_count++] = (fuzz_seed_t){seed_mdl_hdr, sizeof(seed_mdl_hdr) - 1u};
-    corpus[corpus_count++] = (fuzz_seed_t){seed_mdl_alt, sizeof(seed_mdl_alt) - 1u};
-    corpus[corpus_count++] = (fuzz_seed_t){seed_zeros, sizeof(seed_zeros)};
+    corpus[corpus_count++] = (wwal_fuzz_sample_t){seed_json0, sizeof(seed_json0) - 1u};
+    corpus[corpus_count++] = (wwal_fuzz_sample_t){seed_json1, sizeof(seed_json1) - 1u};
+    corpus[corpus_count++] = (wwal_fuzz_sample_t){seed_mdl_hdr, sizeof(seed_mdl_hdr) - 1u};
+    corpus[corpus_count++] = (wwal_fuzz_sample_t){seed_mdl_alt, sizeof(seed_mdl_alt) - 1u};
+    corpus[corpus_count++] = (wwal_fuzz_sample_t){seed_cdt_24b, sizeof(seed_cdt_24b)};
+    corpus[corpus_count++] = (wwal_fuzz_sample_t){seed_zeros, sizeof(seed_zeros)};
 
-    for (size_t i = 0u; i < corpus_count; ++i) {
-        LLVMFuzzerTestOneInput(corpus[i].bytes, corpus[i].len);
-    }
-
-    const int MUTATION_ROUNDS = 2500;
-    uint32_t rng = 0x51A9F00DU;
-    uint8_t mut_buf[4096];
-
-    for (int r = 0; r < MUTATION_ROUNDS; ++r) {
-        size_t base_idx = xorshift32(&rng) % corpus_count;
-        size_t base_len = corpus[base_idx].len;
-        size_t len = base_len < sizeof(mut_buf) ? base_len : sizeof(mut_buf);
-        memcpy(mut_buf, corpus[base_idx].bytes, len);
-
-        uint32_t flips = (xorshift32(&rng) % 10u) + 1u;
-        for (uint32_t f = 0u; f < flips; ++f) {
-            if (len > 0u) {
-                size_t p = xorshift32(&rng) % len;
-                mut_buf[p] ^= (uint8_t)(xorshift32(&rng) & 0xFFu);
-            }
-        }
-
-        size_t test_len = (len > 0u) ? ((xorshift32(&rng) % len) + 1u) : 0u;
-        LLVMFuzzerTestOneInput(mut_buf, test_len);
-    }
-
+    wwal_fuzz_run_mutations(corpus, corpus_count, 0x51A9F00Du, 2500u, 4096u);
     we_mdl_write_free(mdl_seed);
-    printf("[FUZZ] fuzz_rigging_parsers (%d mutation rounds) PASSED CLEANLY (100%%).\n",
-           MUTATION_ROUNDS);
-    return 0;
 }
+
+WWAL_FUZZ_HARNESS_MAIN("fuzz_rigging_parsers", NULL, run_builtin_rigging_corpus, NULL)
 #endif
