@@ -24,25 +24,29 @@ BuildRequires:  pkgconfig(liburing)
 BuildRequires:  pkgconfig(libseccomp)
 BuildRequires:  pkgconfig(libpng)
 BuildRequires:  pkgconfig(libturbojpeg)
+BuildRequires:  pkgconfig(libavcodec)
+BuildRequires:  pkgconfig(libavutil)
+BuildRequires:  pkgconfig(libswscale)
 BuildRequires:  pkgconfig(systemd)
+BuildRequires:  systemd-rpm-macros
 BuildRequires:  pkgconfig(Qt6Core)
 BuildRequires:  pkgconfig(Qt6Gui)
 BuildRequires:  pkgconfig(Qt6Widgets)
 BuildRequires:  pkgconfig(Qt6OpenGLWidgets)
 BuildRequires:  pkgconfig(sqlite3)
-BuildRequires:  pkgconfig(libzstd)
-BuildRequires:  pkgconfig(libsodium)
-BuildRequires:  pkgconfig(libcurl)
 BuildRequires:  scdoc
 BuildRequires:  python3
 
 Recommends:     %{name}-studio = %{version}-%{release}
+Recommends:     libpng
+Recommends:     turbojpeg
 Recommends:     libwebp
 Recommends:     libavif
 Recommends:     libjxl
 Recommends:     librsvg2
 Recommends:     pipewire-libs
 Recommends:     dbus-libs
+Recommends:     systemd-libs
 Recommends:     lz4-libs
 Recommends:     libzstd
 Recommends:     libsodium
@@ -65,6 +69,8 @@ procedural shader presets.
 Summary:        Qt6 desktop GUI for WayWal (wwal-studio)
 Requires:       %{name}%{?_isa} = %{version}-%{release}
 Recommends:     qt6-qtwayland
+Recommends:     lz4-libs
+Recommends:     libwebp
 Recommends:     libzstd
 Recommends:     libsodium
 Recommends:     libcurl
@@ -81,6 +87,8 @@ for the WayWal daemon.
 
 %build
 %meson \
+    -Db_lto=true \
+    -Db_pie=true \
     -Dtests=false \
     -Dstudio=enabled \
     -Denable_vaapi=true \
@@ -88,11 +96,23 @@ for the WayWal daemon.
     -Denable_simd=true \
     -Denable_seccomp=true \
     -Denable_systemd=true \
+    -Dwebp=auto \
+    -Davif=auto \
+    -Djxl=auto \
+    -Dsvg=auto \
+    -Dpipewire=auto \
+    -Dffmpeg_swdec=auto \
     -Dswww_compat=true
 %meson_build
 
 %install
 %meson_install
+
+%post
+%{?systemd_user_post:%systemd_user_post wwald.service wwald.socket}
+
+%preun
+%{?systemd_user_preun:%systemd_user_preun wwald.service wwald.socket}
 
 %files
 %license LICENSE
