@@ -4,24 +4,27 @@
 
 #include <array>
 #include <cstdint>
-#include <list>
 #include <memory>
 #include <optional>
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include <QComboBox>
+#include <QDialog>
+#include <QFocusEvent>
 #include <QHBoxLayout>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMouseEvent>
 #include <QOpenGLExtraFunctions>
 #include <QOpenGLWidget>
 #include <QPainter>
+#include <QPointer>
 #include <QPushButton>
 #include <QScrollBar>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <QWheelEvent>
 #include <QWidget>
@@ -78,13 +81,14 @@ class GridGlCanvas : public QOpenGLWidget, protected QOpenGLExtraFunctions {
     void resetHoverState();
     void setEmbeddedMode(bool embedded) noexcept { m_embeddedMode = embedded; }
     [[nodiscard]] bool isEmbeddedMode() const noexcept { return m_embeddedMode; }
-    [[nodiscard]] const std::unordered_set<uint32_t> &selectedIds() const noexcept
+    [[nodiscard]] const std::vector<uint32_t> &selectedIds() const noexcept
     {
-        return m_selectedIds;
+        return m_selectedOrder;
     }
 
   signals:
     void virtualHeightChanged(int virtual_height);
+    void scrollYChanged(int scroll_y);
     void itemSelected(const CatalogItem &item);
     void itemDoubleClicked(const CatalogItem &item);
     void selectionChanged(const std::vector<uint32_t> &selected_ids);
@@ -104,16 +108,11 @@ class GridGlCanvas : public QOpenGLWidget, protected QOpenGLExtraFunctions {
     void mouseDoubleClickEvent(QMouseEvent *event) override;
     void leaveEvent(QEvent *event) override;
     void wheelEvent(QWheelEvent *event) override;
+    void keyPressEvent(QKeyEvent *event) override;
+    void focusInEvent(QFocusEvent *event) override;
+    void focusOutEvent(QFocusEvent *event) override;
 
   private:
-    struct CompressedCardEntry {
-        GLuint tex_id{0};
-        int width{0};
-        int height{0};
-        qint64 image_cache_key{0};
-        std::list<uint32_t>::iterator lru_it;
-    };
-
     FuzzyCatalogIndex &m_index;
     GpuTexturePool &m_pool;
     HoverPreviewController &m_hover;
@@ -121,40 +120,31 @@ class GridGlCanvas : public QOpenGLWidget, protected QOpenGLExtraFunctions {
     int m_scrollY{0};
     bool m_embeddedMode{false};
     std::optional<size_t> m_hoveredFilteredIdx;
+    std::optional<size_t> m_focusedFilteredIdx;
     std::unordered_set<uint32_t> m_selectedIds;
+    std::vector<uint32_t> m_selectedOrder;
     std::optional<uint32_t> m_lastSelectedId;
 
-    // Double-buffered PBO + ETC2 compressed thumbnail pipeline
-    std::array<GLuint, 2> m_pboRing{0, 0};
-    std::array<size_t, 2> m_pboCapacities{0, 0};
-    int m_pboIndex{0};
-    bool m_supportsEtc2{false};
-    GLenum m_etc2InternalFormat{0};
-    std::list<uint32_t> m_etc2Lru;
-    std::unordered_map<uint32_t, CompressedCardEntry> m_etc2Cache;
-    std::unordered_set<uint32_t> m_glRenderedThisFrame;
+    // Reusable per-slice rendered flags avoid per-frame unordered_set allocs.
+    std::vector<uint8_t> m_glRenderedSliceMask;
+    size_t m_glRenderedSliceStart{0};
 
-    GLuint m_cardProgram{0};
     GLuint m_cardArrayProgram{0};
     GLuint m_cardVao{0};
     GLuint m_cardVbo{0};
-    GLint m_uViewportLoc{-1};
-    GLint m_uCardRectLoc{-1};
-    GLint m_uTexLoc{-1};
     GLint m_uArrayViewportLoc{-1};
     GLint m_uArrayCardRectLoc{-1};
     GLint m_uArrayTexLoc{-1};
     GLint m_uArrayLayerLoc{-1};
     GLint m_uArraySrgbLoc{-1};
+    GLint m_uArrayDprLoc{-1};
     bool m_glInitialized{false};
     QMetaObject::Connection m_contextDestroyConn;
-    QLabel *m_fallbackCanvas{nullptr};
 
+    void ensureIndexVisible(size_t filtered_idx);
+    void selectSingleFilteredIndex(size_t filtered_idx);
     void initCardShaders();
-    void initPboAndEtc2Support();
-    void destroyCompressedCache();
     void releaseGlResources();
-    GLuint uploadOrGetCardTexture(uint32_t item_id, const QImage &thumb, int &uploadBudget);
     void renderGlThumbnails();
     void renderCards(QPainter &painter);
     void drawBadgePill(QPainter &painter, const QRect &card_rect, WallpaperBadge badge);
@@ -179,6 +169,7 @@ class VirtualizedGridWidget : public QWidget {
   public slots:
     void openFolderSettingsDialog();
     void setTagFilter(uint64_t tag_mask);
+    void setBadgeFilter(uint32_t badge_mask);
 
   public:
     [[nodiscard]] const FuzzyCatalogIndex &catalogIndex() const noexcept { return m_index; }
@@ -187,12 +178,17 @@ class VirtualizedGridWidget : public QWidget {
     [[nodiscard]] HoverPreviewController &hoverController() noexcept { return m_hover; }
 
     [[nodiscard]] std::vector<uint32_t> selectedIds() const;
+    [[nodiscard]] const std::vector<uint32_t> &playlistQueue() const noexcept
+    {
+        return m_playlistQueue;
+    }
     void clearSelection();
 
   signals:
     void wallpaperSelected(const CatalogItem &item);
     void wallpaperDoubleClicked(const CatalogItem &item);
     void playlistSelectionChanged(const std::vector<uint32_t> &selected_ids);
+    void playlistAddRequested(const std::vector<uint32_t> &added_ids);
     void catalogScanned(size_t total_count);
 
   private slots:
@@ -211,9 +207,14 @@ class VirtualizedGridWidget : public QWidget {
     QWidget *m_headerContainer{nullptr};
     QLineEdit *m_searchEdit{nullptr};
     QComboBox *m_tagCombo{nullptr};
+    QComboBox *m_badgeCombo{nullptr};
     QComboBox *m_sortCombo{nullptr};
     QPushButton *m_foldersButton{nullptr};
     QLabel *m_statusLabel{nullptr};
+    QTimer *m_searchDebounceTimer{nullptr};
+    QString m_pendingSearchText;
+    QPointer<QDialog> m_folderDialog;
+    std::vector<uint32_t> m_playlistQueue;
 
     GridGlCanvas *m_canvas{nullptr};
     QScrollBar *m_scrollBar{nullptr};
@@ -224,6 +225,7 @@ class VirtualizedGridWidget : public QWidget {
     QPushButton *m_playlistClearButton{nullptr};
 
     void setupUi();
+    void applySearchText(const QString &text);
     void updateStatusText();
 };
 

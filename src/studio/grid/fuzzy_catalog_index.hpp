@@ -2,30 +2,80 @@
 #ifndef WWAL_STUDIO_GRID_FUZZY_CATALOG_INDEX_HPP
 #define WWAL_STUDIO_GRID_FUZZY_CATALOG_INDEX_HPP
 
-#include <cstdint>
-#include <string>
-#include <vector>
 #include <array>
 #include <chrono>
-#include <string_view>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include <waywal/thumb_cache.h>
 #include <waywal/we_project.h>
 
-#include <unordered_set>
-
 namespace wwal::studio {
 
 enum class WallpaperBadge : uint32_t {
-    Image = 0,
     Video = WAYWAL_THUMB_FLAG_VIDEO,
     Shader = WAYWAL_THUMB_FLAG_SHADER,
     Scene = WAYWAL_THUMB_FLAG_SCENE,
-    GnomeXml = (1u << 4),
     Favorite = WAYWAL_THUMB_FLAG_FAVORITE,
+    GnomeXml = (1u << 4),
+    Image = (1u << 5),
 };
+
+struct SortKeyItem {
+    uint32_t item_index;
+    uint16_t oklab_hue_q16;
+};
+
+// Sort up to 100k catalog entries linearly in two 8-bit passes instead of O(N log N) compares.
+inline void radix_sort_oklab_hue(std::vector<SortKeyItem> &items, std::vector<SortKeyItem> &scratch)
+{
+    if (items.size() <= 1U) {
+        return;
+    }
+    scratch.resize(items.size());
+    std::array<uint32_t, 256> counts{};
+
+    for (const auto &it : items) {
+        counts[it.oklab_hue_q16 & 0xFFU]++;
+    }
+    uint32_t offset = 0U;
+    for (uint32_t &c : counts) {
+        const uint32_t n = c;
+        c = offset;
+        offset += n;
+    }
+    for (const auto &it : items) {
+        scratch[counts[it.oklab_hue_q16 & 0xFFU]++] = it;
+    }
+
+    counts.fill(0U);
+    for (const auto &it : scratch) {
+        counts[(it.oklab_hue_q16 >> 8U) & 0xFFU]++;
+    }
+    offset = 0U;
+    for (uint32_t &c : counts) {
+        const uint32_t n = c;
+        c = offset;
+        offset += n;
+    }
+    for (const auto &it : scratch) {
+        items[counts[(it.oklab_hue_q16 >> 8U) & 0xFFU]++] = it;
+    }
+}
+
+inline void radix_sort_oklab_hue(std::vector<SortKeyItem> &items)
+{
+    std::vector<SortKeyItem> scratch;
+    radix_sort_oklab_hue(items, scratch);
+}
 
 enum class SortCriteria {
     NameAsc,
@@ -92,12 +142,12 @@ struct CatalogItem {
 class FuzzyCatalogIndex {
   public:
     FuzzyCatalogIndex();
-    ~FuzzyCatalogIndex() = default;
+    ~FuzzyCatalogIndex();
 
     FuzzyCatalogIndex(const FuzzyCatalogIndex &) = delete;
     FuzzyCatalogIndex &operator=(const FuzzyCatalogIndex &) = delete;
-    FuzzyCatalogIndex(FuzzyCatalogIndex &&) noexcept = default;
-    FuzzyCatalogIndex &operator=(FuzzyCatalogIndex &&) noexcept = default;
+    FuzzyCatalogIndex(FuzzyCatalogIndex &&) noexcept;
+    FuzzyCatalogIndex &operator=(FuzzyCatalogIndex &&) noexcept;
 
     // Discovers wallpapers from configured/standard paths (~/Pictures/Wallpapers,
     // $XDG_DATA_HOME/wallpapers, Steam Workshop 431960) and any additional user paths,
@@ -158,6 +208,7 @@ class FuzzyCatalogIndex {
         return m_filteredIndices;
     }
     [[nodiscard]] const std::vector<CatalogItem> &allItems() const noexcept { return m_items; }
+    [[nodiscard]] std::optional<size_t> filteredPositionOfId(uint32_t item_id) const;
 
     // Performance verification: benchmarks Myers/Bitap scoring across items in microseconds
     [[nodiscard]] double benchmarkSearch(std::string_view query, size_t iterations = 100) const;
@@ -167,16 +218,63 @@ class FuzzyCatalogIndex {
 
     // Tag management
     [[nodiscard]] uint64_t activeTagMask() const noexcept { return m_activeTagMask; }
+    [[nodiscard]] uint32_t activeBadgeMask() const noexcept { return m_activeBadgeMask; }
     [[nodiscard]] std::string_view activeSearchQuery() const noexcept { return m_activeQuery; }
     [[nodiscard]] SortCriteria activeSorting() const noexcept { return m_activeSorting; }
 
   private:
     std::vector<CatalogItem> m_items;
+    std::vector<uint16_t> m_itemHueQ16;
+    std::vector<uint32_t> m_itemBadges;
+    std::vector<uint64_t> m_itemTagMasks;
+    std::vector<uint32_t> m_titleOff;
+    std::vector<uint32_t> m_titleLen;
+    std::string m_lowerTitleArena;
+    std::vector<uint64_t> m_titleCharMasks;
+    std::vector<uint64_t> m_titleCharMasks2;
+    std::vector<uint64_t> m_titleBigramMasks0;
+    std::vector<uint64_t> m_titleBigramMasks1;
+    std::vector<uint64_t> m_titleBigramMasks2;
+    std::vector<uint32_t> m_pathOff;
+    std::vector<uint32_t> m_pathLen;
+    std::vector<uint32_t> m_pathDirLen;
+    std::vector<uint32_t> m_itemDirIds;
+    struct DirMeta {
+        std::string lowerDir;
+        uint64_t charMask{0ULL};
+        uint64_t charMask2{0ULL};
+    };
+    std::vector<DirMeta> m_uniqueDirs;
+    std::unordered_map<std::string, uint32_t> m_dirToId;
+    uint32_t m_lastAddDirId{UINT32_MAX};
+    std::string m_lowerPathArena;
+    std::vector<uint64_t> m_pathCharMasks;
+    std::vector<uint64_t> m_fileCharMasks;
+    std::vector<uint64_t> m_fileCharMasks2;
+    std::vector<uint64_t> m_fileBigramMasks0;
+    std::vector<uint64_t> m_fileBigramMasks1;
+    std::vector<uint64_t> m_fileBigramMasks2;
+
     std::vector<uint32_t> m_filteredIndices;
+    mutable std::unordered_map<uint32_t, size_t> m_idToFilteredPos;
+    mutable bool m_filteredPosDirty{true};
+    mutable std::vector<SortKeyItem> m_radixKeysScratch;
+    mutable std::vector<SortKeyItem> m_radixTmpScratch;
+    mutable std::vector<std::pair<int, uint32_t>> m_scoredScratch;
+    struct FilterWorkerPool;
+    struct FilterImpl;
+    friend struct FilterImpl;
+    mutable std::unique_ptr<FilterWorkerPool> m_filterPool;
+
     std::unordered_set<std::string> m_seenPaths;
+    std::unordered_map<std::string, std::string> m_sizeNameFirstPath;
+    std::unordered_set<std::string> m_seenContentDigests;
+    uint32_t m_nextAutoId{0U};
 
     std::vector<std::string> m_includedDirs;
     std::vector<std::string> m_excludedDirs;
+    std::vector<std::string> m_excludedNamesLower;
+    std::vector<std::string> m_excludedNormPaths;
     bool m_scanSystemPaths{true};
     bool m_configLoaded{false};
 
@@ -192,6 +290,7 @@ class FuzzyCatalogIndex {
     static int scoreItemFuzzy(std::string_view text, std::string_view pattern,
                               const std::array<uint64_t, 256> &char_mask, uint64_t pattern_len);
 
+    void rebuildExcludedCache();
     void scanDirectory(const std::filesystem::path &dir_path, size_t max_depth = 4);
     void scanSteamWorkshop();
     void sortFiltered();

@@ -323,70 +323,7 @@ class IoUringStatxBatcher {
   public:
     static constexpr unsigned kRingEntries = 64;
 
-    IoUringStatxBatcher()
-    {
-#if WWAL_HAS_LINUX_IO_URING_HDR && defined(__NR_io_uring_setup) && defined(__NR_io_uring_enter)
-        io_uring_params params{};
-        long fd = ::syscall(__NR_io_uring_setup, kRingEntries, &params);
-        if (fd < 0) {
-            return;
-        }
-        m_ringFd = static_cast<int>(fd);
-
-        size_t sqRingSz = params.sq_off.array + params.sq_entries * sizeof(unsigned);
-        size_t cqRingSz = params.cq_off.cqes + params.cq_entries * sizeof(io_uring_cqe);
-        m_singleMmap = (params.features & IORING_FEAT_SINGLE_MMAP) != 0;
-        if (m_singleMmap) {
-            sqRingSz = std::max(sqRingSz, cqRingSz);
-            cqRingSz = sqRingSz;
-        }
-
-        m_sqRingSize = sqRingSz;
-        m_sqPtr = ::mmap(nullptr, m_sqRingSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
-                         m_ringFd, IORING_OFF_SQ_RING);
-        if (m_sqPtr == MAP_FAILED) {
-            m_sqPtr = nullptr;
-            teardown();
-            return;
-        }
-
-        if (m_singleMmap) {
-            m_cqPtr = m_sqPtr;
-            m_cqRingSize = 0;
-        } else {
-            m_cqRingSize = cqRingSz;
-            m_cqPtr = ::mmap(nullptr, m_cqRingSize, PROT_READ | PROT_WRITE,
-                             MAP_SHARED | MAP_POPULATE, m_ringFd, IORING_OFF_CQ_RING);
-            if (m_cqPtr == MAP_FAILED) {
-                m_cqPtr = nullptr;
-                teardown();
-                return;
-            }
-        }
-
-        m_sqesSize = params.sq_entries * sizeof(io_uring_sqe);
-        void *sqesMem = ::mmap(nullptr, m_sqesSize, PROT_READ | PROT_WRITE,
-                               MAP_SHARED | MAP_POPULATE, m_ringFd, IORING_OFF_SQES);
-        if (sqesMem == MAP_FAILED) {
-            teardown();
-            return;
-        }
-        m_sqes = static_cast<io_uring_sqe *>(sqesMem);
-
-        auto *sqBase = static_cast<uint8_t *>(m_sqPtr);
-        auto *cqBase = static_cast<uint8_t *>(m_cqPtr);
-        m_sqHead = reinterpret_cast<unsigned *>(sqBase + params.sq_off.head);
-        m_sqTail = reinterpret_cast<unsigned *>(sqBase + params.sq_off.tail);
-        m_sqMask = *reinterpret_cast<unsigned *>(sqBase + params.sq_off.ring_mask);
-        m_sqArray = reinterpret_cast<unsigned *>(sqBase + params.sq_off.array);
-
-        m_cqHead = reinterpret_cast<unsigned *>(cqBase + params.cq_off.head);
-        m_cqTail = reinterpret_cast<unsigned *>(cqBase + params.cq_off.tail);
-        m_cqMask = *reinterpret_cast<unsigned *>(cqBase + params.cq_off.ring_mask);
-        m_cqes = reinterpret_cast<io_uring_cqe *>(cqBase + params.cq_off.cqes);
-        m_ringReady = true;
-#endif
-    }
+    IoUringStatxBatcher() = default;
 
     ~IoUringStatxBatcher() { teardown(); }
 
@@ -403,7 +340,8 @@ class IoUringStatxBatcher {
         }
 
 #if WWAL_HAS_LINUX_IO_URING_HDR && defined(__NR_io_uring_enter)
-        if (m_ringReady) {
+        // Skip io_uring setup/mmap overhead for tiny directories.
+        if (paths.size() > 4 && ensureRingInit()) {
             constexpr size_t kBatchCap = 32;
             std::array<struct statx, kBatchCap> stxBatch{};
 
@@ -459,7 +397,8 @@ class IoUringStatxBatcher {
                     }
                 }
                 if (enterFailed) {
-                    m_ringReady = false;
+                    teardown();
+                    m_ringDisabled = true;
                     break;
                 }
 
@@ -512,6 +451,85 @@ class IoUringStatxBatcher {
     }
 
   private:
+    bool ensureRingInit()
+    {
+        if (m_ringReady) {
+            return true;
+        }
+        if (m_ringDisabled) {
+            return false;
+        }
+#if WWAL_HAS_LINUX_IO_URING_HDR && defined(__NR_io_uring_setup) && defined(__NR_io_uring_enter)
+        io_uring_params params{};
+        long fd = ::syscall(__NR_io_uring_setup, kRingEntries, &params);
+        if (fd < 0) {
+            m_ringDisabled = true;
+            return false;
+        }
+        m_ringFd = static_cast<int>(fd);
+
+        size_t sqRingSz = params.sq_off.array + params.sq_entries * sizeof(unsigned);
+        size_t cqRingSz = params.cq_off.cqes + params.cq_entries * sizeof(io_uring_cqe);
+        m_singleMmap = (params.features & IORING_FEAT_SINGLE_MMAP) != 0;
+        if (m_singleMmap) {
+            sqRingSz = std::max(sqRingSz, cqRingSz);
+            cqRingSz = sqRingSz;
+        }
+
+        m_sqRingSize = sqRingSz;
+        m_sqPtr = ::mmap(nullptr, m_sqRingSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
+                         m_ringFd, IORING_OFF_SQ_RING);
+        if (m_sqPtr == MAP_FAILED) {
+            m_sqPtr = nullptr;
+            teardown();
+            m_ringDisabled = true;
+            return false;
+        }
+
+        if (m_singleMmap) {
+            m_cqPtr = m_sqPtr;
+            m_cqRingSize = 0;
+        } else {
+            m_cqRingSize = cqRingSz;
+            m_cqPtr = ::mmap(nullptr, m_cqRingSize, PROT_READ | PROT_WRITE,
+                             MAP_SHARED | MAP_POPULATE, m_ringFd, IORING_OFF_CQ_RING);
+            if (m_cqPtr == MAP_FAILED) {
+                m_cqPtr = nullptr;
+                teardown();
+                m_ringDisabled = true;
+                return false;
+            }
+        }
+
+        m_sqesSize = params.sq_entries * sizeof(io_uring_sqe);
+        void *sqesMem = ::mmap(nullptr, m_sqesSize, PROT_READ | PROT_WRITE,
+                               MAP_SHARED | MAP_POPULATE, m_ringFd, IORING_OFF_SQES);
+        if (sqesMem == MAP_FAILED) {
+            teardown();
+            m_ringDisabled = true;
+            return false;
+        }
+        m_sqes = static_cast<io_uring_sqe *>(sqesMem);
+
+        auto *sqBase = static_cast<uint8_t *>(m_sqPtr);
+        auto *cqBase = static_cast<uint8_t *>(m_cqPtr);
+        m_sqHead = reinterpret_cast<unsigned *>(sqBase + params.sq_off.head);
+        m_sqTail = reinterpret_cast<unsigned *>(sqBase + params.sq_off.tail);
+        m_sqMask = *reinterpret_cast<unsigned *>(sqBase + params.sq_off.ring_mask);
+        m_sqArray = reinterpret_cast<unsigned *>(sqBase + params.sq_off.array);
+
+        m_cqHead = reinterpret_cast<unsigned *>(cqBase + params.cq_off.head);
+        m_cqTail = reinterpret_cast<unsigned *>(cqBase + params.cq_off.tail);
+        m_cqMask = *reinterpret_cast<unsigned *>(cqBase + params.cq_off.ring_mask);
+        m_cqes = reinterpret_cast<io_uring_cqe *>(cqBase + params.cq_off.cqes);
+        m_ringReady = true;
+        return true;
+#else
+        m_ringDisabled = true;
+        return false;
+#endif
+    }
+
     void teardown()
     {
         if (m_sqes) {
@@ -535,6 +553,7 @@ class IoUringStatxBatcher {
 
     int m_ringFd{-1};
     bool m_ringReady{false};
+    bool m_ringDisabled{false};
     bool m_singleMmap{false};
     void *m_sqPtr{nullptr};
     void *m_cqPtr{nullptr};
@@ -556,6 +575,12 @@ class IoUringStatxBatcher {
     unsigned *m_cqTail{nullptr};
     unsigned m_cqMask{0};
 };
+
+IoUringStatxBatcher &threadLocalStatxBatcher()
+{
+    thread_local IoUringStatxBatcher tlsBatcher;
+    return tlsBatcher;
+}
 
 void collectRegularFilesNoStat(const std::string &dirPath, std::vector<std::string> &outFiles,
                                size_t &statCounter, int depth = 0)
@@ -873,7 +898,7 @@ void parseRootProjectJsonMetadata(const std::filesystem::path &itemDir, std::str
     }
 }
 
-bool bindRecordToStmt(sqlite3_stmt *stmt, const WorkshopItemRecord &rec)
+bool bindRecordAtOffset(sqlite3_stmt *stmt, int baseCol, const WorkshopItemRecord &rec)
 {
     const double safeRating =
         std::isfinite(static_cast<double>(rec.rating)) ? static_cast<double>(rec.rating) : 0.0;
@@ -882,49 +907,265 @@ bool bindRecordToStmt(sqlite3_stmt *stmt, const WorkshopItemRecord &rec)
                                   : (16.0 / 9.0);
 
     bool ok = true;
-    ok = ok && sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(rec.published_file_id)) ==
+    ok = ok && sqlite3_bind_int64(stmt, baseCol + 1,
+                                  static_cast<sqlite3_int64>(rec.published_file_id)) == SQLITE_OK;
+    ok = ok && sqlite3_bind_int64(stmt, baseCol + 2,
+                                  static_cast<sqlite3_int64>(rec.owner_steam_id)) == SQLITE_OK;
+    ok = ok && sqlite3_bind_text(stmt, baseCol + 3, rec.title.data(),
+                                 static_cast<int>(rec.title.size()), SQLITE_STATIC) == SQLITE_OK;
+    ok = ok && sqlite3_bind_text(stmt, baseCol + 4, rec.type.data(),
+                                 static_cast<int>(rec.type.size()), SQLITE_STATIC) == SQLITE_OK;
+    ok =
+        ok && sqlite3_bind_text(stmt, baseCol + 5, rec.file_path.data(),
+                                static_cast<int>(rec.file_path.size()), SQLITE_STATIC) == SQLITE_OK;
+    ok = ok &&
+         sqlite3_bind_text(stmt, baseCol + 6, rec.preview_path.data(),
+                           static_cast<int>(rec.preview_path.size()), SQLITE_STATIC) == SQLITE_OK;
+    ok = ok && sqlite3_bind_int64(stmt, baseCol + 7,
+                                  static_cast<sqlite3_int64>(rec.file_size_bytes)) == SQLITE_OK;
+    ok = ok && sqlite3_bind_int64(stmt, baseCol + 8,
+                                  static_cast<sqlite3_int64>(rec.time_created)) == SQLITE_OK;
+    ok = ok && sqlite3_bind_int64(stmt, baseCol + 9,
+                                  static_cast<sqlite3_int64>(rec.time_updated)) == SQLITE_OK;
+    ok = ok && sqlite3_bind_int64(stmt, baseCol + 10,
+                                  static_cast<sqlite3_int64>(rec.subscriptions)) == SQLITE_OK;
+    ok = ok && sqlite3_bind_int64(stmt, baseCol + 11, static_cast<sqlite3_int64>(rec.favorited)) ==
                    SQLITE_OK;
     ok = ok &&
-         sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(rec.owner_steam_id)) == SQLITE_OK;
-    ok = ok && sqlite3_bind_text(stmt, 3, rec.title.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK;
-    ok = ok && sqlite3_bind_text(stmt, 4, rec.type.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK;
-    ok = ok && sqlite3_bind_text(stmt, 5, rec.file_path.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK;
+         sqlite3_bind_int64(stmt, baseCol + 12, static_cast<sqlite3_int64>(rec.views)) == SQLITE_OK;
+    ok = ok && sqlite3_bind_double(stmt, baseCol + 13, safeRating) == SQLITE_OK;
+    ok = ok && sqlite3_bind_int64(stmt, baseCol + 14,
+                                  static_cast<sqlite3_int64>(rec.install_state)) == SQLITE_OK;
+    ok = ok && sqlite3_bind_int64(stmt, baseCol + 15,
+                                  static_cast<sqlite3_int64>(rec.storage_backend)) == SQLITE_OK;
+    ok = ok && sqlite3_bind_int64(stmt, baseCol + 16,
+                                  static_cast<sqlite3_int64>(rec.compat_tier)) == SQLITE_OK;
+    ok = ok && sqlite3_bind_int64(stmt, baseCol + 17,
+                                  static_cast<sqlite3_int64>(rec.compat_score)) == SQLITE_OK;
+    ok = ok && sqlite3_bind_double(stmt, baseCol + 18, safeAspect) == SQLITE_OK;
+    ok = ok && sqlite3_bind_int64(stmt, baseCol + 19,
+                                  static_cast<sqlite3_int64>(rec.dominant_color)) == SQLITE_OK;
+    ok = ok && sqlite3_bind_int64(stmt, baseCol + 20, static_cast<sqlite3_int64>(rec.tag_mask)) ==
+                   SQLITE_OK;
     ok = ok &&
-         sqlite3_bind_text(stmt, 6, rec.preview_path.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK;
+         sqlite3_bind_text(stmt, baseCol + 21, rec.tags_string.data(),
+                           static_cast<int>(rec.tags_string.size()), SQLITE_STATIC) == SQLITE_OK;
     ok = ok &&
-         sqlite3_bind_int64(stmt, 7, static_cast<sqlite3_int64>(rec.file_size_bytes)) == SQLITE_OK;
-    ok = ok &&
-         sqlite3_bind_int64(stmt, 8, static_cast<sqlite3_int64>(rec.time_created)) == SQLITE_OK;
-    ok = ok &&
-         sqlite3_bind_int64(stmt, 9, static_cast<sqlite3_int64>(rec.time_updated)) == SQLITE_OK;
-    ok = ok &&
-         sqlite3_bind_int64(stmt, 10, static_cast<sqlite3_int64>(rec.subscriptions)) == SQLITE_OK;
-    ok = ok && sqlite3_bind_int64(stmt, 11, static_cast<sqlite3_int64>(rec.favorited)) == SQLITE_OK;
-    ok = ok && sqlite3_bind_int64(stmt, 12, static_cast<sqlite3_int64>(rec.views)) == SQLITE_OK;
-    ok = ok && sqlite3_bind_double(stmt, 13, safeRating) == SQLITE_OK;
-    ok = ok &&
-         sqlite3_bind_int64(stmt, 14, static_cast<sqlite3_int64>(rec.install_state)) == SQLITE_OK;
-    ok = ok &&
-         sqlite3_bind_int64(stmt, 15, static_cast<sqlite3_int64>(rec.storage_backend)) == SQLITE_OK;
-    ok = ok &&
-         sqlite3_bind_int64(stmt, 16, static_cast<sqlite3_int64>(rec.compat_tier)) == SQLITE_OK;
-    ok = ok &&
-         sqlite3_bind_int64(stmt, 17, static_cast<sqlite3_int64>(rec.compat_score)) == SQLITE_OK;
-    ok = ok && sqlite3_bind_double(stmt, 18, safeAspect) == SQLITE_OK;
-    ok = ok &&
-         sqlite3_bind_int64(stmt, 19, static_cast<sqlite3_int64>(rec.dominant_color)) == SQLITE_OK;
-    ok = ok && sqlite3_bind_int64(stmt, 20, static_cast<sqlite3_int64>(rec.tag_mask)) == SQLITE_OK;
-    ok = ok &&
-         sqlite3_bind_text(stmt, 21, rec.tags_string.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK;
-    ok = ok &&
-         sqlite3_bind_text(stmt, 22, rec.description.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK;
-    ok = ok &&
-         sqlite3_bind_int64(stmt, 23, static_cast<sqlite3_int64>(rec.manifest_id)) == SQLITE_OK;
-    ok = ok && sqlite3_bind_int64(stmt, 24,
+         sqlite3_bind_text(stmt, baseCol + 22, rec.description.data(),
+                           static_cast<int>(rec.description.size()), SQLITE_STATIC) == SQLITE_OK;
+    ok = ok && sqlite3_bind_int64(stmt, baseCol + 23,
+                                  static_cast<sqlite3_int64>(rec.manifest_id)) == SQLITE_OK;
+    ok = ok && sqlite3_bind_int64(stmt, baseCol + 24,
                                   static_cast<sqlite3_int64>(
                                       rec.file_clock > 0 ? rec.file_clock : 1ULL)) == SQLITE_OK;
-    ok = ok && sqlite3_bind_int(stmt, 25, rec.signature_verified ? 1 : 0) == SQLITE_OK;
+    ok = ok && sqlite3_bind_int(stmt, baseCol + 25, rec.signature_verified ? 1 : 0) == SQLITE_OK;
     return ok;
+}
+
+bool bindRecordToStmt(sqlite3_stmt *stmt, const WorkshopItemRecord &rec)
+{
+    return bindRecordAtOffset(stmt, 0, rec);
+}
+
+inline bool isAsciiTokenChar(unsigned char c) noexcept
+{
+    return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || c >= 0x80u;
+}
+
+uint64_t prefixTokenBloomMask(std::string_view lowerToken) noexcept
+{
+    if (lowerToken.empty()) {
+        return 0ULL;
+    }
+    uint64_t mask = 0ULL;
+    const auto b0 = static_cast<unsigned char>(lowerToken[0]);
+    mask |= 1ULL << ((static_cast<uint64_t>(b0) * 11400714819323198485ULL) >> 58);
+    if (lowerToken.size() >= 2u) {
+        const uint32_t p2 =
+            (static_cast<uint32_t>(b0) << 8) | static_cast<unsigned char>(lowerToken[1]);
+        mask |= 1ULL << ((static_cast<uint64_t>(p2) * 0x9E3779B97F4A7C15ULL) >> 58);
+        if (lowerToken.size() >= 3u) {
+            const uint32_t p3 = (p2 << 8) | static_cast<unsigned char>(lowerToken[2]);
+            mask |= 1ULL << ((static_cast<uint64_t>(p3) * 0xBF58476D1CE4E5B9ULL) >> 58);
+            if (lowerToken.size() >= 4u) {
+                const uint32_t p4 = (p3 << 8) | static_cast<unsigned char>(lowerToken[3]);
+                mask |= 1ULL << ((static_cast<uint64_t>(p4) * 0x94D049BB133111EBULL) >> 58);
+            }
+        }
+    }
+    return mask;
+}
+
+uint64_t computeDocBloom64(std::string_view lowerTitle, std::string_view lowerTags,
+                           std::string_view lowerDesc) noexcept
+{
+    uint64_t bloom = 0ULL;
+    auto scanField = [&bloom](std::string_view sv) noexcept {
+        size_t i = 0;
+        while (i < sv.size()) {
+            while (i < sv.size() && !isAsciiTokenChar(static_cast<unsigned char>(sv[i]))) {
+                ++i;
+            }
+            if (i >= sv.size()) {
+                break;
+            }
+            const size_t start = i;
+            while (i < sv.size() && isAsciiTokenChar(static_cast<unsigned char>(sv[i]))) {
+                ++i;
+            }
+            bloom |= prefixTokenBloomMask(std::string_view(sv.data() + start, i - start));
+        }
+    };
+    scanField(lowerTitle);
+    scanField(lowerTags);
+    scanField(lowerDesc);
+    return bloom;
+}
+
+uint32_t countWordMatches(std::string_view haystack, std::string_view tok, bool exactWord) noexcept
+{
+    if (tok.empty() || haystack.size() < tok.size()) {
+        return 0U;
+    }
+    uint32_t count = 0U;
+    const char *const base = haystack.data();
+    const char *const end = base + haystack.size();
+    const char *cursor = base;
+    const char first = tok[0];
+    while (static_cast<size_t>(end - cursor) >= tok.size()) {
+        const size_t searchLen = static_cast<size_t>(end - cursor) - tok.size() + 1u;
+        const auto *hit = static_cast<const char *>(std::memchr(cursor, first, searchLen));
+        if (!hit) {
+            break;
+        }
+        const bool leftOk = (hit == base) || !isAsciiTokenChar(static_cast<unsigned char>(hit[-1]));
+        if (leftOk && std::memcmp(hit, tok.data(), tok.size()) == 0) {
+            const char *after = hit + tok.size();
+            const bool rightOk = !exactWord || (after == end) ||
+                                 !isAsciiTokenChar(static_cast<unsigned char>(*after));
+            if (rightOk) {
+                ++count;
+                cursor = after;
+                continue;
+            }
+        }
+        cursor = hit + 1;
+    }
+    return count;
+}
+
+inline double bm25TfNorm(uint32_t tf, size_t len, double avgLen) noexcept
+{
+    if (tf == 0U) {
+        return 0.0;
+    }
+    const double dtf = static_cast<double>(tf);
+    return (dtf * 2.2) / (dtf + 1.2 * (0.25 + 0.75 * (static_cast<double>(len) / avgLen)));
+}
+
+std::shared_ptr<const SegmentTokenIndex> buildSegmentTokenIndex(const ChunkedCatalogSegment &seg)
+{
+    auto out = std::make_shared<SegmentTokenIndex>();
+    if (seg.count == 0U) {
+        return out;
+    }
+
+    struct TokOcc {
+        const char *ptr;
+        uint32_t len;
+        uint16_t localIdx;
+        uint8_t field;
+    };
+    std::vector<TokOcc> occs;
+    occs.reserve(static_cast<size_t>(seg.count) * 14U);
+
+    auto scanSv = [&](std::string_view sv, uint16_t localIdx, uint8_t field) {
+        const size_t n = sv.size();
+        size_t i = 0;
+        while (i < n) {
+            while (i < n && !isAsciiTokenChar(static_cast<unsigned char>(sv[i]))) {
+                ++i;
+            }
+            if (i >= n) {
+                break;
+            }
+            const size_t start = i;
+            while (i < n && isAsciiTokenChar(static_cast<unsigned char>(sv[i]))) {
+                ++i;
+            }
+            occs.push_back(
+                TokOcc{sv.data() + start, static_cast<uint32_t>(i - start), localIdx, field});
+        }
+    };
+
+    for (uint32_t i = 0U; i < seg.count; ++i) {
+        const auto lIdx = static_cast<uint16_t>(i);
+        scanSv(seg.lowerTitleAt(i), lIdx, 0U);
+        scanSv(seg.lowerTagsAt(i), lIdx, 1U);
+        scanSv(seg.lowerDescAt(i), lIdx, 2U);
+    }
+
+    if (occs.empty()) {
+        return out;
+    }
+
+    std::sort(occs.begin(), occs.end(), [](const TokOcc &a, const TokOcc &b) noexcept {
+        const std::string_view sa(a.ptr, a.len);
+        const std::string_view sb(b.ptr, b.len);
+        if (sa != sb) {
+            return sa < sb;
+        }
+        return a.localIdx < b.localIdx;
+    });
+
+    out->postings.reserve(occs.size());
+    size_t pos = 0U;
+    while (pos < occs.size()) {
+        const std::string_view tok(occs[pos].ptr, occs[pos].len);
+        const uint32_t tokOff = static_cast<uint32_t>(out->tokenArena.size());
+        out->tokenArena.append(tok.data(), tok.size());
+        const uint32_t postBegin = static_cast<uint32_t>(out->postings.size());
+
+        while (pos < occs.size() && std::string_view(occs[pos].ptr, occs[pos].len) == tok) {
+            const uint16_t docIdx = occs[pos].localIdx;
+            uint32_t tfT = 0U;
+            uint32_t tfG = 0U;
+            uint32_t tfD = 0U;
+            while (pos < occs.size() && occs[pos].localIdx == docIdx &&
+                   std::string_view(occs[pos].ptr, occs[pos].len) == tok) {
+                if (occs[pos].field == 0U) {
+                    ++tfT;
+                } else if (occs[pos].field == 1U) {
+                    ++tfG;
+                } else {
+                    ++tfD;
+                }
+                ++pos;
+            }
+            const double score = 10.0 * bm25TfNorm(tfT, seg.title_lengths[docIdx], 24.0) +
+                                 5.0 * bm25TfNorm(tfG, seg.tags_lengths[docIdx], 16.0) +
+                                 1.0 * bm25TfNorm(tfD, seg.desc_lengths[docIdx], 64.0);
+            out->postings.push_back(SegmentPosting{
+                score,
+                docIdx,
+                static_cast<uint16_t>(std::min<uint32_t>(tfT, 65535U)),
+                static_cast<uint16_t>(std::min<uint32_t>(tfG, 65535U)),
+                static_cast<uint16_t>(std::min<uint32_t>(tfD, 65535U)),
+            });
+        }
+
+        const uint32_t postEnd = static_cast<uint32_t>(out->postings.size());
+        std::sort(out->postings.begin() + postBegin, out->postings.begin() + postEnd,
+                  [&seg](const SegmentPosting &a, const SegmentPosting &b) noexcept {
+                      if (a.singleScore != b.singleScore) {
+                          return a.singleScore > b.singleScore;
+                      }
+                      return seg.published_ids[a.localIdx] < seg.published_ids[b.localIdx];
+                  });
+        out->dict.push_back(SegmentTokenDictEntry{tokOff, static_cast<uint32_t>(tok.size()),
+                                                  postBegin, postEnd - postBegin});
+    }
+    return out;
 }
 
 WorkshopItemRecord readRecordFromStmt(sqlite3_stmt *stmt)
@@ -1019,32 +1260,31 @@ CatalogItem WorkshopItemRecord::toCatalogItem() const
 /* ========================================================================= */
 
 struct CatalogIndexManager::Impl {
+    static constexpr size_t kBatchInsertRows = 32U;
+
     mutable std::mutex dbMutex;
     mutable std::mutex stmtCacheMutex;
-    mutable ReadOnlySqlitePool readPool;
+    // Declared before readPool so cached sqlite3_stmt handles outlive
+    // ReadOnlySqlitePool::~ReadOnlySqlitePool().
     mutable std::unordered_map<sqlite3 *, std::unordered_map<uint32_t, sqlite3_stmt *>>
         filterStmtCache;
-    std::atomic<std::shared_ptr<const CatalogSoaSnapshot>> rcuSnapshot{
-        std::make_shared<const CatalogSoaSnapshot>()};
+    mutable ReadOnlySqlitePool readPool;
+    ChunkedCatalogSnapshot rcuPool;
     bool hasTrigramFts{false};
     bool hasJsonEach{false};
     std::atomic<size_t> lastReconcileStatCalls{0};
+    sqlite3_stmt *stmtUpsertBatch32{nullptr};
+    sqlite3_stmt *stmtBeginImmediate{nullptr};
+    sqlite3_stmt *stmtCommit{nullptr};
+    sqlite3_stmt *stmtRollback{nullptr};
 
-    // Writer-side mutable SoA state cloned into immutable RCU snapshots upon commit.
-    std::vector<uint64_t> soaPubIds;
-    std::vector<uint64_t> soaTagMasks;
-    std::array<std::vector<uint64_t>, 64> tagBitsets;
-    std::vector<uint32_t> soaTitleOffsets;
-    std::vector<uint32_t> soaTitleLengths;
-    std::string soaLowerTitles;
-    std::vector<uint32_t> soaTagsOffsets;
-    std::vector<uint32_t> soaTagsLengths;
-    std::string soaLowerTags;
-    std::vector<uint16_t> soaDescLengths;
-    uint64_t totalTitleBytes{0};
-    uint64_t totalTagsBytes{0};
-    uint64_t totalDescBytes{0};
-    std::unordered_map<uint64_t, size_t> idToSlot;
+    // Writer-side chunk table; published ChunkedCatalogSegments remain immutable for wait-free
+    // readers.
+    ChunkedCatalogSnapshot::SegmentList committedSegments;
+    std::vector<std::shared_ptr<ChunkedCatalogSegment>> scratchWorking;
+    std::vector<size_t> scratchDirty;
+    std::unordered_map<uint64_t, size_t> idToGlobalSlot;
+    size_t totalCount{0};
 
     [[nodiscard]] sqlite3_stmt *lookupCachedFilterStmt(sqlite3 *dbHandle, uint32_t shapeKey) const
     {
@@ -1101,181 +1341,350 @@ struct CatalogIndexManager::Impl {
         filterStmtCache.clear();
     }
 
-    void publishRcuSnapshotLocked()
+    void finalizeBatchStmt() noexcept
     {
-        auto snap = std::make_shared<CatalogSoaSnapshot>();
-        snap->count = soaPubIds.size();
-        snap->published_ids = soaPubIds;
-        snap->tag_masks = soaTagMasks;
-        snap->tag_bitsets = tagBitsets;
-        snap->title_offsets = soaTitleOffsets;
-        snap->title_lengths = soaTitleLengths;
-        snap->lower_title_arena = soaLowerTitles;
-        snap->tags_offsets = soaTagsOffsets;
-        snap->tags_lengths = soaTagsLengths;
-        snap->lower_tags_arena = soaLowerTags;
-        snap->desc_lengths = soaDescLengths;
-        rcuSnapshot.store(std::move(snap), std::memory_order_release);
+        auto fin = [](sqlite3_stmt *&s) noexcept {
+            if (s) {
+                sqlite3_finalize(s);
+                s = nullptr;
+            }
+        };
+        fin(stmtUpsertBatch32);
+        fin(stmtBeginImmediate);
+        fin(stmtCommit);
+        fin(stmtRollback);
     }
 
-    [[nodiscard]] std::shared_ptr<const CatalogSoaSnapshot> loadSnapshot() const noexcept
+    static bool stepTxStmt(sqlite3 *db, sqlite3_stmt *stmt, const char *ctx)
     {
-        return rcuSnapshot.load(std::memory_order_acquire);
+        if (!stmt) {
+            return false;
+        }
+        const int rc = sqlite3_step(stmt);
+        sqlite3_reset(stmt);
+        if (rc != SQLITE_DONE) {
+            std::fprintf(stderr, "[CatalogIndexManager] %s failed (rc=%d): %s\n", ctx, rc,
+                         db ? sqlite3_errmsg(db) : "null db");
+            return false;
+        }
+        return true;
+    }
+
+    static void overwriteSlotTagBits(ChunkedCatalogSegment &seg, size_t localIdx, uint64_t oldMask,
+                                     uint64_t newMask) noexcept
+    {
+        const size_t wordIdx = localIdx >> 6;
+        const uint64_t bit = 1ULL << (localIdx & 63u);
+        uint64_t cleared = oldMask & ~newMask;
+        while (cleared != 0ULL) {
+            const unsigned b = static_cast<unsigned>(std::countr_zero(cleared));
+            seg.tag_bitsets[b][wordIdx] &= ~bit;
+            cleared &= (cleared - 1ULL);
+        }
+        uint64_t added = newMask & ~oldMask;
+        while (added != 0ULL) {
+            const unsigned b = static_cast<unsigned>(std::countr_zero(added));
+            seg.tag_bitsets[b][wordIdx] |= bit;
+            added &= (added - 1ULL);
+        }
+    }
+
+    static void consolidateArena(uint32_t count, std::shared_ptr<const std::string> &base,
+                                 std::string &delta,
+                                 std::array<uint32_t, ChunkedCatalogSegment::kChunkLen> &offs,
+                                 std::array<uint32_t, ChunkedCatalogSegment::kChunkLen> &lens,
+                                 uint32_t &deadBytes)
+    {
+        size_t liveBytes = 0U;
+        for (uint32_t i = 0U; i < count; ++i) {
+            liveBytes += lens[i];
+        }
+        auto rebuilt = std::make_shared<std::string>();
+        rebuilt->reserve(liveBytes);
+        for (uint32_t i = 0U; i < count; ++i) {
+            const std::string_view sv =
+                ChunkedCatalogSegment::readArenaSlot(base, delta, offs[i], lens[i]);
+            const uint32_t newOff = static_cast<uint32_t>(rebuilt->size());
+            if (!sv.empty()) {
+                rebuilt->append(sv.data(), sv.size());
+            }
+            offs[i] = newOff;
+        }
+        base = std::move(rebuilt);
+        std::string{}.swap(delta);
+        deadBytes = 0U;
+    }
+
+    static void writeArenaSlot(std::shared_ptr<const std::string> &base, std::string &delta,
+                               std::array<uint32_t, ChunkedCatalogSegment::kChunkLen> &offs,
+                               std::array<uint32_t, ChunkedCatalogSegment::kChunkLen> &lens,
+                               uint32_t &deadBytes, size_t localIdx, std::string_view value,
+                               bool isOverwrite)
+    {
+        const uint32_t newLen = static_cast<uint32_t>(
+            std::min<size_t>(value.size(), std::numeric_limits<uint32_t>::max()));
+        if (isOverwrite) {
+            const uint32_t oldOff = offs[localIdx];
+            const uint32_t oldLen = lens[localIdx];
+            if (newLen == oldLen &&
+                ChunkedCatalogSegment::readArenaSlot(base, delta, oldOff, oldLen) == value) {
+                return;
+            }
+            if (((oldOff & ChunkedCatalogSegment::kDeltaOffsetBit) != 0U || !base) &&
+                newLen <= oldLen) {
+                if (newLen > 0U) {
+                    std::memcpy(delta.data() + (oldOff & ~ChunkedCatalogSegment::kDeltaOffsetBit),
+                                value.data(), newLen);
+                }
+                lens[localIdx] = newLen;
+                deadBytes += (oldLen - newLen);
+                return;
+            }
+            deadBytes += oldLen;
+        }
+        const uint32_t deltaOff = static_cast<uint32_t>(delta.size());
+        if (newLen > 0U) {
+            delta.append(value.data(), newLen);
+        }
+        offs[localIdx] = ChunkedCatalogSegment::kDeltaOffsetBit | deltaOff;
+        lens[localIdx] = newLen;
+    }
+
+    void beginChunkEdit()
+    {
+        scratchWorking.assign(committedSegments.size(), nullptr);
+        scratchDirty.clear();
+    }
+
+    ChunkedCatalogSegment &mutableSegment(size_t segIdx)
+    {
+        if (segIdx >= scratchWorking.size()) {
+            scratchWorking.resize(segIdx + 1U);
+        }
+        if (!scratchWorking[segIdx]) {
+            if (segIdx < committedSegments.size() && committedSegments[segIdx]) {
+                scratchWorking[segIdx] =
+                    std::make_shared<ChunkedCatalogSegment>(*committedSegments[segIdx]);
+            } else {
+                scratchWorking[segIdx] = std::make_shared<ChunkedCatalogSegment>();
+            }
+            scratchDirty.push_back(segIdx);
+        }
+        return *scratchWorking[segIdx];
+    }
+
+    void commitChunkEdit()
+    {
+        if (scratchDirty.empty()) {
+            scratchWorking.clear();
+            return;
+        }
+        const size_t neededSegs =
+            (totalCount + ChunkedCatalogSegment::kChunkLen - 1U) / ChunkedCatalogSegment::kChunkLen;
+        const size_t prevSize = committedSegments.size();
+        if (neededSegs > committedSegments.size()) {
+            committedSegments.resize(neededSegs);
+        }
+
+        std::vector<ChunkedCatalogSegment *> toRebuild;
+        toRebuild.reserve(scratchDirty.size());
+        for (size_t segIdx : scratchDirty) {
+            if (segIdx < committedSegments.size() && segIdx < scratchWorking.size() &&
+                scratchWorking[segIdx]) {
+                auto *segPtr = scratchWorking[segIdx].get();
+                if (segPtr->count > 0U &&
+                    (!segPtr->token_index || !segPtr->base_title_arena ||
+                     segPtr->dirty_count >= 256U || segPtr->lower_title_arena.size() > 65536U ||
+                     segPtr->lower_tags_arena.size() > 65536U ||
+                     segPtr->lower_desc_arena.size() > 65536U)) {
+                    toRebuild.push_back(segPtr);
+                }
+            }
+        }
+
+        auto finalizeSeg = [](ChunkedCatalogSegment *segPtr) {
+            if (!segPtr->base_title_arena || segPtr->dirty_count >= 256U ||
+                segPtr->lower_title_arena.size() > 65536U) {
+                consolidateArena(segPtr->count, segPtr->base_title_arena, segPtr->lower_title_arena,
+                                 segPtr->title_offsets, segPtr->title_lengths,
+                                 segPtr->dead_title_bytes);
+            }
+            if (!segPtr->base_tags_arena || segPtr->dirty_count >= 256U ||
+                segPtr->lower_tags_arena.size() > 65536U) {
+                consolidateArena(segPtr->count, segPtr->base_tags_arena, segPtr->lower_tags_arena,
+                                 segPtr->tags_offsets, segPtr->tags_lengths,
+                                 segPtr->dead_tags_bytes);
+            }
+            if (!segPtr->base_desc_arena || segPtr->dirty_count >= 256U ||
+                segPtr->lower_desc_arena.size() > 65536U) {
+                consolidateArena(segPtr->count, segPtr->base_desc_arena, segPtr->lower_desc_arena,
+                                 segPtr->desc_offsets, segPtr->desc_lengths,
+                                 segPtr->dead_desc_bytes);
+            }
+            segPtr->token_index = buildSegmentTokenIndex(*segPtr);
+            segPtr->dirty_count = 0U;
+            segPtr->dirty_bitset.fill(0ULL);
+        };
+
+        if (toRebuild.size() >= 4U) {
+            const size_t workers =
+                std::min<size_t>(std::max(1U, std::thread::hardware_concurrency()),
+                                 std::min<size_t>(toRebuild.size(), 4U));
+            std::vector<std::thread> pool;
+            pool.reserve(workers - 1U);
+            const size_t chunk = (toRebuild.size() + workers - 1U) / workers;
+            for (size_t t = 1U; t < workers; ++t) {
+                const size_t s = t * chunk;
+                const size_t e = std::min(toRebuild.size(), s + chunk);
+                if (s < e) {
+                    pool.emplace_back([&, s, e]() {
+                        for (size_t k = s; k < e; ++k) {
+                            finalizeSeg(toRebuild[k]);
+                        }
+                    });
+                }
+            }
+            for (size_t k = 0U; k < std::min(toRebuild.size(), chunk); ++k) {
+                finalizeSeg(toRebuild[k]);
+            }
+            for (auto &th : pool) {
+                th.join();
+            }
+        } else {
+            for (ChunkedCatalogSegment *segPtr : toRebuild) {
+                finalizeSeg(segPtr);
+            }
+        }
+
+        for (size_t segIdx : scratchDirty) {
+            if (segIdx < committedSegments.size() && segIdx < scratchWorking.size()) {
+                committedSegments[segIdx] = std::move(scratchWorking[segIdx]);
+            }
+        }
+        committedSegments.resize(neededSegs);
+
+        if (scratchDirty.size() == 1U && neededSegs == prevSize && scratchDirty[0] < neededSegs) {
+            const size_t onlyIdx = scratchDirty[0];
+            rcuPool.replace_segment(onlyIdx, committedSegments[onlyIdx]);
+        } else {
+            rcuPool.publish_segments(committedSegments);
+        }
+        scratchWorking.clear();
+        scratchDirty.clear();
     }
 
     void clearSoaLocked()
     {
-        soaPubIds.clear();
-        soaTagMasks.clear();
-        for (auto &plane : tagBitsets) {
-            plane.clear();
-        }
-        soaTitleOffsets.clear();
-        soaTitleLengths.clear();
-        soaLowerTitles.clear();
-        soaTagsOffsets.clear();
-        soaTagsLengths.clear();
-        soaLowerTags.clear();
-        soaDescLengths.clear();
-        totalTitleBytes = 0;
-        totalTagsBytes = 0;
-        totalDescBytes = 0;
-        idToSlot.clear();
-    }
-
-    void overwriteSlotTagBitsLocked(size_t slot, uint64_t oldMask, uint64_t newMask)
-    {
-        const size_t wordIdx = slot >> 6;
-        const uint64_t bit = 1ULL << (slot & 63u);
-        uint64_t cleared = oldMask & ~newMask;
-        while (cleared != 0) {
-            unsigned b = static_cast<unsigned>(std::countr_zero(cleared));
-            tagBitsets[b][wordIdx] &= ~bit;
-            cleared &= (cleared - 1ULL);
-        }
-        uint64_t added = newMask & ~oldMask;
-        while (added != 0) {
-            unsigned b = static_cast<unsigned>(std::countr_zero(added));
-            tagBitsets[b][wordIdx] |= bit;
-            added &= (added - 1ULL);
-        }
+        committedSegments.clear();
+        scratchWorking.clear();
+        scratchDirty.clear();
+        idToGlobalSlot.clear();
+        totalCount = 0;
+        rcuPool.publish_segments({});
     }
 
     void upsertSoaLocked(uint64_t pubId, uint64_t tagMask, std::string_view title,
                          std::string_view tagsStr, std::string_view desc)
     {
-        std::string lowerTitle = toLowerUtf8(title);
-        std::string lowerTags = toLowerUtf8(tagsStr);
-        uint16_t descLen = static_cast<uint16_t>(std::min<size_t>(desc.size(), 65535u));
+        const std::string lowerTitle = toLowerUtf8(title);
+        const std::string lowerTags = toLowerUtf8(tagsStr);
+        const std::string lowerDesc = toLowerUtf8(desc);
+        const uint64_t bloom = computeDocBloom64(lowerTitle, lowerTags, lowerDesc);
 
-        auto it = idToSlot.find(pubId);
-        if (it != idToSlot.end()) {
-            size_t slot = it->second;
-            overwriteSlotTagBitsLocked(slot, soaTagMasks[slot], tagMask);
-            soaTagMasks[slot] = tagMask;
+        auto it = idToGlobalSlot.find(pubId);
+        if (it != idToGlobalSlot.end()) {
+            const size_t globalSlot = it->second;
+            const size_t segIdx = globalSlot / ChunkedCatalogSegment::kChunkLen;
+            const size_t localIdx = globalSlot % ChunkedCatalogSegment::kChunkLen;
+            ChunkedCatalogSegment &seg = mutableSegment(segIdx);
 
-            uint32_t oldTitleLen = soaTitleLengths[slot];
-            totalTitleBytes = totalTitleBytes - oldTitleLen + lowerTitle.size();
-            if (lowerTitle.size() <= oldTitleLen) {
-                std::memcpy(soaLowerTitles.data() + soaTitleOffsets[slot], lowerTitle.data(),
-                            lowerTitle.size());
-                soaTitleLengths[slot] = static_cast<uint32_t>(lowerTitle.size());
-            } else {
-                uint32_t newOff = static_cast<uint32_t>(soaLowerTitles.size());
-                soaLowerTitles.append(lowerTitle);
-                soaTitleOffsets[slot] = newOff;
-                soaTitleLengths[slot] = static_cast<uint32_t>(lowerTitle.size());
-            }
+            overwriteSlotTagBits(seg, localIdx, seg.tag_masks[localIdx], tagMask);
+            seg.tag_masks[localIdx] = tagMask;
+            seg.doc_bloom[localIdx] = bloom;
 
-            uint32_t oldTagsLen = soaTagsLengths[slot];
-            totalTagsBytes = totalTagsBytes - oldTagsLen + lowerTags.size();
-            if (lowerTags.size() <= oldTagsLen) {
-                std::memcpy(soaLowerTags.data() + soaTagsOffsets[slot], lowerTags.data(),
-                            lowerTags.size());
-                soaTagsLengths[slot] = static_cast<uint32_t>(lowerTags.size());
-            } else {
-                uint32_t newOff = static_cast<uint32_t>(soaLowerTags.size());
-                soaLowerTags.append(lowerTags);
-                soaTagsOffsets[slot] = newOff;
-                soaTagsLengths[slot] = static_cast<uint32_t>(lowerTags.size());
-            }
-
-            totalDescBytes = totalDescBytes - soaDescLengths[slot] + descLen;
-            soaDescLengths[slot] = descLen;
+            writeArenaSlot(seg.base_title_arena, seg.lower_title_arena, seg.title_offsets,
+                           seg.title_lengths, seg.dead_title_bytes, localIdx, lowerTitle, true);
+            writeArenaSlot(seg.base_tags_arena, seg.lower_tags_arena, seg.tags_offsets,
+                           seg.tags_lengths, seg.dead_tags_bytes, localIdx, lowerTags, true);
+            writeArenaSlot(seg.base_desc_arena, seg.lower_desc_arena, seg.desc_offsets,
+                           seg.desc_lengths, seg.dead_desc_bytes, localIdx, lowerDesc, true);
+            seg.markSlotDirty(localIdx);
             return;
         }
 
-        size_t slot = soaPubIds.size();
-        if ((slot & 63u) == 0) {
-            for (auto &plane : tagBitsets) {
-                plane.push_back(0ULL);
-            }
-        }
-        const size_t wordIdx = slot >> 6;
-        const uint64_t bit = 1ULL << (slot & 63u);
-        for (uint64_t m = tagMask; m != 0; m &= (m - 1ULL)) {
-            tagBitsets[static_cast<unsigned>(std::countr_zero(m))][wordIdx] |= bit;
-        }
+        const size_t globalSlot = totalCount++;
+        const size_t segIdx = globalSlot / ChunkedCatalogSegment::kChunkLen;
+        const size_t localIdx = globalSlot % ChunkedCatalogSegment::kChunkLen;
+        ChunkedCatalogSegment &seg = mutableSegment(segIdx);
+        seg.count = static_cast<uint32_t>(localIdx + 1U);
+        seg.published_ids[localIdx] = pubId;
+        seg.tag_masks[localIdx] = tagMask;
+        seg.doc_bloom[localIdx] = bloom;
+        overwriteSlotTagBits(seg, localIdx, 0ULL, tagMask);
 
-        idToSlot.emplace(pubId, slot);
-        soaPubIds.push_back(pubId);
-        soaTagMasks.push_back(tagMask);
-
-        uint32_t tOff = static_cast<uint32_t>(soaLowerTitles.size());
-        soaLowerTitles.append(lowerTitle);
-        soaTitleOffsets.push_back(tOff);
-        soaTitleLengths.push_back(static_cast<uint32_t>(lowerTitle.size()));
-        totalTitleBytes += lowerTitle.size();
-
-        uint32_t gOff = static_cast<uint32_t>(soaLowerTags.size());
-        soaLowerTags.append(lowerTags);
-        soaTagsOffsets.push_back(gOff);
-        soaTagsLengths.push_back(static_cast<uint32_t>(lowerTags.size()));
-        totalTagsBytes += lowerTags.size();
-
-        soaDescLengths.push_back(descLen);
-        totalDescBytes += descLen;
+        writeArenaSlot(seg.base_title_arena, seg.lower_title_arena, seg.title_offsets,
+                       seg.title_lengths, seg.dead_title_bytes, localIdx, lowerTitle, false);
+        writeArenaSlot(seg.base_tags_arena, seg.lower_tags_arena, seg.tags_offsets,
+                       seg.tags_lengths, seg.dead_tags_bytes, localIdx, lowerTags, false);
+        writeArenaSlot(seg.base_desc_arena, seg.lower_desc_arena, seg.desc_offsets,
+                       seg.desc_lengths, seg.dead_desc_bytes, localIdx, lowerDesc, false);
+        seg.markSlotDirty(localIdx);
+        idToGlobalSlot.emplace(pubId, globalSlot);
     }
 
     void removeSoaLocked(uint64_t pubId)
     {
-        auto it = idToSlot.find(pubId);
-        if (it == idToSlot.end()) {
+        auto it = idToGlobalSlot.find(pubId);
+        if (it == idToGlobalSlot.end() || totalCount == 0U) {
             return;
         }
-        size_t slot = it->second;
-        totalTitleBytes -= soaTitleLengths[slot];
-        totalTagsBytes -= soaTagsLengths[slot];
-        totalDescBytes -= soaDescLengths[slot];
+        const size_t globalSlot = it->second;
+        const size_t lastGlobal = totalCount - 1U;
+        const size_t lastSegIdx = lastGlobal / ChunkedCatalogSegment::kChunkLen;
+        const size_t lastLocalIdx = lastGlobal % ChunkedCatalogSegment::kChunkLen;
 
-        size_t last = soaPubIds.size() - 1;
-        uint64_t lastMask = soaTagMasks[last];
-        if (slot != last) {
-            uint64_t movedId = soaPubIds[last];
-            overwriteSlotTagBitsLocked(slot, soaTagMasks[slot], lastMask);
-            soaPubIds[slot] = movedId;
-            soaTagMasks[slot] = lastMask;
-            soaTitleOffsets[slot] = soaTitleOffsets[last];
-            soaTitleLengths[slot] = soaTitleLengths[last];
-            soaTagsOffsets[slot] = soaTagsOffsets[last];
-            soaTagsLengths[slot] = soaTagsLengths[last];
-            soaDescLengths[slot] = soaDescLengths[last];
-            idToSlot[movedId] = slot;
+        if (globalSlot != lastGlobal) {
+            const size_t segIdx = globalSlot / ChunkedCatalogSegment::kChunkLen;
+            const size_t localIdx = globalSlot % ChunkedCatalogSegment::kChunkLen;
+
+            // Read moved slot strings from either dirty copy or immutable committed segment before
+            // mutating.
+            const ChunkedCatalogSegment *srcLast =
+                (lastSegIdx < scratchWorking.size() && scratchWorking[lastSegIdx])
+                    ? scratchWorking[lastSegIdx].get()
+                    : committedSegments[lastSegIdx].get();
+            const uint64_t movedId = srcLast->published_ids[lastLocalIdx];
+            const uint64_t movedMask = srcLast->tag_masks[lastLocalIdx];
+            const uint64_t movedBloom = srcLast->doc_bloom[lastLocalIdx];
+            const std::string movedTitle(srcLast->lowerTitleAt(lastLocalIdx));
+            const std::string movedTags(srcLast->lowerTagsAt(lastLocalIdx));
+            const std::string movedDesc(srcLast->lowerDescAt(lastLocalIdx));
+
+            ChunkedCatalogSegment &dstSeg = mutableSegment(segIdx);
+            overwriteSlotTagBits(dstSeg, localIdx, dstSeg.tag_masks[localIdx], movedMask);
+            dstSeg.published_ids[localIdx] = movedId;
+            dstSeg.tag_masks[localIdx] = movedMask;
+            dstSeg.doc_bloom[localIdx] = movedBloom;
+            writeArenaSlot(dstSeg.base_title_arena, dstSeg.lower_title_arena, dstSeg.title_offsets,
+                           dstSeg.title_lengths, dstSeg.dead_title_bytes, localIdx, movedTitle,
+                           true);
+            writeArenaSlot(dstSeg.base_tags_arena, dstSeg.lower_tags_arena, dstSeg.tags_offsets,
+                           dstSeg.tags_lengths, dstSeg.dead_tags_bytes, localIdx, movedTags, true);
+            writeArenaSlot(dstSeg.base_desc_arena, dstSeg.lower_desc_arena, dstSeg.desc_offsets,
+                           dstSeg.desc_lengths, dstSeg.dead_desc_bytes, localIdx, movedDesc, true);
+            dstSeg.markSlotDirty(localIdx);
+            idToGlobalSlot[movedId] = globalSlot;
         }
-        overwriteSlotTagBitsLocked(last, lastMask, 0ULL);
-        if ((last & 63u) == 0) {
-            for (auto &plane : tagBitsets) {
-                plane.pop_back();
-            }
-        }
-        soaPubIds.pop_back();
-        soaTagMasks.pop_back();
-        soaTitleOffsets.pop_back();
-        soaTitleLengths.pop_back();
-        soaTagsOffsets.pop_back();
-        soaTagsLengths.pop_back();
-        soaDescLengths.pop_back();
-        idToSlot.erase(it);
+
+        ChunkedCatalogSegment &lastSeg = mutableSegment(lastSegIdx);
+        overwriteSlotTagBits(lastSeg, lastLocalIdx, lastSeg.tag_masks[lastLocalIdx], 0ULL);
+        lastSeg.dead_title_bytes += lastSeg.title_lengths[lastLocalIdx];
+        lastSeg.dead_tags_bytes += lastSeg.tags_lengths[lastLocalIdx];
+        lastSeg.dead_desc_bytes += lastSeg.desc_lengths[lastLocalIdx];
+        lastSeg.markSlotDirty(lastLocalIdx);
+        lastSeg.count = static_cast<uint32_t>(lastLocalIdx);
+        --totalCount;
+        idToGlobalSlot.erase(it);
     }
 
     bool loadInitialSoaFromDbLocked(sqlite3 *db)
@@ -1292,6 +1701,7 @@ struct CatalogIndexManager::Impl {
                          sqlite3_errmsg(db));
             return false;
         }
+        beginChunkEdit();
         int stepRc = SQLITE_OK;
         while ((stepRc = sqlite3_step(stmt)) == SQLITE_ROW) {
             const uint64_t id = static_cast<uint64_t>(sqlite3_column_int64(stmt, 0));
@@ -1308,7 +1718,7 @@ struct CatalogIndexManager::Impl {
             clearSoaLocked();
             return false;
         }
-        publishRcuSnapshotLocked();
+        commitChunkEdit();
         return true;
     }
 };
@@ -1348,15 +1758,18 @@ CatalogIndexManager::CatalogIndexManager(const std::filesystem::path &dbPath)
         }
         return;
     }
+    m_impl->readPool.setPreCloseCallback(
+        [impl = m_impl.get()]() { impl->finalizeCachedFilterStatements(); });
     (void)m_impl->readPool.open(m_dbPath, m_impl->hasTrigramFts);
 }
 
 CatalogIndexManager::~CatalogIndexManager()
 {
     if (m_impl) {
-        // Cached filter statements may reference readPool slots or m_db, so finalize first.
-        m_impl->finalizeCachedFilterStatements();
+        // Drain readPool before closing cached filter statements and database handles (AUD-027).
         m_impl->readPool.close();
+        m_impl->readPool.setPreCloseCallback({});
+        m_impl->finalizeCachedFilterStatements();
         std::lock_guard<std::mutex> lock(m_impl->dbMutex);
         finalizeStatements();
         if (m_db) {
@@ -1383,7 +1796,7 @@ bool CatalogIndexManager::initSchema()
         !execSql(m_db, "PRAGMA synchronous = NORMAL;", "initSchema.sync") ||
         !execSql(m_db, "PRAGMA temp_store = MEMORY;", "initSchema.tempStore") ||
         !execSql(m_db, "PRAGMA foreign_keys = ON;", "initSchema.foreignKeys") ||
-        !execSql(m_db, "PRAGMA cache_size = -16384;", "initSchema.cacheSize") ||
+        !execSql(m_db, "PRAGMA cache_size = -8192;", "initSchema.cacheSize") ||
         !execSql(m_db, "PRAGMA mmap_size = 67108864;", "initSchema.mmapSize")) {
         return false;
     }
@@ -1476,17 +1889,12 @@ bool CatalogIndexManager::initSchema()
 
     const char *sqlIndices = R"(
         CREATE INDEX IF NOT EXISTS idx_items_type_tier_subs ON workshop_items(type, compat_tier, subscriptions DESC);
-        CREATE INDEX IF NOT EXISTS idx_items_type_subs      ON workshop_items(type, subscriptions DESC);
-        CREATE INDEX IF NOT EXISTS idx_items_tier_subs      ON workshop_items(compat_tier, subscriptions DESC);
         CREATE INDEX IF NOT EXISTS idx_items_subs           ON workshop_items(subscriptions DESC, published_file_id ASC);
-        CREATE INDEX IF NOT EXISTS idx_items_rating         ON workshop_items(rating DESC, published_file_id ASC);
-        CREATE INDEX IF NOT EXISTS idx_items_tier_rating    ON workshop_items(compat_tier, rating DESC, published_file_id ASC);
-        CREATE INDEX IF NOT EXISTS idx_items_tag_rating     ON workshop_items(tag_mask, rating DESC, published_file_id);
         CREATE INDEX IF NOT EXISTS idx_items_time_updated   ON workshop_items(time_updated DESC, published_file_id ASC);
         CREATE INDEX IF NOT EXISTS idx_items_title_nocase   ON workshop_items(title COLLATE NOCASE ASC);
-        CREATE INDEX IF NOT EXISTS idx_items_compat_score   ON workshop_items(compat_score DESC, subscriptions DESC);
-        CREATE INDEX IF NOT EXISTS idx_items_file_size      ON workshop_items(file_size_bytes DESC);
-        CREATE INDEX IF NOT EXISTS idx_items_install_state  ON workshop_items(install_state);
+        DROP INDEX IF EXISTS idx_items_rating;
+        DROP INDEX IF EXISTS idx_items_compat_score;
+        DROP INDEX IF EXISTS idx_items_file_size;
     )";
     if (!execSql(m_db, sqlIndices, "initSchema.indices")) {
         return false;
@@ -1563,39 +1971,15 @@ bool CatalogIndexManager::initSchema()
         return false;
     }
 
-    // Optional FTS5 trigram index on title for fast 3+ character substring lookup.
-    const char *sqlTrigram = R"(
-        CREATE VIRTUAL TABLE IF NOT EXISTS workshop_fts_trigram USING fts5 (
-            title,
-            content='workshop_items',
-            content_rowid='published_file_id',
-            tokenize='trigram'
-        );
-    )";
-    if (sqlite3_exec(m_db, sqlTrigram, nullptr, nullptr, nullptr) == SQLITE_OK) {
-        const char *sqlTriTriggers = R"(
-            CREATE TRIGGER IF NOT EXISTS trg_workshop_tri_ai AFTER INSERT ON workshop_items BEGIN
-                INSERT INTO workshop_fts_trigram (rowid, title)
-                VALUES (new.published_file_id, new.title);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS trg_workshop_tri_ad AFTER DELETE ON workshop_items BEGIN
-                INSERT INTO workshop_fts_trigram (workshop_fts_trigram, rowid, title)
-                VALUES ('delete', old.published_file_id, old.title);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS trg_workshop_tri_au
-            AFTER UPDATE OF title ON workshop_items BEGIN
-                INSERT INTO workshop_fts_trigram (workshop_fts_trigram, rowid, title)
-                VALUES ('delete', old.published_file_id, old.title);
-                INSERT INTO workshop_fts_trigram (rowid, title)
-                VALUES (new.published_file_id, new.title);
-            END;
-        )";
-        if (execSql(m_db, sqlTriTriggers, "initSchema.trigramTriggers")) {
-            m_impl->hasTrigramFts = true;
-        }
-    }
+    // Substring queries fall back to the lock-free Chunked SoA Myers pass instead of writing
+    // heavyweight trigram FTS5 tables/triggers on every bulk upsert.
+    m_impl->hasTrigramFts = false;
+    (void)execSql(m_db,
+                  "DROP TRIGGER IF EXISTS trg_workshop_tri_ai;"
+                  "DROP TRIGGER IF EXISTS trg_workshop_tri_ad;"
+                  "DROP TRIGGER IF EXISTS trg_workshop_tri_au;"
+                  "DROP TABLE IF EXISTS workshop_fts_trigram;",
+                  "initSchema.dropTrigram");
 
     {
         sqlite3_stmt *jsonProbe = nullptr;
@@ -1735,28 +2119,74 @@ bool CatalogIndexManager::prepareStatements()
         return false;
     }
 
-    if (m_impl->hasTrigramFts) {
-        const char *sqlTri = R"(
-            SELECT i.published_file_id, i.owner_steam_id, i.title, i.type, i.file_path, i.preview_path,
-                   i.file_size_bytes, i.time_created, i.time_updated, i.subscriptions, i.favorited,
-                   i.views, i.rating, i.install_state, i.storage_backend, i.compat_tier, i.compat_score,
-                   i.aspect_ratio, i.dominant_color, i.tag_mask, i.tags_string, i.description,
-                   i.manifest_id, i.file_clock, i.signature_verified,
-                   f.rank
-            FROM (
-                SELECT rowid, bm25(workshop_fts_trigram) AS rank
-                FROM workshop_fts_trigram
-                WHERE workshop_fts_trigram MATCH ?1
-                ORDER BY rank ASC, rowid ASC
-                LIMIT ?2 OFFSET ?3
-            ) f
-            JOIN workshop_items i ON f.rowid = i.published_file_id
-            ORDER BY f.rank ASC, i.published_file_id ASC;
-        )";
-        if (!prep(sqlTri, &m_stmtFtsTrigram, "ftsTrigram")) {
-            m_impl->hasTrigramFts = false;
+    // Multi-row prepared statement amortizes SQLite VDBE setup on bulk upserts.
+    std::string sqlBatch;
+    sqlBatch.reserve(2048);
+    sqlBatch.append("INSERT INTO workshop_items ("
+                    "published_file_id, owner_steam_id, title, type, file_path, preview_path,"
+                    "file_size_bytes, time_created, time_updated, subscriptions, favorited,"
+                    "views, rating, install_state, storage_backend, compat_tier, compat_score,"
+                    "aspect_ratio, dominant_color, tag_mask, tags_string, description,"
+                    "manifest_id, file_clock, signature_verified) VALUES ");
+    for (size_t r = 0; r < Impl::kBatchInsertRows; ++r) {
+        if (r > 0) {
+            sqlBatch.push_back(',');
         }
+        sqlBatch.append("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
     }
+    sqlBatch.append(" ON CONFLICT(published_file_id) DO UPDATE SET "
+                    "owner_steam_id=excluded.owner_steam_id,"
+                    "title=excluded.title,"
+                    "type=excluded.type,"
+                    "file_path=excluded.file_path,"
+                    "preview_path=excluded.preview_path,"
+                    "file_size_bytes=excluded.file_size_bytes,"
+                    "time_created=excluded.time_created,"
+                    "time_updated=excluded.time_updated,"
+                    "subscriptions=excluded.subscriptions,"
+                    "favorited=excluded.favorited,"
+                    "views=excluded.views,"
+                    "rating=excluded.rating,"
+                    "install_state=excluded.install_state,"
+                    "storage_backend=excluded.storage_backend,"
+                    "compat_tier=excluded.compat_tier,"
+                    "compat_score=excluded.compat_score,"
+                    "aspect_ratio=excluded.aspect_ratio,"
+                    "dominant_color=excluded.dominant_color,"
+                    "tag_mask=excluded.tag_mask,"
+                    "tags_string=excluded.tags_string,"
+                    "description=excluded.description,"
+                    "manifest_id=excluded.manifest_id,"
+                    "file_clock=CASE WHEN excluded.file_clock>workshop_items.file_clock "
+                    "THEN excluded.file_clock ELSE workshop_items.file_clock+1 END,"
+                    "signature_verified=excluded.signature_verified "
+                    "WHERE workshop_items.owner_steam_id!=excluded.owner_steam_id "
+                    "OR workshop_items.title!=excluded.title "
+                    "OR workshop_items.type!=excluded.type "
+                    "OR workshop_items.file_path!=excluded.file_path "
+                    "OR IFNULL(workshop_items.preview_path,'')!=IFNULL(excluded.preview_path,'') "
+                    "OR workshop_items.file_size_bytes!=excluded.file_size_bytes "
+                    "OR workshop_items.time_created!=excluded.time_created "
+                    "OR workshop_items.time_updated!=excluded.time_updated "
+                    "OR workshop_items.subscriptions!=excluded.subscriptions "
+                    "OR workshop_items.favorited!=excluded.favorited "
+                    "OR workshop_items.views!=excluded.views "
+                    "OR workshop_items.rating!=excluded.rating "
+                    "OR workshop_items.install_state!=excluded.install_state "
+                    "OR workshop_items.storage_backend!=excluded.storage_backend "
+                    "OR workshop_items.compat_tier!=excluded.compat_tier "
+                    "OR workshop_items.compat_score!=excluded.compat_score "
+                    "OR ABS(workshop_items.aspect_ratio-excluded.aspect_ratio)>1e-4 "
+                    "OR workshop_items.dominant_color!=excluded.dominant_color "
+                    "OR workshop_items.tag_mask!=excluded.tag_mask "
+                    "OR workshop_items.tags_string!=excluded.tags_string "
+                    "OR workshop_items.description!=excluded.description "
+                    "OR workshop_items.manifest_id!=excluded.manifest_id "
+                    "OR workshop_items.signature_verified!=excluded.signature_verified;");
+    (void)prep(sqlBatch.c_str(), &m_impl->stmtUpsertBatch32, "upsertBatch32");
+    (void)prep("BEGIN IMMEDIATE TRANSACTION;", &m_impl->stmtBeginImmediate, "beginImmediate");
+    (void)prep("COMMIT;", &m_impl->stmtCommit, "commitTx");
+    (void)prep("ROLLBACK;", &m_impl->stmtRollback, "rollbackTx");
 
     return true;
 }
@@ -1769,6 +2199,9 @@ void CatalogIndexManager::finalizeStatements()
             s = nullptr;
         }
     };
+    if (m_impl) {
+        m_impl->finalizeBatchStmt();
+    }
     finalizeOne(m_stmtUpsert);
     finalizeOne(m_stmtDelete);
     finalizeOne(m_stmtGetById);
@@ -1951,7 +2384,11 @@ bool CatalogIndexManager::upsertItem(const WorkshopItemRecord &item)
         return false;
     }
 
-    if (!execSql(m_db, "BEGIN IMMEDIATE TRANSACTION;", "upsertItem.begin")) {
+    const bool txStarted =
+        m_impl->stmtBeginImmediate
+            ? Impl::stepTxStmt(m_db, m_impl->stmtBeginImmediate, "upsertItem.begin")
+            : execSql(m_db, "BEGIN IMMEDIATE TRANSACTION;", "upsertItem.begin");
+    if (!txStarted) {
         return false;
     }
 
@@ -1964,11 +2401,15 @@ bool CatalogIndexManager::upsertItem(const WorkshopItemRecord &item)
         return false;
     }
 
-    if (!execSql(m_db, "COMMIT;", "upsertItem.commit")) {
+    const bool txCommitted = m_impl->stmtCommit
+                                 ? Impl::stepTxStmt(m_db, m_impl->stmtCommit, "upsertItem.commit")
+                                 : execSql(m_db, "COMMIT;", "upsertItem.commit");
+    if (!txCommitted) {
         rollbackIfInTx(m_db, "upsertItem.commitRollback");
         return false;
     }
 
+    m_impl->beginChunkEdit();
     for (const auto &d : deltas) {
         if (d.isRemove) {
             m_impl->removeSoaLocked(d.removeId);
@@ -1977,13 +2418,13 @@ bool CatalogIndexManager::upsertItem(const WorkshopItemRecord &item)
                                     item.tags_string, item.description);
         }
     }
-    m_impl->publishRcuSnapshotLocked();
+    m_impl->commitChunkEdit();
     return true;
 }
 
 bool CatalogIndexManager::upsertItems(const std::vector<WorkshopItemRecord> &items)
 {
-    std::lock_guard<std::mutex> lock(m_impl->dbMutex);
+    std::unique_lock<std::mutex> lock(m_impl->dbMutex);
     if (!m_db || !m_stmtUpsert) {
         return false;
     }
@@ -1999,24 +2440,51 @@ bool CatalogIndexManager::upsertItems(const std::vector<WorkshopItemRecord> &ite
     deltas.reserve(items.size());
 
     bool allOk = true;
-    for (size_t i = 0; i < items.size(); ++i) {
+    size_t i = 0;
+    if (m_impl->stmtUpsertBatch32 && items.size() >= Impl::kBatchInsertRows) {
+        constexpr size_t kCols = 25;
+        sqlite3_stmt *batchStmt = m_impl->stmtUpsertBatch32;
+        while (i + Impl::kBatchInsertRows <= items.size() && allOk) {
+            sqlite3_reset(batchStmt);
+            sqlite3_clear_bindings(batchStmt);
+            bool bindOk = true;
+            for (size_t r = 0; r < Impl::kBatchInsertRows; ++r) {
+                if (!bindRecordAtOffset(batchStmt, static_cast<int>(r * kCols), items[i + r])) {
+                    bindOk = false;
+                    break;
+                }
+            }
+            if (bindOk) {
+                const int rc = sqlite3_step(batchStmt);
+                sqlite3_reset(batchStmt);
+                if (rc == SQLITE_DONE) {
+                    for (size_t r = 0; r < Impl::kBatchInsertRows; ++r) {
+                        deltas.push_back(PendingSoaDelta{false, i + r, 0});
+                    }
+                    i += Impl::kBatchInsertRows;
+                    continue;
+                }
+            } else {
+                sqlite3_reset(batchStmt);
+            }
+            // Fall back to row-by-row conflict resolution for this 32-item slice on constraint
+            // clash.
+            for (size_t r = 0; r < Impl::kBatchInsertRows; ++r) {
+                if (!upsertSingleItemSql(m_db, m_stmtUpsert, m_stmtGetByPath, m_stmtDelete,
+                                         items[i + r], i + r, deltas)) {
+                    allOk = false;
+                    break;
+                }
+            }
+            i += Impl::kBatchInsertRows;
+        }
+    }
+
+    for (; i < items.size() && allOk; ++i) {
         if (!upsertSingleItemSql(m_db, m_stmtUpsert, m_stmtGetByPath, m_stmtDelete, items[i], i,
                                  deltas)) {
             allOk = false;
             break;
-        }
-    }
-
-    if (allOk && items.size() >= 1000) {
-        if (!execSql(m_db, "INSERT INTO workshop_fts(workshop_fts) VALUES('optimize');",
-                     "upsertItems.ftsOptimize")) {
-            allOk = false;
-        }
-        if (allOk && m_impl->hasTrigramFts &&
-            !execSql(m_db,
-                     "INSERT INTO workshop_fts_trigram(workshop_fts_trigram) VALUES('optimize');",
-                     "upsertItems.trigramOptimize")) {
-            allOk = false;
         }
     }
 
@@ -2029,12 +2497,7 @@ bool CatalogIndexManager::upsertItems(const std::vector<WorkshopItemRecord> &ite
         return false;
     }
 
-    if (items.size() >= 1000) {
-        // Checkpoint bulk batches into the main database file so mmap I/O covers all pages.
-        sqlite3_wal_checkpoint_v2(m_db, nullptr, SQLITE_CHECKPOINT_PASSIVE, nullptr, nullptr);
-    }
-    m_impl->soaPubIds.reserve(m_impl->soaPubIds.size() + items.size());
-    m_impl->soaTagMasks.reserve(m_impl->soaTagMasks.size() + items.size());
+    m_impl->beginChunkEdit();
     for (const auto &d : deltas) {
         if (d.isRemove) {
             m_impl->removeSoaLocked(d.removeId);
@@ -2044,7 +2507,13 @@ bool CatalogIndexManager::upsertItems(const std::vector<WorkshopItemRecord> &ite
                                     item.tags_string, item.description);
         }
     }
-    m_impl->publishRcuSnapshotLocked();
+    m_impl->commitChunkEdit();
+    if (items.size() >= 64U) {
+        sqlite3_wal_checkpoint_v2(m_db, nullptr, SQLITE_CHECKPOINT_PASSIVE, nullptr, nullptr);
+        const uint64_t sampleId = items.front().published_file_id;
+        lock.unlock();
+        m_impl->readPool.warmIdleSlots(sampleId);
+    }
     return true;
 }
 
@@ -2066,8 +2535,9 @@ bool CatalogIndexManager::removeItem(uint64_t publishedFileId)
     const int rc = sqlite3_step(m_stmtDelete);
     sqlite3_reset(m_stmtDelete);
     if (rc == SQLITE_DONE) {
+        m_impl->beginChunkEdit();
         m_impl->removeSoaLocked(publishedFileId);
-        m_impl->publishRcuSnapshotLocked();
+        m_impl->commitChunkEdit();
         return true;
     }
     std::fprintf(stderr, "[CatalogIndexManager] Delete failed for item %llu (rc=%d): %s\n",
@@ -2102,6 +2572,9 @@ std::optional<WorkshopItemRecord> CatalogIndexManager::getItem(uint64_t publishe
 
     if (m_impl->readPool.isOpen()) {
         auto lease = m_impl->readPool.acquire();
+        if (!lease.valid()) {
+            return std::nullopt;
+        }
         return execGet(lease.slot().db, lease.slot().stmtGetById);
     }
 
@@ -2137,6 +2610,9 @@ CatalogIndexManager::getItemByPath(const std::string &filePath) const
 
     if (m_impl->readPool.isOpen()) {
         auto lease = m_impl->readPool.acquire();
+        if (!lease.valid()) {
+            return std::nullopt;
+        }
         return execGet(lease.slot().db, lease.slot().stmtGetByPath);
     }
 
@@ -2165,6 +2641,9 @@ size_t CatalogIndexManager::totalItemCount() const
 
     if (m_impl->readPool.isOpen()) {
         auto lease = m_impl->readPool.acquire();
+        if (!lease.valid()) {
+            return 0;
+        }
         return execCount(lease.slot().db, lease.slot().stmtCount);
     }
 
@@ -2179,61 +2658,63 @@ size_t CatalogIndexManager::filterByTagMaskBitmap(uint64_t requiredMask,
         outIds->clear();
     }
 
-    const auto snap = m_impl->loadSnapshot();
-    if (!snap || snap->count == 0) {
+    const auto snap = m_impl->rcuPool.acquire_snapshot();
+    if (!snap || snap.total_count() == 0U) {
         return 0;
     }
 
-    const size_t n = snap->count;
-    const uint64_t *ids = snap->published_ids.data();
-    if (requiredMask == 0) {
+    const auto &segments = snap.segments();
+    if (requiredMask == 0ULL) {
         if (outIds) {
-            outIds->assign(ids, ids + n);
+            outIds->reserve(snap.total_count());
+            for (const auto &seg : segments) {
+                if (!seg || seg->count == 0U) {
+                    continue;
+                }
+                outIds->insert(outIds->end(), seg->published_ids.data(),
+                               seg->published_ids.data() + seg->count);
+            }
         }
-        return n;
+        return snap.total_count();
     }
 
-    std::array<const uint64_t *, 64> activePlanes{};
+    std::array<unsigned, 64> activeBitIdx{};
     size_t planeCount = 0;
-    for (uint64_t m = requiredMask; m != 0; m &= (m - 1ULL)) {
-        unsigned b = static_cast<unsigned>(std::countr_zero(m));
-        activePlanes[planeCount++] = snap->tag_bitsets[b].data();
+    for (uint64_t m = requiredMask; m != 0ULL; m &= (m - 1ULL)) {
+        activeBitIdx[planeCount++] = static_cast<unsigned>(std::countr_zero(m));
     }
 
-    const size_t wordCount = (n + 63u) >> 6;
-    const unsigned tailBits = static_cast<unsigned>(n & 63u);
-    const uint64_t tailMask = (tailBits == 0u) ? ~0ULL : ((1ULL << tailBits) - 1ULL);
+    size_t matches = 0;
+    for (const auto &seg : segments) {
+        if (!seg || seg->count == 0U) {
+            continue;
+        }
+        const uint32_t segCount = seg->count;
+        const size_t wordCount = (segCount + 63u) >> 6;
+        const unsigned tailBits = static_cast<unsigned>(segCount & 63u);
+        const uint64_t tailMask = (tailBits == 0u) ? ~0ULL : ((1ULL << tailBits) - 1ULL);
+        const uint64_t *ids = seg->published_ids.data();
 
-    if (outIds) {
         for (size_t w = 0; w < wordCount; ++w) {
-            uint64_t bits = activePlanes[0][w];
+            uint64_t bits = seg->tag_bitsets[activeBitIdx[0]][w];
             for (size_t p = 1; p < planeCount; ++p) {
-                bits &= activePlanes[p][w];
+                bits &= seg->tag_bitsets[activeBitIdx[p]][w];
             }
             if (w + 1 == wordCount) {
                 bits &= tailMask;
             }
-            while (bits != 0) {
-                unsigned bitIdx = static_cast<unsigned>(std::countr_zero(bits));
-                outIds->push_back(ids[(w << 6) + bitIdx]);
-                bits &= (bits - 1ULL);
+            if (outIds) {
+                while (bits != 0ULL) {
+                    const unsigned bitIdx = static_cast<unsigned>(std::countr_zero(bits));
+                    outIds->push_back(ids[(w << 6) + bitIdx]);
+                    bits &= (bits - 1ULL);
+                }
+            } else {
+                matches += static_cast<size_t>(std::popcount(bits));
             }
         }
-        return outIds->size();
     }
-
-    size_t matches = 0;
-    for (size_t w = 0; w < wordCount; ++w) {
-        uint64_t bits = activePlanes[0][w];
-        for (size_t p = 1; p < planeCount; ++p) {
-            bits &= activePlanes[p][w];
-        }
-        if (w + 1 == wordCount) {
-            bits &= tailMask;
-        }
-        matches += static_cast<size_t>(std::popcount(bits));
-    }
-    return matches;
+    return outIds ? outIds->size() : matches;
 }
 
 namespace {
@@ -2371,6 +2852,9 @@ std::vector<WorkshopItemRecord> CatalogIndexManager::searchFuzzy(const std::stri
 
         if (m_impl->readPool.isOpen()) {
             auto lease = m_impl->readPool.acquire();
+            if (!lease.valid()) {
+                return {};
+            }
             runTrigram(lease.slot().db, lease.slot().stmtTrigram);
         } else {
             std::lock_guard<std::mutex> lock(m_impl->dbMutex);
@@ -2381,8 +2865,8 @@ std::vector<WorkshopItemRecord> CatalogIndexManager::searchFuzzy(const std::stri
         }
     }
 
-    const auto snap = m_impl->loadSnapshot();
-    if (!snap || snap->count == 0) {
+    const auto snap = m_impl->rcuPool.acquire_snapshot();
+    if (!snap || snap.total_count() == 0U) {
         return {};
     }
 
@@ -2453,31 +2937,34 @@ std::vector<WorkshopItemRecord> CatalogIndexManager::searchFuzzy(const std::stri
     std::vector<CandidateHit> hits;
     hits.reserve(std::min<size_t>(reserveCap * 2u, kMaxReserveRows));
 
-    const size_t n = snap->count;
-    const uint64_t *masks = snap->tag_masks.data();
-    const uint64_t *ids = snap->published_ids.data();
-    const uint32_t *offs = snap->title_offsets.data();
-    const uint32_t *lens = snap->title_lengths.data();
-    const char *arena = snap->lower_title_arena.data();
-
-    for (size_t i = 0; i < n; ++i) {
-        if (requiredTagMask != 0 && (masks[i] & requiredTagMask) != requiredTagMask) {
+    for (const auto &seg : snap.segments()) {
+        if (!seg || seg->count == 0U) {
             continue;
         }
-        const std::string_view titleView(arena + offs[i], lens[i]);
-        uint32_t totalDist = 0;
-        bool matchedAll = true;
-        for (const auto &tm : matchers) {
-            const uint32_t d = tm.isAscii ? myersSubstringDistance64(titleView, tm.peq, tm.m)
-                                          : myersSubstringDistanceCodepoints64(titleView, tm.cpMap);
-            if (d > tm.maxDist) {
-                matchedAll = false;
-                break;
+        const uint32_t segCount = seg->count;
+        const uint64_t *masks = seg->tag_masks.data();
+        const uint64_t *ids = seg->published_ids.data();
+        const uint32_t *lens = seg->title_lengths.data();
+        for (uint32_t i = 0; i < segCount; ++i) {
+            if (requiredTagMask != 0ULL && (masks[i] & requiredTagMask) != requiredTagMask) {
+                continue;
             }
-            totalDist += d;
-        }
-        if (matchedAll) {
-            hits.push_back(CandidateHit{totalDist, lens[i], ids[i]});
+            const std::string_view titleView = seg->lowerTitleAt(i);
+            uint32_t totalDist = 0;
+            bool matchedAll = true;
+            for (const auto &tm : matchers) {
+                const uint32_t d = tm.isAscii
+                                       ? myersSubstringDistance64(titleView, tm.peq, tm.m)
+                                       : myersSubstringDistanceCodepoints64(titleView, tm.cpMap);
+                if (d > tm.maxDist) {
+                    matchedAll = false;
+                    break;
+                }
+                totalDist += d;
+            }
+            if (matchedAll) {
+                hits.push_back(CandidateHit{totalDist, lens[i], ids[i]});
+            }
         }
     }
 
@@ -2525,6 +3012,9 @@ std::vector<WorkshopItemRecord> CatalogIndexManager::searchFuzzy(const std::stri
 
     if (m_impl->readPool.isOpen()) {
         auto lease = m_impl->readPool.acquire();
+        if (!lease.valid()) {
+            return {};
+        }
         fetchByIds(lease.slot().db, lease.slot().stmtGetById);
     } else {
         std::lock_guard<std::mutex> lock(m_impl->dbMutex);
@@ -2545,9 +3035,487 @@ std::vector<WorkshopItemRecord> CatalogIndexManager::searchFts5Bm25(const std::s
 
     const int cappedLimit = std::clamp(limit > 0 ? limit : 50, 1, kMaxQueryLimit);
     const int safeOffset = std::clamp(offset >= 0 ? offset : 0, 0, kMaxQueryOffset);
+    const size_t keepCount = static_cast<size_t>(safeOffset) + static_cast<size_t>(cappedLimit);
 
     std::vector<WorkshopItemRecord> results;
     results.reserve(std::min<size_t>(static_cast<size_t>(cappedLimit), kMaxReserveRows));
+
+    // Answer bounded ASCII BM25 queries directly over wait-free ChunkedCatalogSnapshot arenas
+    // before hydrating winning rowids via ReadOnlySqlitePool.
+    const std::vector<std::string> rawTokens = tokenizeSanitizedFts(query);
+    bool allAscii = !rawTokens.empty();
+    std::vector<std::string> lowerTokens;
+    if (allAscii && keepCount <= 1024U) {
+        lowerTokens.reserve(rawTokens.size());
+        uint64_t qBloomMask = 0ULL;
+        for (const auto &tok : rawTokens) {
+            for (unsigned char c : tok) {
+                if (c >= 0x80u) {
+                    allAscii = false;
+                    break;
+                }
+            }
+            if (!allAscii) {
+                break;
+            }
+            std::string lowerTok = toLowerUtf8(tok);
+            qBloomMask |= prefixTokenBloomMask(lowerTok);
+            lowerTokens.push_back(std::move(lowerTok));
+        }
+
+        if (allAscii && !lowerTokens.empty()) {
+            const auto snap = m_impl->rcuPool.acquire_snapshot();
+            if (snap && snap.total_count() > 0U) {
+                struct Bm25Hit {
+                    double rankScore;
+                    uint64_t pubId;
+                };
+                auto betterThan = [](const Bm25Hit &a, const Bm25Hit &b) noexcept {
+                    if (a.rankScore != b.rankScore) {
+                        return a.rankScore < b.rankScore;
+                    }
+                    return a.pubId < b.pubId;
+                };
+
+                std::vector<Bm25Hit> topHits;
+                topHits.reserve(std::min<size_t>(keepCount, 128U));
+                const size_t tokCount = lowerTokens.size();
+
+                auto pushHit = [&](double docScore, uint64_t pubId) {
+                    const Bm25Hit cand{-docScore, pubId};
+                    if (topHits.size() < keepCount) {
+                        topHits.push_back(cand);
+                        if (topHits.size() == keepCount) {
+                            std::make_heap(topHits.begin(), topHits.end(), betterThan);
+                        }
+                    } else if (betterThan(cand, topHits.front())) {
+                        std::pop_heap(topHits.begin(), topHits.end(), betterThan);
+                        topHits.back() = cand;
+                        std::push_heap(topHits.begin(), topHits.end(), betterThan);
+                    }
+                };
+
+                struct SegDocAcc {
+                    double scoreAcc;
+                    uint32_t tfT;
+                    uint32_t tfG;
+                    uint32_t tfD;
+                    uint32_t matchMask;
+                };
+                struct TlsBm25Scratch {
+                    std::array<uint16_t, ChunkedCatalogSegment::kChunkLen> stamps{};
+                    std::array<SegDocAcc, ChunkedCatalogSegment::kChunkLen> docs;
+                    std::vector<uint16_t> touched{};
+                    uint16_t curStamp{0U};
+                };
+                thread_local TlsBm25Scratch tlsAcc;
+
+                auto nextStamp = [&]() -> uint16_t {
+                    if (tlsAcc.curStamp == std::numeric_limits<uint16_t>::max()) {
+                        tlsAcc.stamps.fill(0U);
+                        tlsAcc.curStamp = 0U;
+                    }
+                    return ++tlsAcc.curStamp;
+                };
+
+                auto evalSingleDocFromArena = [&](const ChunkedCatalogSegment &seg, uint32_t i) {
+                    if ((seg.doc_bloom[i] & qBloomMask) != qBloomMask) {
+                        return;
+                    }
+                    const std::string_view titleView = seg.lowerTitleAt(i);
+                    const std::string_view tagsView = seg.lowerTagsAt(i);
+                    const std::string_view descView = seg.lowerDescAt(i);
+
+                    double docScore = 0.0;
+                    for (size_t t = 0; t < tokCount; ++t) {
+                        const bool exactWord = (t + 1U < tokCount);
+                        const std::string_view tok = lowerTokens[t];
+                        const uint32_t tfTitle = countWordMatches(titleView, tok, exactWord);
+                        const uint32_t tfTags = countWordMatches(tagsView, tok, exactWord);
+                        const uint32_t tfDesc = countWordMatches(descView, tok, exactWord);
+                        if (tfTitle == 0U && tfTags == 0U && tfDesc == 0U) {
+                            return;
+                        }
+                        docScore += 10.0 * bm25TfNorm(tfTitle, titleView.size(), 24.0) +
+                                    5.0 * bm25TfNorm(tfTags, tagsView.size(), 16.0) +
+                                    1.0 * bm25TfNorm(tfDesc, descView.size(), 64.0);
+                    }
+                    pushHit(docScore, seg.published_ids[i]);
+                };
+
+                auto findRange = [&](const SegmentTokenIndex &ti, std::string_view tok,
+                                     bool exactWord) -> std::pair<size_t, size_t> {
+                    auto lo = std::lower_bound(
+                        ti.dict.begin(), ti.dict.end(), tok,
+                        [&](const SegmentTokenDictEntry &de, std::string_view key) {
+                            return ti.tokenAt(de) < key;
+                        });
+                    if (lo == ti.dict.end()) {
+                        return {0U, 0U};
+                    }
+                    const size_t loIdx = static_cast<size_t>(lo - ti.dict.begin());
+                    if (exactWord) {
+                        if (ti.tokenAt(*lo) == tok) {
+                            return {loIdx, loIdx + 1U};
+                        }
+                        return {0U, 0U};
+                    }
+                    auto hi = std::partition_point(lo, ti.dict.end(),
+                                                   [&](const SegmentTokenDictEntry &de) {
+                                                       return ti.tokenAt(de).starts_with(tok);
+                                                   });
+                    return {loIdx, static_cast<size_t>(hi - ti.dict.begin())};
+                };
+
+                if (tokCount == 1U) {
+                    struct SegCand {
+                        double upperBound;
+                        size_t segIdx;
+                        size_t loIdx;
+                        size_t hiIdx;
+                    };
+                    const auto &segs = snap.segments();
+                    std::vector<SegCand> segCands;
+                    segCands.reserve(segs.size());
+                    for (size_t segIdx = 0U; segIdx < segs.size(); ++segIdx) {
+                        const auto &seg = segs[segIdx];
+                        if (!seg || seg->count == 0U) {
+                            continue;
+                        }
+                        const uint32_t segCount = seg->count;
+                        if (!seg->token_index) {
+                            for (uint32_t i = 0U; i < segCount; ++i) {
+                                evalSingleDocFromArena(*seg, i);
+                            }
+                            continue;
+                        }
+                        for (uint16_t d = 0U; d < seg->dirty_count; ++d) {
+                            const uint16_t dirtyIdx = seg->dirty_slots[d];
+                            if (dirtyIdx < segCount) {
+                                evalSingleDocFromArena(*seg, dirtyIdx);
+                            }
+                        }
+                        const SegmentTokenIndex &ti = *seg->token_index;
+                        const auto [loIdx, hiIdx] = findRange(ti, lowerTokens[0], false);
+                        if (loIdx == hiIdx) {
+                            continue;
+                        }
+                        double upperBound = 0.0;
+                        for (size_t d = loIdx; d < hiIdx; ++d) {
+                            const auto &de = ti.dict[d];
+                            if (de.postLen > 0U) {
+                                upperBound += ti.postings[de.postBegin].singleScore;
+                            }
+                        }
+                        segCands.push_back(SegCand{upperBound, segIdx, loIdx, hiIdx});
+                    }
+
+                    std::sort(segCands.begin(), segCands.end(),
+                              [](const SegCand &a, const SegCand &b) noexcept {
+                                  return a.upperBound > b.upperBound;
+                              });
+
+                    for (const auto &sc : segCands) {
+                        if (topHits.size() == keepCount &&
+                            sc.upperBound < -topHits.front().rankScore) {
+                            break;
+                        }
+                        const auto &seg = segs[sc.segIdx];
+                        const uint32_t segCount = seg->count;
+                        const SegmentTokenIndex &ti = *seg->token_index;
+                        if (sc.loIdx + 1U == sc.hiIdx) {
+                            const auto &de = ti.dict[sc.loIdx];
+                            size_t cleanTaken = 0U;
+                            const uint32_t endPos = de.postBegin + de.postLen;
+                            for (uint32_t p = de.postBegin; p < endPos; ++p) {
+                                const auto &post = ti.postings[p];
+                                if (topHits.size() == keepCount &&
+                                    post.singleScore < -topHits.front().rankScore) {
+                                    break;
+                                }
+                                if (post.localIdx >= segCount || seg->isSlotDirty(post.localIdx)) {
+                                    continue;
+                                }
+                                pushHit(post.singleScore, seg->published_ids[post.localIdx]);
+                                if (++cleanTaken >= keepCount) {
+                                    break;
+                                }
+                            }
+                        } else {
+                            const uint16_t stamp = nextStamp();
+                            tlsAcc.touched.clear();
+                            for (size_t d = sc.loIdx; d < sc.hiIdx; ++d) {
+                                const auto &de = ti.dict[d];
+                                const uint32_t endPos = de.postBegin + de.postLen;
+                                for (uint32_t p = de.postBegin; p < endPos; ++p) {
+                                    const auto &post = ti.postings[p];
+                                    if (post.localIdx >= segCount ||
+                                        seg->isSlotDirty(post.localIdx)) {
+                                        continue;
+                                    }
+                                    auto &acc = tlsAcc.docs[post.localIdx];
+                                    if (tlsAcc.stamps[post.localIdx] != stamp) {
+                                        tlsAcc.stamps[post.localIdx] = stamp;
+                                        acc.tfT = 0U;
+                                        acc.tfG = 0U;
+                                        acc.tfD = 0U;
+                                        tlsAcc.touched.push_back(post.localIdx);
+                                    }
+                                    acc.tfT += post.tfTitle;
+                                    acc.tfG += post.tfTags;
+                                    acc.tfD += post.tfDesc;
+                                }
+                            }
+                            for (uint16_t docIdx : tlsAcc.touched) {
+                                const auto &acc = tlsAcc.docs[docIdx];
+                                const double docScore =
+                                    10.0 * bm25TfNorm(acc.tfT, seg->title_lengths[docIdx], 24.0) +
+                                    5.0 * bm25TfNorm(acc.tfG, seg->tags_lengths[docIdx], 16.0) +
+                                    1.0 * bm25TfNorm(acc.tfD, seg->desc_lengths[docIdx], 64.0);
+                                pushHit(docScore, seg->published_ids[docIdx]);
+                            }
+                        }
+                    }
+                } else {
+                    for (const auto &seg : snap.segments()) {
+                        if (!seg || seg->count == 0U) {
+                            continue;
+                        }
+                        const uint32_t segCount = seg->count;
+
+                        if (!seg->token_index || tokCount > 16U) {
+                            for (uint32_t i = 0U; i < segCount; ++i) {
+                                evalSingleDocFromArena(*seg, i);
+                            }
+                            continue;
+                        }
+
+                        for (uint16_t d = 0U; d < seg->dirty_count; ++d) {
+                            const uint16_t dirtyIdx = seg->dirty_slots[d];
+                            if (dirtyIdx < segCount) {
+                                evalSingleDocFromArena(*seg, dirtyIdx);
+                            }
+                        }
+
+                        const SegmentTokenIndex &ti = *seg->token_index;
+                        std::array<std::pair<size_t, size_t>, 16> ranges{};
+                        bool allPresent = true;
+                        size_t anchorToken = 0U;
+                        size_t smallestCount = std::numeric_limits<size_t>::max();
+                        for (size_t t = 0U; t < tokCount; ++t) {
+                            ranges[t] = findRange(ti, lowerTokens[t], t + 1U < tokCount);
+                            if (ranges[t].first == ranges[t].second) {
+                                allPresent = false;
+                                break;
+                            }
+                            size_t spanPosts = 0U;
+                            for (size_t d = ranges[t].first; d < ranges[t].second; ++d) {
+                                spanPosts += ti.dict[d].postLen;
+                            }
+                            if (spanPosts < smallestCount) {
+                                smallestCount = spanPosts;
+                                anchorToken = t;
+                            }
+                        }
+                        if (!allPresent) {
+                            continue;
+                        }
+
+                        const uint16_t stamp = nextStamp();
+                        tlsAcc.touched.clear();
+                        const uint32_t fullMask = (1U << tokCount) - 1U;
+                        const bool anchorIsLast = (anchorToken + 1U == tokCount);
+                        for (size_t d = ranges[anchorToken].first; d < ranges[anchorToken].second;
+                             ++d) {
+                            const auto &de = ti.dict[d];
+                            const uint32_t endPos = de.postBegin + de.postLen;
+                            for (uint32_t p = de.postBegin; p < endPos; ++p) {
+                                const auto &post = ti.postings[p];
+                                if (post.localIdx >= segCount || seg->isSlotDirty(post.localIdx)) {
+                                    continue;
+                                }
+                                auto &acc = tlsAcc.docs[post.localIdx];
+                                if (tlsAcc.stamps[post.localIdx] != stamp) {
+                                    tlsAcc.stamps[post.localIdx] = stamp;
+                                    acc.scoreAcc = 0.0;
+                                    acc.tfT = 0U;
+                                    acc.tfG = 0U;
+                                    acc.tfD = 0U;
+                                    acc.matchMask = 1U << anchorToken;
+                                    tlsAcc.touched.push_back(post.localIdx);
+                                }
+                                if (anchorIsLast) {
+                                    acc.tfT += post.tfTitle;
+                                    acc.tfG += post.tfTags;
+                                    acc.tfD += post.tfDesc;
+                                } else {
+                                    acc.scoreAcc += post.singleScore;
+                                }
+                            }
+                        }
+                        for (size_t t = 0U; t < tokCount; ++t) {
+                            if (t == anchorToken) {
+                                continue;
+                            }
+                            const bool isLast = (t + 1U == tokCount);
+                            const uint32_t tBit = 1U << t;
+                            for (size_t d = ranges[t].first; d < ranges[t].second; ++d) {
+                                const auto &de = ti.dict[d];
+                                const uint32_t endPos = de.postBegin + de.postLen;
+                                for (uint32_t p = de.postBegin; p < endPos; ++p) {
+                                    const auto &post = ti.postings[p];
+                                    if (post.localIdx >= segCount) {
+                                        continue;
+                                    }
+                                    if (tlsAcc.stamps[post.localIdx] != stamp) {
+                                        continue;
+                                    }
+                                    auto &acc = tlsAcc.docs[post.localIdx];
+                                    acc.matchMask |= tBit;
+                                    if (isLast) {
+                                        acc.tfT += post.tfTitle;
+                                        acc.tfG += post.tfTags;
+                                        acc.tfD += post.tfDesc;
+                                    } else {
+                                        acc.scoreAcc += post.singleScore;
+                                    }
+                                }
+                            }
+                        }
+                        for (uint16_t docIdx : tlsAcc.touched) {
+                            const auto &acc = tlsAcc.docs[docIdx];
+                            if (acc.matchMask != fullMask) {
+                                continue;
+                            }
+                            double totalScore = acc.scoreAcc;
+                            if (acc.tfT != 0U || acc.tfG != 0U || acc.tfD != 0U) {
+                                totalScore +=
+                                    10.0 * bm25TfNorm(acc.tfT, seg->title_lengths[docIdx], 24.0) +
+                                    5.0 * bm25TfNorm(acc.tfG, seg->tags_lengths[docIdx], 16.0) +
+                                    1.0 * bm25TfNorm(acc.tfD, seg->desc_lengths[docIdx], 64.0);
+                            }
+                            pushHit(totalScore, seg->published_ids[docIdx]);
+                        }
+                    }
+                }
+
+                if (!topHits.empty()) {
+                    std::sort(topHits.begin(), topHits.end(), betterThan);
+                    const size_t startIdx =
+                        std::min(static_cast<size_t>(safeOffset), topHits.size());
+                    const size_t endIdx =
+                        std::min(startIdx + static_cast<size_t>(cappedLimit), topHits.size());
+                    if (startIdx >= endIdx) {
+                        return {};
+                    }
+
+                    auto hydrateHits = [&](sqlite3 *db, sqlite3_stmt *stmtSingle,
+                                           sqlite3_stmt *stmtBatch50) {
+                        if (stmtBatch50) {
+                            StmtResetGuard batchResetGuard{stmtBatch50};
+                            std::vector<WorkshopItemRecord> fetched;
+                            fetched.reserve(50U);
+                            for (size_t pos = startIdx; pos < endIdx; pos += 50U) {
+                                const size_t batchN = std::min<size_t>(50U, endIdx - pos);
+                                sqlite3_reset(stmtBatch50);
+                                sqlite3_clear_bindings(stmtBatch50);
+                                bool bindOk = true;
+                                for (size_t k = 0U; k < 50U; ++k) {
+                                    const int rc =
+                                        (k < batchN)
+                                            ? sqlite3_bind_int64(stmtBatch50,
+                                                                 static_cast<int>(k + 1U),
+                                                                 static_cast<sqlite3_int64>(
+                                                                     topHits[pos + k].pubId))
+                                            : sqlite3_bind_null(stmtBatch50,
+                                                                static_cast<int>(k + 1U));
+                                    if (rc != SQLITE_OK) {
+                                        bindOk = false;
+                                        break;
+                                    }
+                                }
+                                if (!bindOk) {
+                                    continue;
+                                }
+                                fetched.clear();
+                                int stepRc = SQLITE_OK;
+                                while ((stepRc = sqlite3_step(stmtBatch50)) == SQLITE_ROW) {
+                                    fetched.push_back(readRecordFromStmt(stmtBatch50));
+                                }
+                                if (stepRc != SQLITE_DONE) {
+                                    std::fprintf(stderr,
+                                                 "[CatalogIndexManager] BM25 batch hydrate failed "
+                                                 "(rc=%d): %s\n",
+                                                 stepRc, db ? sqlite3_errmsg(db) : "null db");
+                                    continue;
+                                }
+                                std::sort(fetched.begin(), fetched.end(),
+                                          [](const WorkshopItemRecord &a,
+                                             const WorkshopItemRecord &b) noexcept {
+                                              return a.published_file_id < b.published_file_id;
+                                          });
+                                for (size_t k = 0U; k < batchN; ++k) {
+                                    const uint64_t targetId = topHits[pos + k].pubId;
+                                    auto it = std::lower_bound(
+                                        fetched.begin(), fetched.end(), targetId,
+                                        [](const WorkshopItemRecord &r, uint64_t id) noexcept {
+                                            return r.published_file_id < id;
+                                        });
+                                    if (it != fetched.end() && it->published_file_id == targetId) {
+                                        WorkshopItemRecord rec = std::move(*it);
+                                        rec.search_rank = topHits[pos + k].rankScore;
+                                        results.push_back(std::move(rec));
+                                    }
+                                }
+                            }
+                            return;
+                        }
+                        if (!stmtSingle) {
+                            return;
+                        }
+                        StmtResetGuard resetGuard{stmtSingle};
+                        for (size_t idx = startIdx; idx < endIdx; ++idx) {
+                            sqlite3_reset(stmtSingle);
+                            sqlite3_clear_bindings(stmtSingle);
+                            if (sqlite3_bind_int64(
+                                    stmtSingle, 1,
+                                    static_cast<sqlite3_int64>(topHits[idx].pubId)) != SQLITE_OK) {
+                                continue;
+                            }
+                            const int rc = sqlite3_step(stmtSingle);
+                            if (rc == SQLITE_ROW) {
+                                WorkshopItemRecord rec = readRecordFromStmt(stmtSingle);
+                                rec.search_rank = topHits[idx].rankScore;
+                                results.push_back(std::move(rec));
+                            } else if (rc != SQLITE_DONE) {
+                                std::fprintf(
+                                    stderr,
+                                    "[CatalogIndexManager] BM25 hydrate failed (rc=%d): %s\n", rc,
+                                    db ? sqlite3_errmsg(db) : "null db");
+                            }
+                        }
+                    };
+
+                    if (m_impl->readPool.isOpen()) {
+                        auto lease = m_impl->readPool.acquire();
+                        if (!lease.valid()) {
+                            return {};
+                        }
+                        hydrateHits(lease.slot().db, lease.slot().stmtGetById,
+                                    lease.slot().stmtGetBatch50);
+                    } else {
+                        std::lock_guard<std::mutex> lock(m_impl->dbMutex);
+                        if (m_db && m_stmtGetById) {
+                            hydrateHits(m_db, m_stmtGetById, nullptr);
+                        }
+                    }
+                    if (!results.empty()) {
+                        return results;
+                    }
+                }
+            }
+        }
+    }
 
     auto runBm25 = [&](sqlite3 *db, sqlite3_stmt *stmt) {
         if (!stmt) {
@@ -2574,6 +3542,9 @@ std::vector<WorkshopItemRecord> CatalogIndexManager::searchFts5Bm25(const std::s
 
     if (m_impl->readPool.isOpen()) {
         auto lease = m_impl->readPool.acquire();
+        if (!lease.valid()) {
+            return {};
+        }
         runBm25(lease.slot().db, lease.slot().stmtFtsBm25);
     } else {
         std::lock_guard<std::mutex> lock(m_impl->dbMutex);
@@ -2690,6 +3661,9 @@ CatalogIndexManager::queryByFilters(const CatalogFilter &filter) const
 
     if (m_impl->readPool.isOpen()) {
         auto lease = m_impl->readPool.acquire();
+        if (!lease.valid()) {
+            return {};
+        }
         return executeWithDb(lease.slot().db);
     }
 
@@ -2958,6 +3932,11 @@ size_t CatalogIndexManager::reconcileDirectory(const std::filesystem::path &work
         bool loaded = false;
         if (m_impl->readPool.isOpen()) {
             auto lease = m_impl->readPool.acquire();
+            if (!lease.valid()) {
+                ::closedir(topDir);
+                m_impl->lastReconcileStatCalls.store(0, std::memory_order_relaxed);
+                return 0;
+            }
             loaded = loadExisting(lease.slot().db);
         } else {
             std::lock_guard<std::mutex> lock(m_impl->dbMutex);
@@ -2972,7 +3951,7 @@ size_t CatalogIndexManager::reconcileDirectory(const std::filesystem::path &work
 
     size_t indexedCount = 0;
     size_t statCalls = 0;
-    IoUringStatxBatcher statxBatcher;
+    IoUringStatxBatcher &statxBatcher = threadLocalStatxBatcher();
     std::vector<WorkshopItemRecord> dirtyRecords;
     std::unordered_set<uint64_t> seenIds;
     seenIds.reserve(existingScopedIds.size() + 32);
@@ -3155,10 +4134,11 @@ size_t CatalogIndexManager::reconcileDirectory(const std::filesystem::path &work
             rollbackIfInTx(m_db, "reconcile.deleteRollback");
             return indexedCount;
         }
+        m_impl->beginChunkEdit();
         for (uint64_t deadId : staleIds) {
             m_impl->removeSoaLocked(deadId);
         }
-        m_impl->publishRcuSnapshotLocked();
+        m_impl->commitChunkEdit();
     }
 
     if (!dirtyRecords.empty()) {
@@ -3178,7 +4158,7 @@ bool CatalogIndexManager::reconcileItemDirectory(const std::filesystem::path &it
         return false;
     }
 
-    IoUringStatxBatcher batcher;
+    IoUringStatxBatcher &batcher = threadLocalStatxBatcher();
     size_t statCalls = 0;
     WorkshopItemRecord rec;
     if (!buildLooseItemRecord(itemDir, publishedFileId, storageBackend, nullptr, batcher, statCalls,

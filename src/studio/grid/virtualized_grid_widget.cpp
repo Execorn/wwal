@@ -12,6 +12,8 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QDialog>
+#include <QDir>
+#include <QFile>
 #include <QFileDialog>
 #include <QGridLayout>
 #include <QGuiApplication>
@@ -25,12 +27,70 @@
 #include <QResizeEvent>
 #include <QScrollArea>
 #include <QSignalBlocker>
+#include <QStandardPaths>
 
 namespace wwal::studio {
 
 namespace {
 
 bool isOffscreenPlatform() { return QGuiApplication::platformName() == QLatin1String("offscreen"); }
+
+void drawImageAspectFill(QPainter &painter, const QRect &target, const QImage &img)
+{
+    if (img.isNull() || target.isEmpty()) {
+        return;
+    }
+    const QSize scaledSize = img.size().scaled(target.size(), Qt::KeepAspectRatioByExpanding);
+    QRect drawRect(0, 0, scaledSize.width(), scaledSize.height());
+    drawRect.moveCenter(target.center());
+    painter.drawImage(drawRect, img);
+}
+
+QString ensureSampleAssetDir()
+{
+    QString base = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
+    if (base.isEmpty()) {
+        base = QDir::tempPath();
+    }
+    QDir dir(base + QStringLiteral("/wwal_samples"));
+    if (!dir.exists()) {
+        dir.mkpath(QStringLiteral("."));
+    }
+    return dir.absolutePath();
+}
+
+void ensureSamplePng(const QString &path, uint32_t rgb)
+{
+    if (QFile::exists(path)) {
+        return;
+    }
+    QImage img(64, 36, QImage::Format_RGBA8888);
+    const QColor base((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
+    for (int y = 0; y < img.height(); ++y) {
+        const float t = static_cast<float>(y) / static_cast<float>(img.height() - 1);
+        for (int x = 0; x < img.width(); ++x) {
+            const float s = static_cast<float>(x) / static_cast<float>(img.width() - 1);
+            const int r = std::clamp(static_cast<int>(base.red() * (0.65f + 0.35f * s)), 0, 255);
+            const int g = std::clamp(static_cast<int>(base.green() * (0.65f + 0.35f * t)), 0, 255);
+            const int b =
+                std::clamp(static_cast<int>(base.blue() * (0.75f + 0.25f * (1.0f - t))), 0, 255);
+            img.setPixelColor(x, y, QColor(r, g, b));
+        }
+    }
+    (void)img.save(path, "PNG");
+}
+
+void ensureSampleTextFile(const QString &path, const QByteArray &content)
+{
+    if (QFile::exists(path)) {
+        return;
+    }
+    QFile f(path);
+    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        f.write(content);
+        f.close();
+    }
+}
 
 #ifndef GL_COMPRESSED_RGB8_ETC2
 #define GL_COMPRESSED_RGB8_ETC2 0x9274
@@ -100,10 +160,7 @@ GridGlCanvas::GridGlCanvas(FuzzyCatalogIndex &index, GpuTexturePool &pool,
     setAutoFillBackground(false);
     setMouseTracking(true);
     setFocusPolicy(Qt::StrongFocus);
-
-    m_fallbackCanvas = new QLabel(this);
-    m_fallbackCanvas->setAttribute(Qt::WA_TransparentForMouseEvents, true);
-    m_fallbackCanvas->setVisible(false);
+    setAccessibleName(QStringLiteral("Wallpaper Catalog Grid"));
 
     m_hover.setGlOwner(this);
 
@@ -140,28 +197,8 @@ GridGlCanvas::~GridGlCanvas()
     }
 }
 
-void GridGlCanvas::destroyCompressedCache()
-{
-    for (auto &[id, entry] : m_etc2Cache) {
-        if (entry.tex_id != 0) {
-            glDeleteTextures(1, &entry.tex_id);
-        }
-    }
-    m_etc2Cache.clear();
-    m_etc2Lru.clear();
-}
-
 void GridGlCanvas::releaseGlResources()
 {
-    destroyCompressedCache();
-    if (m_pboRing[0] != 0 || m_pboRing[1] != 0) {
-        glDeleteBuffers(2, m_pboRing.data());
-        m_pboRing = {0, 0};
-    }
-    m_pboCapacities = {0, 0};
-    m_pboIndex = 0;
-    m_supportsEtc2 = false;
-    m_etc2InternalFormat = 0;
     if (m_cardVbo != 0) {
         glDeleteBuffers(1, &m_cardVbo);
         m_cardVbo = 0;
@@ -170,23 +207,17 @@ void GridGlCanvas::releaseGlResources()
         glDeleteVertexArrays(1, &m_cardVao);
         m_cardVao = 0;
     }
-    if (m_cardProgram != 0) {
-        glDeleteProgram(m_cardProgram);
-        m_cardProgram = 0;
-    }
     if (m_cardArrayProgram != 0) {
         glDeleteProgram(m_cardArrayProgram);
         m_cardArrayProgram = 0;
     }
-    m_uViewportLoc = -1;
-    m_uCardRectLoc = -1;
-    m_uTexLoc = -1;
     m_uArrayViewportLoc = -1;
     m_uArrayCardRectLoc = -1;
     m_uArrayTexLoc = -1;
     m_uArrayLayerLoc = -1;
     m_uArraySrgbLoc = -1;
-    m_glRenderedThisFrame.clear();
+    m_uArrayDprLoc = -1;
+    std::fill(m_glRenderedSliceMask.begin(), m_glRenderedSliceMask.end(), uint8_t{0});
     m_pool.destroyGl(this);
     m_hover.destroyGl(this);
     m_glInitialized = false;
@@ -222,17 +253,27 @@ GridVisibleSlice GridGlCanvas::computeVisibleSlice(size_t total_items, int colum
             .is_empty = true, .row_first = 0, .row_last = 0, .index_first = 0, .index_last = 0};
     }
 
-    int r_total = computeTotalRows(total_items, columns);
-    int r_first = std::max(0, (scroll_y / ROW_HEIGHT) - OVERSCAN_ROWS);
-    int r_last = std::min(r_total - 1,
-                          ((scroll_y + viewport_h + ROW_HEIGHT - 1) / ROW_HEIGHT) + OVERSCAN_ROWS);
+    // Clamp via int64_t so negative or extreme scroll_y never underflows size_t indices (AUD-055).
+    const int64_t r_total = computeTotalRows(total_items, columns);
+    const int64_t clamped_scroll = std::max<int64_t>(0, scroll_y);
+    const int64_t safe_view_h = std::max<int64_t>(0, viewport_h);
+    const int64_t row_h = ROW_HEIGHT;
+    const int64_t raw_first = (clamped_scroll / row_h) - OVERSCAN_ROWS;
+    const int64_t raw_last = ((clamped_scroll + safe_view_h + row_h - 1) / row_h) + OVERSCAN_ROWS;
+    const int64_t r_first_i = std::clamp<int64_t>(raw_first, 0, r_total - 1);
+    const int64_t r_last_i = std::clamp<int64_t>(raw_last, 0, r_total - 1);
 
-    size_t idx_first = static_cast<size_t>(columns * r_first);
-    size_t idx_last = std::min(total_items - 1, static_cast<size_t>(columns * (r_last + 1) - 1));
+    const size_t idx_first = static_cast<size_t>(columns) * static_cast<size_t>(r_first_i);
+    const size_t idx_last = std::min(
+        total_items - 1U, static_cast<size_t>(columns) * static_cast<size_t>(r_last_i + 1) - 1U);
+    if (idx_first > idx_last) {
+        return GridVisibleSlice{
+            .is_empty = true, .row_first = 0, .row_last = 0, .index_first = 0, .index_last = 0};
+    }
 
     return GridVisibleSlice{.is_empty = false,
-                            .row_first = r_first,
-                            .row_last = r_last,
+                            .row_first = static_cast<int>(r_first_i),
+                            .row_last = static_cast<int>(r_last_i),
                             .index_first = idx_first,
                             .index_last = idx_last};
 }
@@ -282,7 +323,8 @@ std::optional<size_t> GridGlCanvas::itemAtPoint(const QPoint &pos) const
     int in_card_x = rel_x % (card_w + SPACING_X);
     int in_card_y = rel_y % ROW_HEIGHT;
 
-    if (in_card_x > card_w || in_card_y > ITEM_HEIGHT) {
+    // Gutter begins strictly at card_w / ITEM_HEIGHT (AUD-218).
+    if (in_card_x >= card_w || in_card_y >= ITEM_HEIGHT) {
         return std::nullopt;
     }
 
@@ -300,45 +342,46 @@ void GridGlCanvas::setScrollY(int scroll_y)
     int clamped = std::clamp(scroll_y, 0, max_scroll);
     if (m_scrollY != clamped) {
         m_scrollY = clamped;
+        emit scrollYChanged(m_scrollY);
         update();
     }
 }
 
 void GridGlCanvas::toggleSelection(uint32_t item_id)
 {
-    if (m_selectedIds.contains(item_id)) {
-        m_selectedIds.erase(item_id);
+    if (m_selectedIds.erase(item_id) > 0U) {
+        std::erase(m_selectedOrder, item_id);
     } else {
         m_selectedIds.insert(item_id);
+        m_selectedOrder.push_back(item_id);
     }
     m_lastSelectedId = item_id;
 
-    std::vector<uint32_t> list(m_selectedIds.begin(), m_selectedIds.end());
-    emit selectionChanged(list);
+    emit selectionChanged(m_selectedOrder);
     update();
 }
 
 void GridGlCanvas::selectRange(uint32_t from_id, uint32_t to_id)
 {
-    size_t total = m_index.filteredCount();
-    bool in_range = false;
-    for (size_t i = 0; i < total; ++i) {
-        uint32_t id = m_index.filteredIdAt(i);
-        if (id == from_id || id == to_id) {
-            m_selectedIds.insert(id);
-            if (!in_range) {
-                in_range = true;
-            } else {
-                break;
+    const auto fromPos = m_index.filteredPositionOfId(from_id);
+    const auto toPos = m_index.filteredPositionOfId(to_id);
+    if (fromPos.has_value() && toPos.has_value()) {
+        const size_t lo = std::min(*fromPos, *toPos);
+        const size_t hi = std::max(*fromPos, *toPos);
+        for (size_t i = lo; i <= hi; ++i) {
+            const uint32_t id = m_index.filteredItemAt(i).id;
+            if (m_selectedIds.insert(id).second) {
+                m_selectedOrder.push_back(id);
             }
-        } else if (in_range) {
-            m_selectedIds.insert(id);
+        }
+    } else if (toPos.has_value()) {
+        if (m_selectedIds.insert(to_id).second) {
+            m_selectedOrder.push_back(to_id);
         }
     }
     m_lastSelectedId = to_id;
 
-    std::vector<uint32_t> list(m_selectedIds.begin(), m_selectedIds.end());
-    emit selectionChanged(list);
+    emit selectionChanged(m_selectedOrder);
     update();
 }
 
@@ -346,6 +389,7 @@ void GridGlCanvas::clearSelection()
 {
     if (!m_selectedIds.empty()) {
         m_selectedIds.clear();
+        m_selectedOrder.clear();
         m_lastSelectedId = std::nullopt;
         emit selectionChanged({});
         update();
@@ -359,43 +403,6 @@ void GridGlCanvas::resetHoverState()
         m_hoveredFilteredIdx = std::nullopt;
         emit hoverChanged(std::nullopt);
     }
-}
-
-void GridGlCanvas::initPboAndEtc2Support()
-{
-    while (glGetError() != GL_NO_ERROR) {
-    }
-
-    // Probe GL_COMPRESSED_SRGB8_ETC2 hardware upload support with a single 4x4 block
-    GLuint probeTex = 0;
-    glGenTextures(1, &probeTex);
-    glBindTexture(GL_TEXTURE_2D, probeTex);
-    const uint8_t dummyBlock[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_SRGB8_ETC2, 4, 4, 0, 8, dummyBlock);
-    if (glGetError() == GL_NO_ERROR) {
-        m_supportsEtc2 = true;
-        m_etc2InternalFormat = GL_COMPRESSED_SRGB8_ETC2;
-    } else {
-        glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGB8_ETC2, 4, 4, 0, 8, dummyBlock);
-        if (glGetError() == GL_NO_ERROR) {
-            m_supportsEtc2 = true;
-            m_etc2InternalFormat = GL_COMPRESSED_RGB8_ETC2;
-        }
-    }
-    glBindTexture(GL_TEXTURE_2D, 0);
-    if (probeTex != 0) {
-        glDeleteTextures(1, &probeTex);
-    }
-
-    const size_t initialCap = GpuTexturePool::ETC2_FRAME_SIZE_BYTES;
-    glGenBuffers(2, m_pboRing.data());
-    for (size_t i = 0; i < 2; ++i) {
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_pboRing[i]);
-        glBufferData(GL_PIXEL_UNPACK_BUFFER, static_cast<GLsizeiptr>(initialCap), nullptr,
-                     GL_STREAM_DRAW);
-        m_pboCapacities[i] = initialCap;
-    }
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 }
 
 void GridGlCanvas::initCardShaders()
@@ -428,22 +435,27 @@ void GridGlCanvas::initCardShaders()
                                  "    gl_Position = vec4(ndc, 0.0, 1.0);\n"
                                  "}\n";
 
-    const char *fsSrc =
+    const char *fsArraySrc =
         isGles ? "#version 300 es\n"
                  "precision mediump float;\n"
+                 "precision mediump sampler2DArray;\n"
                  "in vec2 v_uv;\n"
                  "uniform vec4 u_cardRect;\n"
-                 "uniform sampler2D u_tex;\n"
+                 "uniform sampler2DArray u_texArray;\n"
+                 "uniform float u_texLayer;\n"
                  "uniform int u_srgbEncode;\n"
+                 "uniform float u_dpr;\n"
                  "out vec4 fragColor;\n"
                  "void main() {\n"
-                 "    vec2 halfSize = u_cardRect.zw * 0.5;\n"
-                 "    vec2 p = (v_uv - 0.5) * u_cardRect.zw;\n"
-                 "    vec2 q = abs(p) - (halfSize - vec2(8.0));\n"
-                 "    float dist = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - 8.0;\n"
-                 "    float alpha = clamp(0.5 - dist, 0.0, 1.0);\n"
+                 "    float scale = max(1.0, u_dpr);\n"
+                 "    vec2 halfPx = u_cardRect.zw * (0.5 * scale);\n"
+                 "    vec2 pPx = (v_uv - 0.5) * u_cardRect.zw * scale;\n"
+                 "    float radiusPx = 8.0 * scale;\n"
+                 "    vec2 q = abs(pPx) - (halfPx - vec2(radiusPx));\n"
+                 "    float distPx = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radiusPx;\n"
+                 "    float alpha = clamp(0.5 - distPx, 0.0, 1.0);\n"
                  "    if (alpha <= 0.001) discard;\n"
-                 "    vec3 col = texture(u_tex, v_uv).rgb;\n"
+                 "    vec3 col = texture(u_texArray, vec3(v_uv, u_texLayer)).rgb;\n"
                  "    if (u_srgbEncode != 0) {\n"
                  "        col = pow(max(col, vec3(0.0)), vec3(1.0 / 2.2));\n"
                  "    }\n"
@@ -452,17 +464,21 @@ void GridGlCanvas::initCardShaders()
                : "#version 330 core\n"
                  "in vec2 v_uv;\n"
                  "uniform vec4 u_cardRect;\n"
-                 "uniform sampler2D u_tex;\n"
+                 "uniform sampler2DArray u_texArray;\n"
+                 "uniform float u_texLayer;\n"
                  "uniform int u_srgbEncode;\n"
+                 "uniform float u_dpr;\n"
                  "out vec4 fragColor;\n"
                  "void main() {\n"
-                 "    vec2 halfSize = u_cardRect.zw * 0.5;\n"
-                 "    vec2 p = (v_uv - 0.5) * u_cardRect.zw;\n"
-                 "    vec2 q = abs(p) - (halfSize - vec2(8.0));\n"
-                 "    float dist = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - 8.0;\n"
-                 "    float alpha = clamp(0.5 - dist, 0.0, 1.0);\n"
+                 "    float scale = max(1.0, u_dpr);\n"
+                 "    vec2 halfPx = u_cardRect.zw * (0.5 * scale);\n"
+                 "    vec2 pPx = (v_uv - 0.5) * u_cardRect.zw * scale;\n"
+                 "    float radiusPx = 8.0 * scale;\n"
+                 "    vec2 q = abs(pPx) - (halfPx - vec2(radiusPx));\n"
+                 "    float distPx = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radiusPx;\n"
+                 "    float alpha = clamp(0.5 - distPx, 0.0, 1.0);\n"
                  "    if (alpha <= 0.001) discard;\n"
-                 "    vec3 col = texture(u_tex, v_uv).rgb;\n"
+                 "    vec3 col = texture(u_texArray, vec3(v_uv, u_texLayer)).rgb;\n"
                  "    if (u_srgbEncode != 0) {\n"
                  "        col = pow(max(col, vec3(0.0)), vec3(1.0 / 2.2));\n"
                  "    }\n"
@@ -482,79 +498,6 @@ void GridGlCanvas::initCardShaders()
         return sh;
     };
 
-    GLuint vs = compileShader(GL_VERTEX_SHADER, vsSrc);
-    GLuint fs = compileShader(GL_FRAGMENT_SHADER, fsSrc);
-    if (vs == 0 || fs == 0) {
-        if (vs != 0)
-            glDeleteShader(vs);
-        if (fs != 0)
-            glDeleteShader(fs);
-        return;
-    }
-
-    GLuint prog = glCreateProgram();
-    glAttachShader(prog, vs);
-    glAttachShader(prog, fs);
-    glLinkProgram(prog);
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-
-    GLint linked = GL_FALSE;
-    glGetProgramiv(prog, GL_LINK_STATUS, &linked);
-    if (linked != GL_TRUE) {
-        glDeleteProgram(prog);
-        return;
-    }
-
-    m_cardProgram = prog;
-    m_uViewportLoc = glGetUniformLocation(m_cardProgram, "u_viewport");
-    m_uCardRectLoc = glGetUniformLocation(m_cardProgram, "u_cardRect");
-    m_uTexLoc = glGetUniformLocation(m_cardProgram, "u_tex");
-
-    const char *fsArraySrc =
-        isGles ? "#version 300 es\n"
-                 "precision mediump float;\n"
-                 "precision mediump sampler2DArray;\n"
-                 "in vec2 v_uv;\n"
-                 "uniform vec4 u_cardRect;\n"
-                 "uniform sampler2DArray u_texArray;\n"
-                 "uniform float u_texLayer;\n"
-                 "uniform int u_srgbEncode;\n"
-                 "out vec4 fragColor;\n"
-                 "void main() {\n"
-                 "    vec2 halfSize = u_cardRect.zw * 0.5;\n"
-                 "    vec2 p = (v_uv - 0.5) * u_cardRect.zw;\n"
-                 "    vec2 q = abs(p) - (halfSize - vec2(8.0));\n"
-                 "    float dist = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - 8.0;\n"
-                 "    float alpha = clamp(0.5 - dist, 0.0, 1.0);\n"
-                 "    if (alpha <= 0.001) discard;\n"
-                 "    vec3 col = texture(u_texArray, vec3(v_uv, u_texLayer)).rgb;\n"
-                 "    if (u_srgbEncode != 0) {\n"
-                 "        col = pow(max(col, vec3(0.0)), vec3(1.0 / 2.2));\n"
-                 "    }\n"
-                 "    fragColor = vec4(col, alpha);\n"
-                 "}\n"
-               : "#version 330 core\n"
-                 "in vec2 v_uv;\n"
-                 "uniform vec4 u_cardRect;\n"
-                 "uniform sampler2DArray u_texArray;\n"
-                 "uniform float u_texLayer;\n"
-                 "uniform int u_srgbEncode;\n"
-                 "out vec4 fragColor;\n"
-                 "void main() {\n"
-                 "    vec2 halfSize = u_cardRect.zw * 0.5;\n"
-                 "    vec2 p = (v_uv - 0.5) * u_cardRect.zw;\n"
-                 "    vec2 q = abs(p) - (halfSize - vec2(8.0));\n"
-                 "    float dist = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - 8.0;\n"
-                 "    float alpha = clamp(0.5 - dist, 0.0, 1.0);\n"
-                 "    if (alpha <= 0.001) discard;\n"
-                 "    vec3 col = texture(u_texArray, vec3(v_uv, u_texLayer)).rgb;\n"
-                 "    if (u_srgbEncode != 0) {\n"
-                 "        col = pow(max(col, vec3(0.0)), vec3(1.0 / 2.2));\n"
-                 "    }\n"
-                 "    fragColor = vec4(col, alpha);\n"
-                 "}\n";
-
     GLuint vsArr = compileShader(GL_VERTEX_SHADER, vsSrc);
     GLuint fsArr = compileShader(GL_FRAGMENT_SHADER, fsArraySrc);
     if (vsArr != 0 && fsArr != 0) {
@@ -571,6 +514,7 @@ void GridGlCanvas::initCardShaders()
             m_uArrayTexLoc = glGetUniformLocation(m_cardArrayProgram, "u_texArray");
             m_uArrayLayerLoc = glGetUniformLocation(m_cardArrayProgram, "u_texLayer");
             m_uArraySrgbLoc = glGetUniformLocation(m_cardArrayProgram, "u_srgbEncode");
+            m_uArrayDprLoc = glGetUniformLocation(m_cardArrayProgram, "u_dpr");
         } else {
             glDeleteProgram(arrProg);
         }
@@ -597,283 +541,72 @@ void GridGlCanvas::initCardShaders()
     glBindVertexArray(0);
 }
 
-GLuint GridGlCanvas::uploadOrGetCardTexture(uint32_t item_id, const QImage &thumb,
-                                            int &uploadBudget)
-{
-    if (thumb.isNull() || m_pboRing[0] == 0) {
-        return 0;
-    }
-
-    const qint64 cacheKey = thumb.cacheKey();
-    auto it = m_etc2Cache.find(item_id);
-    if (it != m_etc2Cache.end()) {
-        if (it->second.image_cache_key == cacheKey && it->second.tex_id != 0) {
-            m_etc2Lru.splice(m_etc2Lru.begin(), m_etc2Lru, it->second.lru_it);
-            return it->second.tex_id;
-        }
-        if (it->second.tex_id != 0) {
-            glDeleteTextures(1, &it->second.tex_id);
-        }
-        m_etc2Lru.erase(it->second.lru_it);
-        m_etc2Cache.erase(it);
-    }
-
-    if (uploadBudget <= 0) {
-        return 0;
-    }
-    --uploadBudget;
-
-    QImage rgbaImg = (thumb.format() == QImage::Format_RGBA8888)
-                         ? thumb
-                         : thumb.convertToFormat(QImage::Format_RGBA8888);
-    const int w = (rgbaImg.width() + 3) & ~3;
-    const int h = (rgbaImg.height() + 3) & ~3;
-    if (w <= 0 || h <= 0) {
-        return 0;
-    }
-    if (rgbaImg.width() != w || rgbaImg.height() != h) {
-        rgbaImg = rgbaImg.scaled(w, h, Qt::IgnoreAspectRatio, Qt::FastTransformation);
-    }
-
-    const int expectedRowBytes = w * 4;
-    const size_t tightBytes = static_cast<size_t>(expectedRowBytes) * static_cast<size_t>(h);
-    const uint8_t *rgbaPixels = rgbaImg.constBits();
-    thread_local std::vector<uint8_t> tightBuffer;
-    if (rgbaImg.bytesPerLine() != expectedRowBytes) {
-        tightBuffer.resize(tightBytes);
-        for (int row = 0; row < h; ++row) {
-            std::memcpy(tightBuffer.data() +
-                            static_cast<size_t>(row) * static_cast<size_t>(expectedRowBytes),
-                        rgbaImg.constScanLine(row), static_cast<size_t>(expectedRowBytes));
-        }
-        rgbaPixels = tightBuffer.data();
-    }
-
-    while (m_etc2Cache.size() >= MAX_COMPRESSED_CARD_TEXTURES && !m_etc2Lru.empty()) {
-        uint32_t victimId = m_etc2Lru.back();
-        m_etc2Lru.pop_back();
-        auto vit = m_etc2Cache.find(victimId);
-        if (vit != m_etc2Cache.end()) {
-            if (vit->second.tex_id != 0) {
-                glDeleteTextures(1, &vit->second.tex_id);
-            }
-            m_etc2Cache.erase(vit);
-        }
-    }
-
-    GLuint tex = 0;
-    glGenTextures(1, &tex);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-    // Restore default unpack state since QPainter mutates unpack stride on the shared GL context.
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-#ifdef GL_UNPACK_ROW_LENGTH
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-#endif
-#ifdef GL_UNPACK_SKIP_PIXELS
-    glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
-#endif
-#ifdef GL_UNPACK_SKIP_ROWS
-    glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
-#endif
-
-    const size_t ringSlot = static_cast<size_t>(m_pboIndex & 1);
-    const GLuint pbo = m_pboRing[ringSlot];
-    m_pboIndex ^= 1;
-
-    if (m_supportsEtc2) {
-        const uint8_t *compressedData = nullptr;
-        size_t payloadBytes = 0;
-        auto precompressed = m_pool.getCompressedEtc2Blocks(item_id);
-        thread_local std::vector<uint8_t> etc2Blocks;
-        if (precompressed && w == static_cast<int>(GpuTexturePool::THUMB_WIDTH) &&
-            h == static_cast<int>(GpuTexturePool::THUMB_HEIGHT) &&
-            precompressed->size() == GpuTexturePool::ETC2_FRAME_SIZE_BYTES) {
-            compressedData = precompressed->data();
-            payloadBytes = precompressed->size();
-        } else {
-            encodeRgbaToEtc2(rgbaPixels, w, h, etc2Blocks);
-            compressedData = etc2Blocks.data();
-            payloadBytes = etc2Blocks.size();
-        }
-
-        glCompressedTexImage2D(GL_TEXTURE_2D, 0, m_etc2InternalFormat, w, h, 0,
-                               static_cast<GLsizei>(payloadBytes), nullptr);
-
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-        if (payloadBytes > m_pboCapacities[ringSlot]) {
-            m_pboCapacities[ringSlot] = payloadBytes;
-            glBufferData(GL_PIXEL_UNPACK_BUFFER, static_cast<GLsizeiptr>(payloadBytes), nullptr,
-                         GL_STREAM_DRAW);
-        }
-        void *mapped =
-            glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, static_cast<GLsizeiptr>(payloadBytes),
-                             GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
-        if (mapped) {
-            std::memcpy(mapped, compressedData, payloadBytes);
-            glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
-        } else {
-            glBufferSubData(GL_PIXEL_UNPACK_BUFFER, 0, static_cast<GLsizeiptr>(payloadBytes),
-                            compressedData);
-        }
-
-        glCompressedTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, m_etc2InternalFormat,
-                                  static_cast<GLsizei>(payloadBytes), nullptr);
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-    } else {
-        const size_t payloadBytes = tightBytes;
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-        if (payloadBytes > m_pboCapacities[ringSlot]) {
-            m_pboCapacities[ringSlot] = payloadBytes;
-            glBufferData(GL_PIXEL_UNPACK_BUFFER, static_cast<GLsizeiptr>(payloadBytes), nullptr,
-                         GL_STREAM_DRAW);
-        }
-        void *mapped =
-            glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, static_cast<GLsizeiptr>(payloadBytes),
-                             GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
-        if (mapped) {
-            std::memcpy(mapped, rgbaPixels, payloadBytes);
-            glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
-        } else {
-            glBufferSubData(GL_PIXEL_UNPACK_BUFFER, 0, static_cast<GLsizeiptr>(payloadBytes),
-                            rgbaPixels);
-        }
-
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-    }
-
-    glBindTexture(GL_TEXTURE_2D, 0);
-
-    m_etc2Lru.push_front(item_id);
-    m_etc2Cache.emplace(item_id, CompressedCardEntry{.tex_id = tex,
-                                                     .width = w,
-                                                     .height = h,
-                                                     .image_cache_key = cacheKey,
-                                                     .lru_it = m_etc2Lru.begin()});
-    return tex;
-}
-
 void GridGlCanvas::renderGlThumbnails()
 {
-    m_glRenderedThisFrame.clear();
-    if (m_cardProgram == 0 || m_cardVao == 0 || width() <= 0 || height() <= 0) {
+    m_glRenderedSliceMask.assign(m_glRenderedSliceMask.size(), uint8_t{0});
+    if (m_cardArrayProgram == 0 || m_cardVao == 0 || !m_pool.isInitialized() ||
+        m_pool.textureArrayId() == 0 || width() <= 0 || height() <= 0) {
         return;
     }
 
-    size_t total = m_index.filteredCount();
-    int cols = computeColumns(width());
-    GridVisibleSlice slice = computeVisibleSlice(total, cols, m_scrollY, height());
+    const size_t total = m_index.filteredCount();
+    const int cols = computeColumns(width());
+    const GridVisibleSlice slice = computeVisibleSlice(total, cols, m_scrollY, height());
     if (slice.is_empty) {
         return;
     }
 
-    int uploadBudget = 4;
-    const GLint srgbLoc = glGetUniformLocation(m_cardProgram, "u_srgbEncode");
+    m_glRenderedSliceStart = slice.index_first;
+    m_glRenderedSliceMask.assign(slice.index_last - slice.index_first + 1U, uint8_t{0});
 
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glActiveTexture(GL_TEXTURE0);
     glBindVertexArray(m_cardVao);
 
-    const bool canUsePoolArray =
-        (m_cardArrayProgram != 0 && m_pool.isInitialized() && m_pool.textureArrayId() != 0);
-    if (canUsePoolArray) {
-        glUseProgram(m_cardArrayProgram);
-        glUniform2f(m_uArrayViewportLoc, static_cast<float>(width()), static_cast<float>(height()));
-        glUniform1i(m_uArrayTexLoc, 0);
-        if (m_uArraySrgbLoc >= 0) {
-            glUniform1i(m_uArraySrgbLoc, (m_pool.isArrayEtc2() &&
-                                          m_pool.arrayInternalFormat() == GL_COMPRESSED_SRGB8_ETC2)
-                                             ? 1
-                                             : 0);
-        }
-        glBindTexture(GL_TEXTURE_2D_ARRAY, m_pool.textureArrayId());
+    glUseProgram(m_cardArrayProgram);
+    glUniform2f(m_uArrayViewportLoc, static_cast<float>(width()), static_cast<float>(height()));
+    glUniform1i(m_uArrayTexLoc, 0);
+    if (m_uArraySrgbLoc >= 0) {
+        glUniform1i(m_uArraySrgbLoc, (m_pool.isArrayEtc2() &&
+                                      m_pool.arrayInternalFormat() == GL_COMPRESSED_SRGB8_ETC2)
+                                         ? 1
+                                         : 0);
+    }
+    if (m_uArrayDprLoc >= 0) {
+        glUniform1f(m_uArrayDprLoc, static_cast<float>(std::max<qreal>(1.0, devicePixelRatioF())));
+    }
+    glBindTexture(GL_TEXTURE_2D_ARRAY, m_pool.textureArrayId());
 
-        for (size_t i = slice.index_first; i <= slice.index_last; ++i) {
-            const auto &item = m_index.filteredItemAt(i);
-            QRect card = itemRect(i, cols, m_scrollY);
-            if (card.bottom() < 0 || card.top() > height()) {
-                continue;
-            }
-
-            const int layer = m_pool.requestTexture(item.id, item.path, item.preview_path);
-            if (layer < 0) {
-                continue;
-            }
-
-            bool is_hovered = (m_hoveredFilteredIdx.has_value() && *m_hoveredFilteredIdx == i);
-            QRect render_rect = card;
-            if (is_hovered) {
-                int dw = static_cast<int>(card.width() * 0.03f);
-                int dh = static_cast<int>(card.height() * 0.03f);
-                render_rect.adjust(-dw / 2, -dh / 2, dw / 2, dh / 2);
-            }
-
-            glUniform1f(m_uArrayLayerLoc, static_cast<float>(layer));
-            glUniform4f(m_uArrayCardRectLoc, static_cast<float>(render_rect.x()),
-                        static_cast<float>(render_rect.y()),
-                        static_cast<float>(render_rect.width()),
-                        static_cast<float>(render_rect.height()));
-            glDrawArrays(GL_TRIANGLES, 0, 6);
-            m_glRenderedThisFrame.insert(item.id);
+    for (size_t i = slice.index_first; i <= slice.index_last; ++i) {
+        const auto &item = m_index.filteredItemAt(i);
+        const QRect card = itemRect(i, cols, m_scrollY);
+        if (card.bottom() < 0 || card.top() > height()) {
+            continue;
         }
 
-        glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
-    } else {
-        glUseProgram(m_cardProgram);
-        glUniform2f(m_uViewportLoc, static_cast<float>(width()), static_cast<float>(height()));
-        glUniform1i(m_uTexLoc, 0);
-        if (srgbLoc >= 0) {
-            glUniform1i(srgbLoc,
-                        (m_supportsEtc2 && m_etc2InternalFormat == GL_COMPRESSED_SRGB8_ETC2) ? 1
-                                                                                             : 0);
+        const int layer = m_pool.requestTexture(item.id, item.path, item.preview_path);
+        if (layer < 0) {
+            continue;
         }
 
-        for (size_t i = slice.index_first; i <= slice.index_last; ++i) {
-            const auto &item = m_index.filteredItemAt(i);
-            QRect card = itemRect(i, cols, m_scrollY);
-            if (card.bottom() < 0 || card.top() > height()) {
-                continue;
-            }
-
-            (void)m_pool.requestTexture(item.id, item.path, item.preview_path);
-            QImage thumb = m_pool.getThumbnailImage(item.id);
-            if (thumb.isNull()) {
-                continue;
-            }
-
-            GLuint tex = uploadOrGetCardTexture(item.id, thumb, uploadBudget);
-            if (tex == 0) {
-                continue;
-            }
-
-            bool is_hovered = (m_hoveredFilteredIdx.has_value() && *m_hoveredFilteredIdx == i);
-            QRect render_rect = card;
-            if (is_hovered) {
-                int dw = static_cast<int>(card.width() * 0.03f);
-                int dh = static_cast<int>(card.height() * 0.03f);
-                render_rect.adjust(-dw / 2, -dh / 2, dw / 2, dh / 2);
-            }
-
-            glBindTexture(GL_TEXTURE_2D, tex);
-            glUniform4f(m_uCardRectLoc, static_cast<float>(render_rect.x()),
-                        static_cast<float>(render_rect.y()),
-                        static_cast<float>(render_rect.width()),
-                        static_cast<float>(render_rect.height()));
-            glDrawArrays(GL_TRIANGLES, 0, 6);
-            m_glRenderedThisFrame.insert(item.id);
+        const bool is_hovered = (m_hoveredFilteredIdx.has_value() && *m_hoveredFilteredIdx == i);
+        QRect render_rect = card;
+        if (is_hovered) {
+            const int dw = static_cast<int>(card.width() * 0.03f);
+            const int dh = static_cast<int>(card.height() * 0.03f);
+            render_rect.adjust(-dw / 2, -dh / 2, dw / 2, dh / 2);
         }
 
-        glBindTexture(GL_TEXTURE_2D, 0);
+        glUniform1f(m_uArrayLayerLoc, static_cast<float>(layer));
+        glUniform4f(m_uArrayCardRectLoc, static_cast<float>(render_rect.x()),
+                    static_cast<float>(render_rect.y()), static_cast<float>(render_rect.width()),
+                    static_cast<float>(render_rect.height()));
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        m_glRenderedSliceMask[i - m_glRenderedSliceStart] = uint8_t{1};
     }
 
+    glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
     glBindVertexArray(0);
     glUseProgram(0);
     glDisable(GL_BLEND);
@@ -885,28 +618,16 @@ void GridGlCanvas::initializeGL()
         return;
     }
 
-    // Clear any stale handles left over if a previous GL context was torn down on dock/monitor
-    // reparenting before initializing resources on the current context.
-    m_etc2Cache.clear();
-    m_etc2Lru.clear();
-    m_pboRing = {0, 0};
-    m_pboCapacities = {0, 0};
-    m_pboIndex = 0;
-    m_supportsEtc2 = false;
-    m_etc2InternalFormat = 0;
-    m_cardProgram = 0;
     m_cardArrayProgram = 0;
     m_cardVao = 0;
     m_cardVbo = 0;
-    m_uViewportLoc = -1;
-    m_uCardRectLoc = -1;
-    m_uTexLoc = -1;
     m_uArrayViewportLoc = -1;
     m_uArrayCardRectLoc = -1;
     m_uArrayTexLoc = -1;
     m_uArrayLayerLoc = -1;
     m_uArraySrgbLoc = -1;
-    m_glRenderedThisFrame.clear();
+    m_uArrayDprLoc = -1;
+    std::fill(m_glRenderedSliceMask.begin(), m_glRenderedSliceMask.end(), uint8_t{0});
 
     QObject::disconnect(m_contextDestroyConn);
     if (QOpenGLContext *ctx = context()) {
@@ -924,7 +645,6 @@ void GridGlCanvas::initializeGL()
 
     m_pool.initGl(this);
     m_hover.initGl(this);
-    initPboAndEtc2Support();
     initCardShaders();
 
     m_glInitialized = true;
@@ -933,12 +653,13 @@ void GridGlCanvas::initializeGL()
 void GridGlCanvas::resizeGL(int w, int h)
 {
     if (isOffscreenPlatform()) {
-        int vh = computeVirtualHeight(m_index.filteredCount(), computeColumns(width()));
+        const int vh = computeVirtualHeight(m_index.filteredCount(), computeColumns(width()));
         emit virtualHeightChanged(vh);
         return;
     }
-    glViewport(0, 0, w, h);
-    int vh = computeVirtualHeight(m_index.filteredCount(), computeColumns(width()));
+    const qreal dpr = devicePixelRatioF();
+    glViewport(0, 0, std::max(1, qRound(w * dpr)), std::max(1, qRound(h * dpr)));
+    const int vh = computeVirtualHeight(m_index.filteredCount(), computeColumns(width()));
     emit virtualHeightChanged(vh);
 }
 
@@ -948,12 +669,12 @@ void GridGlCanvas::resizeEvent(QResizeEvent *event)
         // Offscreen QPA lacks a GL backing context; stay on the QPainter card fallback without
         // letting QOpenGLWidgetPrivate::initialize() allocate and leak a failed QOpenGLContext.
         QWidget::resizeEvent(event);
-        int vh = computeVirtualHeight(m_index.filteredCount(), computeColumns(width()));
+        const int vh = computeVirtualHeight(m_index.filteredCount(), computeColumns(width()));
         emit virtualHeightChanged(vh);
         return;
     }
     QOpenGLWidget::resizeEvent(event);
-    int vh = computeVirtualHeight(m_index.filteredCount(), computeColumns(width()));
+    const int vh = computeVirtualHeight(m_index.filteredCount(), computeColumns(width()));
     emit virtualHeightChanged(vh);
 }
 
@@ -965,13 +686,12 @@ void GridGlCanvas::paintGL()
     if (isValid()) {
         m_pool.processPendingUploads(this, 12);
         const qreal dpr = devicePixelRatioF();
-        glViewport(0, 0, std::max(1, static_cast<int>(width() * dpr)),
-                   std::max(1, static_cast<int>(height() * dpr)));
+        glViewport(0, 0, std::max(1, qRound(width() * dpr)), std::max(1, qRound(height() * dpr)));
         glClearColor(0.08f, 0.09f, 0.11f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         renderGlThumbnails();
     } else {
-        m_glRenderedThisFrame.clear();
+        std::fill(m_glRenderedSliceMask.begin(), m_glRenderedSliceMask.end(), uint8_t{0});
         m_pool.processPendingUploads(nullptr, 12);
     }
 
@@ -982,35 +702,19 @@ void GridGlCanvas::paintGL()
 void GridGlCanvas::paintEvent(QPaintEvent *event)
 {
     if (!isOffscreenPlatform() && isValid()) {
-        if (m_fallbackCanvas && m_fallbackCanvas->isVisible()) {
-            m_fallbackCanvas->hide();
-        }
         QOpenGLWidget::paintEvent(event);
         return;
     }
-    if (!m_fallbackCanvas || width() <= 0 || height() <= 0) {
+    if (width() <= 0 || height() <= 0) {
         return;
     }
 
-    m_glRenderedThisFrame.clear();
+    std::fill(m_glRenderedSliceMask.begin(), m_glRenderedSliceMask.end(), uint8_t{0});
     m_pool.processPendingUploads(nullptr, 12);
 
-    const qreal dpr = devicePixelRatioF();
-    QImage frame(std::max(1, static_cast<int>(width() * dpr)),
-                 std::max(1, static_cast<int>(height() * dpr)),
-                 QImage::Format_ARGB32_Premultiplied);
-    frame.setDevicePixelRatio(dpr);
-    frame.fill(QColor(20, 23, 28));
-
-    QPainter painter(&frame);
+    QPainter painter(this);
+    painter.fillRect(rect(), QColor(20, 23, 28));
     renderCards(painter);
-    painter.end();
-
-    m_fallbackCanvas->setGeometry(rect());
-    m_fallbackCanvas->setPixmap(QPixmap::fromImage(frame));
-    if (!m_fallbackCanvas->isVisible()) {
-        m_fallbackCanvas->show();
-    }
 }
 
 void GridGlCanvas::renderCards(QPainter &painter)
@@ -1025,112 +729,127 @@ void GridGlCanvas::renderCards(QPainter &painter)
     if (slice.is_empty) {
         painter.setPen(QColor(148, 163, 184));
         QFont font = painter.font();
-        font.setPointSize(10);
+        font.setPixelSize(12);
         font.setWeight(QFont::Medium);
         painter.setFont(font);
         painter.drawText(rect().adjusted(14, 14, -14, -14), Qt::AlignCenter | Qt::TextWordWrap,
                          "No wallpapers found matching query or tags.");
-        return;
+    } else {
+        const bool canvasHasFocus = hasFocus();
+        for (size_t i = slice.index_first; i <= slice.index_last; ++i) {
+            const auto &item = m_index.filteredItemAt(i);
+            const QRect card = itemRect(i, cols, m_scrollY);
+            if (card.bottom() < 0 || card.top() > height()) {
+                continue;
+            }
+
+            const bool is_hovered =
+                (m_hoveredFilteredIdx.has_value() && *m_hoveredFilteredIdx == i);
+            const bool is_focused =
+                (canvasHasFocus && m_focusedFilteredIdx.has_value() && *m_focusedFilteredIdx == i);
+            const bool is_selected = m_selectedIds.contains(item.id);
+            bool renderedByGl = false;
+            if (i >= m_glRenderedSliceStart) {
+                const size_t rel = i - m_glRenderedSliceStart;
+                if (rel < m_glRenderedSliceMask.size()) {
+                    renderedByGl = (m_glRenderedSliceMask[rel] != 0U);
+                }
+            }
+
+            QRect render_rect = card;
+            if (is_hovered) {
+                const int dw = static_cast<int>(card.width() * 0.03f);
+                const int dh = static_cast<int>(card.height() * 0.03f);
+                render_rect.adjust(-dw / 2, -dh / 2, dw / 2, dh / 2);
+            }
+
+            painter.save();
+            QPainterPath card_clip;
+            card_clip.addRoundedRect(QRectF(render_rect), 8.0, 8.0);
+            painter.setClipPath(card_clip);
+
+            if (!renderedByGl) {
+                const uint32_t dc = item.dominant_color;
+                const QColor base_color((dc >> 16) & 0xFF, (dc >> 8) & 0xFF, dc & 0xFF);
+                QLinearGradient bg_grad(render_rect.topLeft(), render_rect.bottomRight());
+                bg_grad.setColorAt(0.0, base_color.lighter(120));
+                bg_grad.setColorAt(0.55, base_color.darker(115));
+                bg_grad.setColorAt(1.0, base_color.darker(175));
+                painter.fillRect(render_rect, bg_grad);
+
+                QPainterPath wave;
+                const qreal wl = render_rect.left();
+                const qreal wr = render_rect.right();
+                const qreal wb = render_rect.bottom();
+                const qreal wy = render_rect.top() + render_rect.height() * 0.56;
+                wave.moveTo(wl, wb);
+                wave.lineTo(wl, wy);
+                wave.cubicTo(wl + render_rect.width() * 0.35, wy - 18.0,
+                             wl + render_rect.width() * 0.65, wy + 16.0, wr, wy - 6.0);
+                wave.lineTo(wr, wb);
+                wave.closeSubpath();
+                QColor wave_col = base_color.darker(210);
+                wave_col.setAlpha(110);
+                painter.fillPath(wave, wave_col);
+
+                (void)m_pool.requestTexture(item.id, item.path, item.preview_path);
+                const QImage thumb = m_pool.getThumbnailImage(item.id);
+                if (!thumb.isNull()) {
+                    drawImageAspectFill(painter, render_rect, thumb);
+                }
+            }
+
+            if (m_hover.isPreviewActive() && m_hover.activeItemId() == item.id) {
+                const QImage &previewImg = m_hover.currentPreviewImage();
+                if (!previewImg.isNull()) {
+                    drawImageAspectFill(painter, render_rect, previewImg);
+                }
+            }
+
+            drawBadgePill(painter, render_rect, item.badge);
+            drawCardSelectionIndicator(painter, render_rect, is_selected);
+            drawCardTitleOverlay(painter, render_rect, item.title);
+
+            painter.restore();
+
+            if (is_focused || is_selected) {
+                const QPen focus_pen(QColor(56, 189, 248), 2.0);
+                painter.setPen(focus_pen);
+                painter.setBrush(Qt::NoBrush);
+                painter.drawRoundedRect(render_rect.adjusted(1, 1, -1, -1), 7.5, 7.5);
+            } else if (is_hovered) {
+                const QPen hover_pen(QColor(129, 140, 248, 220), 2.0);
+                painter.setPen(hover_pen);
+                painter.setBrush(Qt::NoBrush);
+                painter.drawRoundedRect(render_rect.adjusted(1, 1, -1, -1), 7.5, 7.5);
+            } else {
+                const QPen border_pen(QColor(255, 255, 255, 28), 1.0);
+                painter.setPen(border_pen);
+                painter.setBrush(Qt::NoBrush);
+                painter.drawRoundedRect(render_rect, 8.0, 8.0);
+            }
+        }
     }
 
-    for (size_t i = slice.index_first; i <= slice.index_last; ++i) {
-        const auto &item = m_index.filteredItemAt(i);
-        QRect card = itemRect(i, cols, m_scrollY);
-        if (card.bottom() < 0 || card.top() > height()) {
-            continue;
-        }
-
-        bool is_hovered = (m_hoveredFilteredIdx.has_value() && *m_hoveredFilteredIdx == i);
-        bool is_selected = m_selectedIds.contains(item.id);
-        bool renderedByGl = m_glRenderedThisFrame.contains(item.id);
-
-        QRect render_rect = card;
-        if (is_hovered) {
-            int dw = static_cast<int>(card.width() * 0.03f);
-            int dh = static_cast<int>(card.height() * 0.03f);
-            render_rect.adjust(-dw / 2, -dh / 2, dw / 2, dh / 2);
-        }
-
-        painter.save();
-        QPainterPath card_clip;
-        card_clip.addRoundedRect(QRectF(render_rect), 8.0, 8.0);
-        painter.setClipPath(card_clip);
-
-        if (!renderedByGl) {
-            uint32_t dc = item.dominant_color;
-            QColor base_color((dc >> 16) & 0xFF, (dc >> 8) & 0xFF, dc & 0xFF);
-            QLinearGradient bg_grad(render_rect.topLeft(), render_rect.bottomRight());
-            bg_grad.setColorAt(0.0, base_color.lighter(120));
-            bg_grad.setColorAt(0.55, base_color.darker(115));
-            bg_grad.setColorAt(1.0, base_color.darker(175));
-            painter.fillRect(render_rect, bg_grad);
-
-            QPainterPath wave;
-            const qreal wl = render_rect.left();
-            const qreal wr = render_rect.right();
-            const qreal wb = render_rect.bottom();
-            const qreal wy = render_rect.top() + render_rect.height() * 0.56;
-            wave.moveTo(wl, wb);
-            wave.lineTo(wl, wy);
-            wave.cubicTo(wl + render_rect.width() * 0.35, wy - 18.0,
-                         wl + render_rect.width() * 0.65, wy + 16.0, wr, wy - 6.0);
-            wave.lineTo(wr, wb);
-            wave.closeSubpath();
-            QColor wave_col = base_color.darker(210);
-            wave_col.setAlpha(110);
-            painter.fillPath(wave, wave_col);
-
-            (void)m_pool.requestTexture(item.id, item.path, item.preview_path);
-            QImage thumb = m_pool.getThumbnailImage(item.id);
-            if (!thumb.isNull()) {
-                painter.drawImage(render_rect, thumb);
-            }
-        }
-
-        if (m_hover.isPreviewActive() && m_hover.activeItemId() == item.id) {
-            const QImage &previewImg = m_hover.currentPreviewImage();
-            if (!previewImg.isNull()) {
-                painter.drawImage(render_rect, previewImg);
-            }
-        }
-
-        drawBadgePill(painter, render_rect, item.badge);
-        drawCardSelectionIndicator(painter, render_rect, is_selected);
-        drawCardTitleOverlay(painter, render_rect, item.title);
-
-        painter.restore();
-
-        if (is_selected) {
-            QPen sel_pen(QColor(56, 189, 248), 2.0);
-            painter.setPen(sel_pen);
-            painter.setBrush(Qt::NoBrush);
-            painter.drawRoundedRect(render_rect.adjusted(1, 1, -1, -1), 7.5, 7.5);
-        } else if (is_hovered) {
-            QPen hover_pen(QColor(129, 140, 248, 220), 2.0);
-            painter.setPen(hover_pen);
-            painter.setBrush(Qt::NoBrush);
-            painter.drawRoundedRect(render_rect.adjusted(1, 1, -1, -1), 7.5, 7.5);
-        } else {
-            QPen border_pen(QColor(255, 255, 255, 28), 1.0);
-            painter.setPen(border_pen);
-            painter.setBrush(Qt::NoBrush);
-            painter.drawRoundedRect(render_rect, 8.0, 8.0);
-        }
+    if (hasFocus() && rect().width() > 4 && rect().height() > 4) {
+        painter.setPen(QPen(QColor(56, 189, 248), 2.0));
+        painter.setBrush(Qt::NoBrush);
+        painter.drawRoundedRect(rect().adjusted(1, 1, -1, -1), 4.0, 4.0);
     }
 }
 
 void GridGlCanvas::drawBadgePill(QPainter &painter, const QRect &card_rect, WallpaperBadge badge)
 {
     QFont font = painter.font();
-    font.setPixelSize(9);
+    font.setPixelSize(11);
     font.setWeight(QFont::Bold);
     painter.setFont(font);
 
     QString label = QString::fromUtf8(badgeText(badge));
     QFontMetrics fm(font);
     int pill_w =
-        std::clamp(fm.horizontalAdvance(label) + 12, 42, std::max(42, card_rect.width() - 44));
-    QRect pill_rect(card_rect.left() + 8, card_rect.top() + 8, pill_w, 19);
+        std::clamp(fm.horizontalAdvance(label) + 12, 46, std::max(46, card_rect.width() - 44));
+    QRect pill_rect(card_rect.left() + 8, card_rect.top() + 8, pill_w, 20);
 
     QColor pill_bg = badgeColor(badge);
     pill_bg.setAlpha(215);
@@ -1184,7 +903,7 @@ void GridGlCanvas::drawCardTitleOverlay(QPainter &painter, const QRect &card_rec
 
     painter.setPen(QColor(241, 245, 249));
     QFont font = painter.font();
-    font.setPixelSize(10);
+    font.setPixelSize(11);
     font.setWeight(QFont::DemiBold);
     painter.setFont(font);
 
@@ -1194,13 +913,43 @@ void GridGlCanvas::drawCardTitleOverlay(QPainter &painter, const QRect &card_rec
     painter.drawText(text_rect, Qt::AlignLeft | Qt::AlignVCenter, elided);
 }
 
+void GridGlCanvas::ensureIndexVisible(size_t filtered_idx)
+{
+    if (width() <= 0 || height() <= 0 || filtered_idx >= m_index.filteredCount()) {
+        return;
+    }
+    const int cols = computeColumns(width());
+    const int row = static_cast<int>(filtered_idx / static_cast<size_t>(cols));
+    const int cardTop = SPACING_Y + row * ROW_HEIGHT;
+    const int cardBottom = cardTop + ITEM_HEIGHT;
+    if (cardTop < m_scrollY + SPACING_Y) {
+        setScrollY(std::max(0, cardTop - SPACING_Y));
+    } else if (cardBottom > m_scrollY + height() - SPACING_Y) {
+        setScrollY(cardBottom - height() + SPACING_Y);
+    }
+}
+
+void GridGlCanvas::selectSingleFilteredIndex(size_t filtered_idx)
+{
+    if (filtered_idx >= m_index.filteredCount()) {
+        return;
+    }
+    const CatalogItem &item = m_index.filteredItemAt(filtered_idx);
+    m_focusedFilteredIdx = filtered_idx;
+    ensureIndexVisible(filtered_idx);
+    clearSelection();
+    toggleSelection(item.id);
+    emit itemSelected(item);
+    update();
+}
+
 void GridGlCanvas::mouseMoveEvent(QMouseEvent *event)
 {
     auto hit = itemAtPoint(event->pos());
     if (hit != m_hoveredFilteredIdx) {
         if (m_hoveredFilteredIdx.has_value()) {
             if (*m_hoveredFilteredIdx < m_index.filteredCount()) {
-                uint32_t prev_id = m_index.filteredIdAt(*m_hoveredFilteredIdx);
+                const uint32_t prev_id = m_index.filteredItemAt(*m_hoveredFilteredIdx).id;
                 m_hover.onCellHoverExited(prev_id);
             } else {
                 m_hover.stop();
@@ -1221,22 +970,30 @@ void GridGlCanvas::mouseMoveEvent(QMouseEvent *event)
 
 void GridGlCanvas::mousePressEvent(QMouseEvent *event)
 {
+    setFocus(Qt::MouseFocusReason);
     auto hit = itemAtPoint(event->pos());
     if (!hit.has_value()) {
         if (event->button() == Qt::RightButton) {
-            QMenu menu(this);
-            menu.setStyleSheet("QMenu { background: #1e222b; color: #f1f5f9; border: 1px solid "
-                               "#334155; padding: 4px; }"
-                               "QMenu::item { padding: 5px 14px; border-radius: 4px; }"
-                               "QMenu::item:selected { background: #0284c7; color: white; }");
-            QAction *cfgAct = menu.addAction("Configure Wallpaper Folders && Exclusions...");
-            connect(cfgAct, &QAction::triggered, this, &GridGlCanvas::configureFoldersRequested);
-            menu.exec(event->globalPosition().toPoint());
+            auto *menu = new QMenu(this);
+            menu->setAttribute(Qt::WA_DeleteOnClose);
+            menu->setStyleSheet("QMenu { background: #1e222b; color: #f1f5f9; border: 1px solid "
+                                "#334155; padding: 4px; }"
+                                "QMenu::item { padding: 5px 14px; border-radius: 4px; }"
+                                "QMenu::item:selected { background: #0284c7; color: white; }");
+            QAction *cfgAct = menu->addAction("Configure Wallpaper Folders && Exclusions...");
+            QPointer<GridGlCanvas> safeSelf(this);
+            connect(cfgAct, &QAction::triggered, this, [safeSelf]() {
+                if (safeSelf) {
+                    emit safeSelf->configureFoldersRequested();
+                }
+            });
+            menu->popup(event->globalPosition().toPoint());
         }
         return;
     }
 
-    const auto &item = m_index.filteredItemAt(*hit);
+    m_focusedFilteredIdx = hit;
+    const auto item = m_index.filteredItemAt(*hit);
 
     if (event->button() == Qt::RightButton) {
         clearSelection();
@@ -1248,28 +1005,40 @@ void GridGlCanvas::mousePressEvent(QMouseEvent *event)
         QString parent_qstr = QString::fromStdString(parent_dir.string());
         QString parent_name = QString::fromStdString(parent_dir.filename().string());
 
-        QMenu menu(this);
-        menu.setStyleSheet(
+        auto *menu = new QMenu(this);
+        menu->setAttribute(Qt::WA_DeleteOnClose);
+        menu->setStyleSheet(
             "QMenu { background: #1e222b; color: #f1f5f9; border: 1px solid #334155; padding: 4px; "
             "}"
             "QMenu::item { padding: 5px 14px; border-radius: 4px; }"
             "QMenu::item:selected { background: #0284c7; color: white; }"
             "QMenu::separator { height: 1px; background: #334155; margin: 4px 2px; }");
-        QAction *applyAct = menu.addAction("Apply Wallpaper Now");
-        connect(applyAct, &QAction::triggered, this,
-                [this, item]() { emit itemDoubleClicked(item); });
-        if (!m_embeddedMode) {
-            menu.addSeparator();
-            if (!parent_qstr.isEmpty()) {
-                QAction *exclAct = menu.addAction(
-                    QStringLiteral("Exclude Folder '%1' (%2)").arg(parent_name, parent_qstr));
-                connect(exclAct, &QAction::triggered, this,
-                        [this, parent_qstr]() { emit excludeFolderRequested(parent_qstr); });
+        QAction *applyAct = menu->addAction("Apply Wallpaper Now");
+        QPointer<GridGlCanvas> safeSelf(this);
+        connect(applyAct, &QAction::triggered, this, [safeSelf, item]() {
+            if (safeSelf) {
+                emit safeSelf->itemDoubleClicked(item);
             }
-            QAction *cfgAct = menu.addAction("Configure Wallpaper Folders && Exclusions...");
-            connect(cfgAct, &QAction::triggered, this, &GridGlCanvas::configureFoldersRequested);
+        });
+        if (!m_embeddedMode) {
+            menu->addSeparator();
+            if (!parent_qstr.isEmpty()) {
+                QAction *exclAct = menu->addAction(
+                    QStringLiteral("Exclude Folder '%1' (%2)").arg(parent_name, parent_qstr));
+                connect(exclAct, &QAction::triggered, this, [safeSelf, parent_qstr]() {
+                    if (safeSelf) {
+                        emit safeSelf->excludeFolderRequested(parent_qstr);
+                    }
+                });
+            }
+            QAction *cfgAct = menu->addAction("Configure Wallpaper Folders && Exclusions...");
+            connect(cfgAct, &QAction::triggered, this, [safeSelf]() {
+                if (safeSelf) {
+                    emit safeSelf->configureFoldersRequested();
+                }
+            });
         }
-        menu.exec(event->globalPosition().toPoint());
+        menu->popup(event->globalPosition().toPoint());
         return;
     }
 
@@ -1293,6 +1062,7 @@ void GridGlCanvas::mouseDoubleClickEvent(QMouseEvent *event)
 {
     auto hit = itemAtPoint(event->pos());
     if (hit.has_value()) {
+        m_focusedFilteredIdx = hit;
         const auto &item = m_index.filteredItemAt(*hit);
         emit itemDoubleClicked(item);
     }
@@ -1303,7 +1073,7 @@ void GridGlCanvas::leaveEvent(QEvent *event)
     Q_UNUSED(event);
     if (m_hoveredFilteredIdx.has_value()) {
         if (*m_hoveredFilteredIdx < m_index.filteredCount()) {
-            uint32_t id = m_index.filteredIdAt(*m_hoveredFilteredIdx);
+            const uint32_t id = m_index.filteredItemAt(*m_hoveredFilteredIdx).id;
             m_hover.onCellHoverExited(id);
         } else {
             m_hover.stop();
@@ -1321,6 +1091,126 @@ void GridGlCanvas::wheelEvent(QWheelEvent *event)
     event->accept();
 }
 
+void GridGlCanvas::keyPressEvent(QKeyEvent *event)
+{
+    const size_t total = m_index.filteredCount();
+    if (total == 0U) {
+        QOpenGLWidget::keyPressEvent(event);
+        return;
+    }
+
+    const int cols = computeColumns(width());
+    const size_t current = (m_focusedFilteredIdx.has_value() && *m_focusedFilteredIdx < total)
+                               ? *m_focusedFilteredIdx
+                               : 0U;
+    const size_t visibleRows = static_cast<size_t>(std::max(1, height() / ROW_HEIGHT));
+    const size_t pageStep = visibleRows * static_cast<size_t>(cols);
+
+    std::optional<size_t> nextIdx;
+    switch (event->key()) {
+    case Qt::Key_Left:
+        nextIdx = (current > 0U) ? (current - 1U) : 0U;
+        break;
+    case Qt::Key_Right:
+        nextIdx = std::min(total - 1U, current + 1U);
+        break;
+    case Qt::Key_Up:
+        nextIdx = (current >= static_cast<size_t>(cols)) ? (current - static_cast<size_t>(cols))
+                                                         : current;
+        break;
+    case Qt::Key_Down:
+        nextIdx = std::min(total - 1U, current + static_cast<size_t>(cols));
+        break;
+    case Qt::Key_PageUp:
+        nextIdx = (current > pageStep) ? (current - pageStep) : 0U;
+        break;
+    case Qt::Key_PageDown:
+        nextIdx = std::min(total - 1U, current + pageStep);
+        break;
+    case Qt::Key_Home:
+        nextIdx = 0U;
+        break;
+    case Qt::Key_End:
+        nextIdx = total - 1U;
+        break;
+    case Qt::Key_Space: {
+        m_focusedFilteredIdx = current;
+        ensureIndexVisible(current);
+        const auto &item = m_index.filteredItemAt(current);
+        toggleSelection(item.id);
+        emit itemSelected(item);
+        event->accept();
+        return;
+    }
+    case Qt::Key_Return:
+    case Qt::Key_Enter: {
+        m_focusedFilteredIdx = current;
+        ensureIndexVisible(current);
+        const auto &item = m_index.filteredItemAt(current);
+        emit itemDoubleClicked(item);
+        event->accept();
+        return;
+    }
+    case Qt::Key_A:
+        if (event->modifiers() & Qt::ControlModifier) {
+            const size_t limit = std::min<size_t>(total, 10000U);
+            m_selectedIds.clear();
+            m_selectedOrder.clear();
+            m_selectedOrder.reserve(limit);
+            for (size_t i = 0; i < limit; ++i) {
+                const uint32_t id = m_index.filteredItemAt(i).id;
+                if (m_selectedIds.insert(id).second) {
+                    m_selectedOrder.push_back(id);
+                }
+            }
+            if (!m_selectedOrder.empty()) {
+                m_lastSelectedId = m_selectedOrder.back();
+            }
+            emit selectionChanged(m_selectedOrder);
+            update();
+            event->accept();
+            return;
+        }
+        QOpenGLWidget::keyPressEvent(event);
+        return;
+    case Qt::Key_Escape:
+        clearSelection();
+        event->accept();
+        return;
+    default:
+        QOpenGLWidget::keyPressEvent(event);
+        return;
+    }
+
+    if (nextIdx.has_value()) {
+        if ((event->modifiers() & Qt::ShiftModifier) && m_lastSelectedId.has_value()) {
+            m_focusedFilteredIdx = *nextIdx;
+            ensureIndexVisible(*nextIdx);
+            const auto &item = m_index.filteredItemAt(*nextIdx);
+            selectRange(*m_lastSelectedId, item.id);
+            emit itemSelected(item);
+        } else {
+            selectSingleFilteredIndex(*nextIdx);
+        }
+        event->accept();
+    }
+}
+
+void GridGlCanvas::focusInEvent(QFocusEvent *event)
+{
+    if (!m_focusedFilteredIdx.has_value() && m_index.filteredCount() > 0U) {
+        m_focusedFilteredIdx = 0U;
+    }
+    update();
+    QOpenGLWidget::focusInEvent(event);
+}
+
+void GridGlCanvas::focusOutEvent(QFocusEvent *event)
+{
+    update();
+    QOpenGLWidget::focusOutEvent(event);
+}
+
 // ============================================================================
 // VirtualizedGridWidget Implementation
 // ============================================================================
@@ -1333,6 +1223,13 @@ VirtualizedGridWidget::VirtualizedGridWidget(QWidget *parent) : QWidget(parent)
 
 VirtualizedGridWidget::~VirtualizedGridWidget()
 {
+    if (m_searchDebounceTimer) {
+        m_searchDebounceTimer->stop();
+    }
+    if (m_folderDialog) {
+        m_folderDialog->close();
+        m_folderDialog.clear();
+    }
     m_pool.setThumbnailReadyCallback(nullptr);
     m_pool.shutdownWorkers();
     m_hover.stop();
@@ -1349,42 +1246,97 @@ void VirtualizedGridWidget::setupUi()
     m_headerContainer = new QWidget(this);
     auto *header_layout = new QVBoxLayout(m_headerContainer);
     header_layout->setContentsMargins(0, 0, 0, 0);
-    header_layout->setSpacing(8);
+    header_layout->setSpacing(6);
 
     m_searchEdit = new QLineEdit(m_headerContainer);
     m_searchEdit->setPlaceholderText("Search wallpapers...");
     m_searchEdit->setClearButtonEnabled(true);
-    m_searchEdit->setFixedHeight(28);
+    m_searchEdit->setAccessibleName(QStringLiteral("Search wallpapers"));
+    m_searchEdit->setMinimumHeight(28);
     m_searchEdit->setStyleSheet(
         "QLineEdit { background: #14171f; color: #f1f5f9; border: 1px solid #2e3545; "
         "border-radius: 5px; padding: 4px 10px; font-size: 11px; }"
-        "QLineEdit:focus { border: 1px solid #38bdf8; }");
+        "QLineEdit:focus { border: 2px solid #38bdf8; }");
+
+    m_searchDebounceTimer = new QTimer(this);
+    m_searchDebounceTimer->setSingleShot(true);
+    m_searchDebounceTimer->setInterval(16);
+    connect(m_searchDebounceTimer, &QTimer::timeout, this,
+            [this]() { applySearchText(m_pendingSearchText); });
+
     connect(m_searchEdit, &QLineEdit::textChanged, this,
             &VirtualizedGridWidget::onSearchTextChanged);
+    connect(m_searchEdit, &QLineEdit::returnPressed, this, [this]() {
+        if (m_searchDebounceTimer) {
+            m_searchDebounceTimer->stop();
+        }
+        applySearchText(m_searchEdit->text());
+    });
     header_layout->addWidget(m_searchEdit);
 
-    auto *top_bar = new QHBoxLayout();
-    top_bar->setContentsMargins(0, 0, 0, 0);
-    top_bar->setSpacing(8);
+    const QString comboStyle = QStringLiteral(
+        "QComboBox { background: #14171f; color: #f1f5f9; border: 1px solid #2e3545; "
+        "border-radius: 5px; padding: 2px 8px; font-size: 11px; }"
+        "QComboBox:focus { border: 2px solid #38bdf8; }");
+
+    auto configureCombo = [&comboStyle](QComboBox *cb, const QString &accName) {
+        cb->setMinimumHeight(28);
+        cb->setMinimumWidth(0);
+        cb->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+        cb->setMinimumContentsLength(5);
+        cb->setAccessibleName(accName);
+        cb->setStyleSheet(comboStyle);
+    };
+
+    auto *filter_row = new QHBoxLayout();
+    filter_row->setContentsMargins(0, 0, 0, 0);
+    filter_row->setSpacing(6);
 
     m_tagCombo = new QComboBox(m_headerContainer);
-    m_tagCombo->setFixedHeight(26);
     m_tagCombo->addItem("All Tags", QVariant::fromValue<qulonglong>(WallpaperTags::None));
     for (const auto &tag : WallpaperTags::allKnownTags()) {
         m_tagCombo->addItem(QString::fromUtf8(tag.display_name),
                             QVariant::fromValue<qulonglong>(tag.mask));
     }
-    m_tagCombo->setStyleSheet(
-        "QComboBox { background: #14171f; color: #f1f5f9; border: 1px solid #2e3545; "
-        "border-radius: 5px; padding: 2px 8px; font-size: 11px; }");
+    configureCombo(m_tagCombo, QStringLiteral("Tag Filter"));
     connect(m_tagCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int idx) {
-        uint64_t mask = m_tagCombo->itemData(idx).toULongLong();
-        setTagFilter(mask);
+        const QVariant v = m_tagCombo->itemData(idx);
+        if (!v.isValid()) {
+            return;
+        }
+        setTagFilter(v.toULongLong());
     });
-    top_bar->addWidget(m_tagCombo, 1);
+    filter_row->addWidget(m_tagCombo, 1);
+
+    m_badgeCombo = new QComboBox(m_headerContainer);
+    m_badgeCombo->addItem("All Types", QVariant::fromValue<uint>(0xFFFFFFFFu));
+    m_badgeCombo->addItem("Image",
+                          QVariant::fromValue<uint>(static_cast<uint>(WallpaperBadge::Image)));
+    m_badgeCombo->addItem("Video",
+                          QVariant::fromValue<uint>(static_cast<uint>(WallpaperBadge::Video)));
+    m_badgeCombo->addItem("Shader",
+                          QVariant::fromValue<uint>(static_cast<uint>(WallpaperBadge::Shader)));
+    m_badgeCombo->addItem("Scene",
+                          QVariant::fromValue<uint>(static_cast<uint>(WallpaperBadge::Scene)));
+    m_badgeCombo->addItem("XML",
+                          QVariant::fromValue<uint>(static_cast<uint>(WallpaperBadge::GnomeXml)));
+    configureCombo(m_badgeCombo, QStringLiteral("Type Filter"));
+    connect(m_badgeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            [this](int idx) {
+                const QVariant v = m_badgeCombo->itemData(idx);
+                if (!v.isValid()) {
+                    return;
+                }
+                setBadgeFilter(v.toUInt());
+            });
+    filter_row->addWidget(m_badgeCombo, 1);
+    header_layout->addLayout(filter_row);
+
+    auto *sort_row = new QHBoxLayout();
+    sort_row->setContentsMargins(0, 0, 0, 0);
+    sort_row->setSpacing(6);
 
     m_sortCombo = new QComboBox(m_headerContainer);
-    m_sortCombo->setFixedHeight(26);
     m_sortCombo->addItem("Name (A-Z)", static_cast<int>(SortCriteria::NameAsc));
     m_sortCombo->addItem("Name (Z-A)", static_cast<int>(SortCriteria::NameDesc));
     m_sortCombo->addItem("Newest", static_cast<int>(SortCriteria::DateNewest));
@@ -1393,29 +1345,29 @@ void VirtualizedGridWidget::setupUi()
     m_sortCombo->addItem("Smallest", static_cast<int>(SortCriteria::SizeSmallest));
     m_sortCombo->addItem("Type", static_cast<int>(SortCriteria::Type));
     m_sortCombo->addItem("Color", static_cast<int>(SortCriteria::DominantHue));
-    m_sortCombo->setStyleSheet(
-        "QComboBox { background: #14171f; color: #f1f5f9; border: 1px solid #2e3545; "
-        "border-radius: 5px; padding: 2px 8px; font-size: 11px; }");
+    configureCombo(m_sortCombo, QStringLiteral("Sort Order"));
     connect(m_sortCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             &VirtualizedGridWidget::onSortChanged);
-    top_bar->addWidget(m_sortCombo, 1);
+    sort_row->addWidget(m_sortCombo, 1);
 
     m_foldersButton = new QPushButton("Folders...", m_headerContainer);
-    m_foldersButton->setFixedHeight(26);
+    m_foldersButton->setMinimumHeight(28);
     m_foldersButton->setToolTip("Choose which wallpaper folders to include or exclude");
+    m_foldersButton->setAccessibleName(QStringLiteral("Configure Wallpaper Folders"));
     m_foldersButton->setStyleSheet(
-        "QPushButton { background: #20242e; color: #e2e8f0; border: 1px solid #2e3545; "
+        "QPushButton { background: #20242e; color: #f1f5f9; border: 1px solid #2e3545; "
         "border-radius: 5px; padding: 2px 10px; font-size: 11px; font-weight: 500; }"
-        "QPushButton:hover { background: #2a303d; border-color: #38bdf8; color: #ffffff; }");
+        "QPushButton:hover { background: #2a303d; border-color: #38bdf8; color: #ffffff; }"
+        "QPushButton:focus { border: 2px solid #38bdf8; }");
     connect(m_foldersButton, &QPushButton::clicked, this,
             &VirtualizedGridWidget::openFolderSettingsDialog);
-    top_bar->addWidget(m_foldersButton);
+    sort_row->addWidget(m_foldersButton);
 
-    header_layout->addLayout(top_bar);
+    header_layout->addLayout(sort_row);
     root_layout->addWidget(m_headerContainer);
 
     m_statusLabel = new QLabel("0 wallpapers", this);
-    m_statusLabel->setStyleSheet("color: #64748b; font-size: 11px;");
+    m_statusLabel->setStyleSheet("color: #94a3b8; font-size: 11px;");
     root_layout->addWidget(m_statusLabel);
 
     auto *grid_layout = new QHBoxLayout();
@@ -1430,14 +1382,21 @@ void VirtualizedGridWidget::setupUi()
     m_canvas = new GridGlCanvas(m_index, m_pool, m_hover, offscreenNoGl ? nullptr : this);
     m_scrollBar = new QScrollBar(Qt::Vertical, this);
     m_scrollBar->setVisible(false);
+    m_scrollBar->setAccessibleName(QStringLiteral("Catalog Scrollbar"));
     m_scrollBar->setStyleSheet(
-        "QScrollBar:vertical { background: #14171f; width: 8px; margin: 0; }"
+        "QScrollBar:vertical { background: #14171f; width: 10px; margin: 0; }"
         "QScrollBar::handle:vertical { background: #2e3545; min-height: 24px; border-radius: 4px; }"
         "QScrollBar::handle:vertical:hover { background: #475569; }"
         "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }");
 
     connect(m_scrollBar, &QScrollBar::valueChanged, this,
             &VirtualizedGridWidget::onScrollValueChanged);
+    connect(m_canvas, &GridGlCanvas::scrollYChanged, this, [this](int y) {
+        if (m_scrollBar && m_scrollBar->value() != y) {
+            const QSignalBlocker blocker(m_scrollBar);
+            m_scrollBar->setValue(y);
+        }
+    });
     connect(m_canvas, &GridGlCanvas::virtualHeightChanged, this,
             &VirtualizedGridWidget::onVirtualHeightChanged);
 
@@ -1494,21 +1453,23 @@ void VirtualizedGridWidget::setupUi()
     pl_layout->addStretch();
 
     m_playlistAddButton = new QPushButton("Add to Playlist", m_playlistBar);
-    m_playlistAddButton->setFixedHeight(26);
+    m_playlistAddButton->setMinimumHeight(28);
     m_playlistAddButton->setStyleSheet(
         "QPushButton { background: #0284c7; color: white; border: none; border-radius: 4px; "
         "padding: 4px 12px; font-weight: 600; font-size: 11px; }"
-        "QPushButton:hover { background: #0369a1; }");
+        "QPushButton:hover { background: #0369a1; }"
+        "QPushButton:focus { border: 2px solid #38bdf8; }");
     connect(m_playlistAddButton, &QPushButton::clicked, this,
             &VirtualizedGridWidget::onPlaylistAddClicked);
     pl_layout->addWidget(m_playlistAddButton);
 
     m_playlistClearButton = new QPushButton("Clear", m_playlistBar);
-    m_playlistClearButton->setFixedHeight(26);
+    m_playlistClearButton->setMinimumHeight(28);
     m_playlistClearButton->setStyleSheet(
         "QPushButton { background: #20242e; color: #94a3b8; "
         "border: 1px solid #2e3545; border-radius: 4px; padding: 4px 10px; font-size: 11px; }"
-        "QPushButton:hover { color: #f1f5f9; border-color: #38bdf8; }");
+        "QPushButton:hover { color: #f1f5f9; border-color: #38bdf8; }"
+        "QPushButton:focus { border: 2px solid #38bdf8; }");
     connect(m_playlistClearButton, &QPushButton::clicked, this,
             &VirtualizedGridWidget::clearSelection);
     pl_layout->addWidget(m_playlistClearButton);
@@ -1522,7 +1483,8 @@ void VirtualizedGridWidget::setTagFilter(uint64_t tag_mask)
         QSignalBlocker blocker(m_tagCombo);
         int matchedIdx = 0;
         for (int i = 0; i < m_tagCombo->count(); ++i) {
-            if (m_tagCombo->itemData(i).toULongLong() == tag_mask) {
+            const QVariant v = m_tagCombo->itemData(i);
+            if (v.isValid() && v.toULongLong() == tag_mask) {
                 matchedIdx = i;
                 break;
             }
@@ -1535,8 +1497,36 @@ void VirtualizedGridWidget::setTagFilter(uint64_t tag_mask)
     }
     m_index.setTagMask(tag_mask, false);
     if (m_canvas) {
-        int cols = m_canvas->computeColumns(m_canvas->width());
-        int vh = m_canvas->computeVirtualHeight(m_index.filteredCount(), cols);
+        const int cols = m_canvas->computeColumns(m_canvas->width());
+        const int vh = m_canvas->computeVirtualHeight(m_index.filteredCount(), cols);
+        onVirtualHeightChanged(vh);
+        updateStatusText();
+        m_canvas->update();
+    }
+}
+
+void VirtualizedGridWidget::setBadgeFilter(uint32_t badge_mask)
+{
+    if (m_badgeCombo) {
+        QSignalBlocker blocker(m_badgeCombo);
+        int matchedIdx = 0;
+        for (int i = 0; i < m_badgeCombo->count(); ++i) {
+            const QVariant v = m_badgeCombo->itemData(i);
+            if (v.isValid() && v.toUInt() == badge_mask) {
+                matchedIdx = i;
+                break;
+            }
+        }
+        m_badgeCombo->setCurrentIndex(matchedIdx);
+    }
+
+    if (m_canvas) {
+        m_canvas->resetHoverState();
+    }
+    m_index.setBadgeFilter(badge_mask);
+    if (m_canvas) {
+        const int cols = m_canvas->computeColumns(m_canvas->width());
+        const int vh = m_canvas->computeVirtualHeight(m_index.filteredCount(), cols);
         onVirtualHeightChanged(vh);
         updateStatusText();
         m_canvas->update();
@@ -1572,8 +1562,8 @@ void VirtualizedGridWidget::refreshCatalogView()
         return;
     }
     m_canvas->resetHoverState();
-    int cols = m_canvas->computeColumns(m_canvas->width());
-    int vh = m_canvas->computeVirtualHeight(m_index.filteredCount(), cols);
+    const int cols = m_canvas->computeColumns(m_canvas->width());
+    const int vh = m_canvas->computeVirtualHeight(m_index.filteredCount(), cols);
     onVirtualHeightChanged(vh);
     updateStatusText();
     m_canvas->update();
@@ -1585,7 +1575,8 @@ void VirtualizedGridWidget::scanWallpapers(const std::vector<std::string> &extra
         m_canvas->resetHoverState();
         m_canvas->clearSelection();
     }
-    size_t count = m_index.scanAll(extra_paths);
+    m_pool.clear();
+    const size_t count = m_index.scanAll(extra_paths);
     refreshCatalogView();
     emit catalogScanned(count);
 }
@@ -1596,47 +1587,66 @@ void VirtualizedGridWidget::populateSampleCatalogIfEmpty(bool force_showcase_car
         return;
     }
 
+    const QString sampleDir = ensureSampleAssetDir();
+
     struct SampleDef {
         const char *title;
-        const char *path;
+        const char *filename;
+        const char *previewName;
         WallpaperBadge badge;
+        uint32_t flags;
         uint32_t color;
         uint64_t tags;
     };
 
     const SampleDef samples[] = {
-        {"01 Cyberpunk Neon Rainstorm", "/usr/share/wwal/samples/cyberpunk_neon.glsl",
-         WallpaperBadge::Shader, 0x0ea5e9,
+        {"01 Cyberpunk Neon Rainstorm", "cyberpunk_neon.glsl", "cyberpunk_neon_preview.png",
+         WallpaperBadge::Shader, WAYWAL_THUMB_FLAG_SHADER, 0x0ea5e9,
          WallpaperTags::Cyberpunk | WallpaperTags::Dark | WallpaperTags::Urban},
-        {"02 Abyssal Bioluminescence", "/usr/share/wwal/samples/abyssal_reef.json",
-         WallpaperBadge::Scene, 0x6366f1,
+        {"02 Abyssal Bioluminescence", "abyssal_reef.json", "abyssal_reef_preview.png",
+         WallpaperBadge::Scene, WAYWAL_THUMB_FLAG_SCENE, 0x6366f1,
          WallpaperTags::Nature | WallpaperTags::Dark | WallpaperTags::Fantasy},
-        {"03 Solarized Horizon 4K", "/usr/share/wwal/samples/solarized_horizon.png",
-         WallpaperBadge::Image, 0xf97316,
+        {"03 Solarized Horizon 4K", "solarized_horizon.png", "solarized_horizon.png",
+         WallpaperBadge::Image, WAYWAL_THUMB_FLAG_NONE, 0xf97316,
          WallpaperTags::Landscape | WallpaperTags::Minimal | WallpaperTags::Nature},
-        {"04 Quantum Fluid Vortex", "/usr/share/wwal/samples/quantum_fluid.glsl",
-         WallpaperBadge::Shader, 0x10b981,
+        {"04 Quantum Fluid Vortex", "quantum_fluid.glsl", "quantum_fluid_preview.png",
+         WallpaperBadge::Shader, WAYWAL_THUMB_FLAG_SHADER, 0x10b981,
          WallpaperTags::Abstract | WallpaperTags::SciFi | WallpaperTags::Dark},
-        {"05 Tokyo Midnight Shinjuku", "/usr/share/wwal/samples/tokyo_shinjuku.mp4",
-         WallpaperBadge::Video, 0xa855f7,
+        {"05 Tokyo Midnight Shinjuku", "tokyo_shinjuku.mp4", "tokyo_shinjuku_preview.png",
+         WallpaperBadge::Video, WAYWAL_THUMB_FLAG_VIDEO, 0xa855f7,
          WallpaperTags::Urban | WallpaperTags::Cyberpunk | WallpaperTags::Photography},
-        {"06 Celestial Nebula Drift", "/usr/share/wwal/samples/celestial_nebula.json",
-         WallpaperBadge::Scene, 0xec4899,
+        {"06 Celestial Nebula Drift", "celestial_nebula.json", "celestial_nebula_preview.png",
+         WallpaperBadge::Scene, WAYWAL_THUMB_FLAG_SCENE, 0xec4899,
          WallpaperTags::Space | WallpaperTags::SciFi | WallpaperTags::DigitalArt},
-        {"07 Nordic Fjord Minimal", "/usr/share/wwal/samples/nordic_fjord.png",
-         WallpaperBadge::Image, 0x3b82f6,
+        {"07 Nordic Fjord Minimal", "nordic_fjord.png", "nordic_fjord.png", WallpaperBadge::Image,
+         WAYWAL_THUMB_FLAG_NONE, 0x3b82f6,
          WallpaperTags::Landscape | WallpaperTags::Minimal | WallpaperTags::Light},
-        {"08 Synthwave Outrun Grid", "/usr/share/wwal/samples/synthwave_grid.glsl",
-         WallpaperBadge::Shader, 0xd946ef,
+        {"08 Synthwave Outrun Grid", "synthwave_grid.glsl", "synthwave_grid_preview.png",
+         WallpaperBadge::Shader, WAYWAL_THUMB_FLAG_SHADER, 0xd946ef,
          WallpaperTags::Retro | WallpaperTags::Cyberpunk | WallpaperTags::Vehicles},
     };
 
-    int64_t base_time = 1710000000;
+    const int64_t base_time = 1710000000;
     for (size_t i = 0; i < std::size(samples); ++i) {
+        const QString assetPath = sampleDir + QLatin1Char('/') + QLatin1String(samples[i].filename);
+        const QString previewPath =
+            sampleDir + QLatin1Char('/') + QLatin1String(samples[i].previewName);
+        ensureSamplePng(previewPath, samples[i].color);
+        if (samples[i].badge == WallpaperBadge::Shader) {
+            ensureSampleTextFile(assetPath, "void mainImage(out vec4 fragColor, in vec2 fragCoord) "
+                                            "{ fragColor = vec4(0.1, 0.5, 0.9, 1.0); }\n");
+        } else if (samples[i].badge == WallpaperBadge::Scene) {
+            ensureSampleTextFile(assetPath, "{\"title\":\"Sample Scene\",\"type\":\"scene\"}\n");
+        } else if (samples[i].badge == WallpaperBadge::Video) {
+            ensureSampleTextFile(assetPath, "WWAL-SAMPLE-VIDEO-PLACEHOLDER\n");
+        }
+
         CatalogItem item;
         item.title = samples[i].title;
-        item.path = samples[i].path;
+        item.path = assetPath.toStdString();
+        item.preview_path = previewPath.toStdString();
         item.badge = samples[i].badge;
+        item.flags = samples[i].flags;
         item.dominant_color = samples[i].color;
         item.tag_mask = samples[i].tags;
         item.file_size = (2 + i * 3) * 1024 * 1024;
@@ -1661,103 +1671,150 @@ void VirtualizedGridWidget::selectFirstItemIfAvailable()
 
 void VirtualizedGridWidget::openFolderSettingsDialog()
 {
-    QDialog dlg(this);
-    dlg.setWindowTitle("Wallpaper Folders & Exclusions");
-    dlg.setMinimumSize(540, 480);
-    dlg.setStyleSheet(
+    if (m_folderDialog) {
+        m_folderDialog->raise();
+        m_folderDialog->activateWindow();
+        return;
+    }
+
+    auto *dlg = new QDialog(this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->setWindowModality(Qt::WindowModal);
+    dlg->setWindowTitle("Wallpaper Folders & Exclusions");
+    dlg->setMinimumSize(540, 480);
+    m_folderDialog = dlg;
+
+    dlg->setStyleSheet(
         "QDialog { background: #14171d; color: #f1f5f9; }"
-        "QLabel { color: #e2e8f0; font-size: 11px; }"
+        "QLabel { color: #f1f5f9; font-size: 11px; }"
         "QListWidget { background: #1e222b; color: #f1f5f9; border: 1px solid #334155; "
         "border-radius: 5px; padding: 4px; font-size: 11px; }"
         "QLineEdit { background: #1e222b; color: #f1f5f9; border: 1px solid #334155; "
         "border-radius: 5px; padding: 4px 8px; font-size: 11px; }"
+        "QLineEdit:focus { border: 2px solid #38bdf8; }"
         "QPushButton { background: #1e222b; color: #f1f5f9; border: 1px solid #334155; "
-        "border-radius: 5px; padding: 5px 10px; font-size: 11px; font-weight: 600; }"
+        "border-radius: 5px; padding: 5px 10px; font-size: 11px; font-weight: 600; min-height: "
+        "28px; }"
         "QPushButton:hover { background: #283040; border-color: #38bdf8; }"
-        "QCheckBox { color: #cbd5e1; font-size: 11px; spacing: 6px; }");
+        "QPushButton:focus { border: 2px solid #38bdf8; }"
+        "QCheckBox { color: #f1f5f9; font-size: 11px; spacing: 6px; }");
 
-    auto *layout = new QVBoxLayout(&dlg);
+    auto *layout = new QVBoxLayout(dlg);
     layout->setContentsMargins(14, 14, 14, 14);
     layout->setSpacing(10);
 
     auto *incHeader =
-        new QLabel("<b>Included Wallpaper Folders</b> (only these folders are scanned):", &dlg);
+        new QLabel("<b>Included Wallpaper Folders</b> (only these folders are scanned):", dlg);
     layout->addWidget(incHeader);
 
-    auto *incList = new QListWidget(&dlg);
+    auto *incList = new QListWidget(dlg);
     for (const auto &dir : m_index.includedDirectories()) {
         incList->addItem(QString::fromStdString(dir));
     }
     layout->addWidget(incList, 1);
 
     auto *incBtnRow = new QHBoxLayout();
-    auto *addIncBtn = new QPushButton("+ Add Folder...", &dlg);
-    auto *onlyWallpapersBtn = new QPushButton("Only ~/Pictures/Wallpapers", &dlg);
-    auto *remIncBtn = new QPushButton("Remove Selected", &dlg);
+    auto *addIncBtn = new QPushButton("+ Add Folder...", dlg);
+    auto *onlyWallpapersBtn = new QPushButton("Only ~/Pictures/Wallpapers", dlg);
+    auto *remIncBtn = new QPushButton("Remove Selected", dlg);
     incBtnRow->addWidget(addIncBtn);
     incBtnRow->addWidget(onlyWallpapersBtn);
     incBtnRow->addWidget(remIncBtn);
     incBtnRow->addStretch();
     layout->addLayout(incBtnRow);
 
-    connect(addIncBtn, &QPushButton::clicked, &dlg, [&dlg, incList]() {
-        QString dir = QFileDialog::getExistingDirectory(&dlg, "Select Wallpaper Folder to Include");
-        if (!dir.isEmpty()) {
-            incList->addItem(dir);
+    QPointer<QDialog> safeDlg(dlg);
+    QPointer<QListWidget> safeIncList(incList);
+    connect(addIncBtn, &QPushButton::clicked, dlg, [safeDlg, safeIncList]() {
+        if (!safeDlg || !safeIncList) {
+            return;
         }
+        auto *fd = new QFileDialog(safeDlg, QStringLiteral("Select Wallpaper Folder to Include"));
+        fd->setAttribute(Qt::WA_DeleteOnClose);
+        fd->setFileMode(QFileDialog::Directory);
+        fd->setOption(QFileDialog::ShowDirsOnly, true);
+        connect(fd, &QFileDialog::fileSelected, safeIncList, [safeIncList](const QString &dir) {
+            if (safeIncList && !dir.isEmpty()) {
+                safeIncList->addItem(dir);
+            }
+        });
+        fd->open();
     });
-    connect(onlyWallpapersBtn, &QPushButton::clicked, &dlg, [incList]() {
-        incList->clear();
-        incList->addItem(
+    connect(onlyWallpapersBtn, &QPushButton::clicked, dlg, [safeIncList]() {
+        if (!safeIncList) {
+            return;
+        }
+        safeIncList->clear();
+        safeIncList->addItem(
             QString::fromStdString(FuzzyCatalogIndex::expandUserPath("~/Pictures/Wallpapers")));
     });
-    connect(remIncBtn, &QPushButton::clicked, &dlg,
-            [incList]() { qDeleteAll(incList->selectedItems()); });
+    connect(remIncBtn, &QPushButton::clicked, dlg, [safeIncList]() {
+        if (safeIncList) {
+            qDeleteAll(safeIncList->selectedItems());
+        }
+    });
 
     auto *excHeader =
         new QLabel("<b>Excluded Folders or Folder Names</b> (e.g. <code>Screenshots</code>, "
                    "<code>~/Pictures/Camera</code>):",
-                   &dlg);
+                   dlg);
     layout->addWidget(excHeader);
 
-    auto *excList = new QListWidget(&dlg);
+    auto *excList = new QListWidget(dlg);
     for (const auto &dir : m_index.excludedDirectories()) {
         excList->addItem(QString::fromStdString(dir));
     }
     layout->addWidget(excList, 1);
 
     auto *excInputRow = new QHBoxLayout();
-    auto *excPatternEdit = new QLineEdit(&dlg);
+    auto *excPatternEdit = new QLineEdit(dlg);
     excPatternEdit->setPlaceholderText(
         "Folder name or path to exclude (e.g. Screenshots, Memes)...");
-    auto *addExcPatternBtn = new QPushButton("+ Exclude Name/Path", &dlg);
-    auto *addExcDirBtn = new QPushButton("Browse Folder...", &dlg);
-    auto *remExcBtn = new QPushButton("Remove Selected", &dlg);
+    auto *addExcPatternBtn = new QPushButton("+ Exclude Name/Path", dlg);
+    auto *addExcDirBtn = new QPushButton("Browse Folder...", dlg);
+    auto *remExcBtn = new QPushButton("Remove Selected", dlg);
     excInputRow->addWidget(excPatternEdit, 1);
     excInputRow->addWidget(addExcPatternBtn);
     excInputRow->addWidget(addExcDirBtn);
     excInputRow->addWidget(remExcBtn);
     layout->addLayout(excInputRow);
 
-    connect(addExcPatternBtn, &QPushButton::clicked, &dlg, [excPatternEdit, excList]() {
-        QString txt = excPatternEdit->text().trimmed();
+    QPointer<QLineEdit> safeExcEdit(excPatternEdit);
+    QPointer<QListWidget> safeExcList(excList);
+    connect(addExcPatternBtn, &QPushButton::clicked, dlg, [safeExcEdit, safeExcList]() {
+        if (!safeExcEdit || !safeExcList) {
+            return;
+        }
+        const QString txt = safeExcEdit->text().trimmed();
         if (!txt.isEmpty()) {
-            excList->addItem(txt);
-            excPatternEdit->clear();
+            safeExcList->addItem(txt);
+            safeExcEdit->clear();
         }
     });
     connect(excPatternEdit, &QLineEdit::returnPressed, addExcPatternBtn, &QPushButton::click);
-    connect(addExcDirBtn, &QPushButton::clicked, &dlg, [&dlg, excList]() {
-        QString dir = QFileDialog::getExistingDirectory(&dlg, "Select Folder to Exclude");
-        if (!dir.isEmpty()) {
-            excList->addItem(dir);
+    connect(addExcDirBtn, &QPushButton::clicked, dlg, [safeDlg, safeExcList]() {
+        if (!safeDlg || !safeExcList) {
+            return;
+        }
+        auto *fd = new QFileDialog(safeDlg, QStringLiteral("Select Folder to Exclude"));
+        fd->setAttribute(Qt::WA_DeleteOnClose);
+        fd->setFileMode(QFileDialog::Directory);
+        fd->setOption(QFileDialog::ShowDirsOnly, true);
+        connect(fd, &QFileDialog::fileSelected, safeExcList, [safeExcList](const QString &dir) {
+            if (safeExcList && !dir.isEmpty()) {
+                safeExcList->addItem(dir);
+            }
+        });
+        fd->open();
+    });
+    connect(remExcBtn, &QPushButton::clicked, dlg, [safeExcList]() {
+        if (safeExcList) {
+            qDeleteAll(safeExcList->selectedItems());
         }
     });
-    connect(remExcBtn, &QPushButton::clicked, &dlg,
-            [excList]() { qDeleteAll(excList->selectedItems()); });
 
     auto *sysCheck =
-        new QCheckBox("Also scan system (/usr/share/backgrounds) and Steam Workshop folders", &dlg);
+        new QCheckBox("Also scan system (/usr/share/backgrounds) and Steam Workshop folders", dlg);
     sysCheck->setChecked(m_index.scanSystemAndWorkshopPaths());
     layout->addWidget(sysCheck);
 
@@ -1765,112 +1822,160 @@ void VirtualizedGridWidget::openFolderSettingsDialog()
         QStringLiteral("Saved to: <code>%1</code> (or set <code>WWAL_WALLPAPER_DIRS</code> / "
                        "<code>WWAL_EXCLUDE_DIRS</code>)")
             .arg(QString::fromStdString(FuzzyCatalogIndex::defaultConfigFilePath())),
-        &dlg);
-    cfgPathNote->setStyleSheet("color: #64748b; font-size: 10px;");
+        dlg);
+    cfgPathNote->setStyleSheet("color: #94a3b8; font-size: 11px;");
     cfgPathNote->setWordWrap(true);
     layout->addWidget(cfgPathNote);
 
     auto *bottomRow = new QHBoxLayout();
-    auto *resetBtn = new QPushButton("Reset Defaults", &dlg);
+    auto *resetBtn = new QPushButton("Reset Defaults", dlg);
     bottomRow->addWidget(resetBtn);
     bottomRow->addStretch();
 
-    auto *cancelBtn = new QPushButton("Cancel", &dlg);
-    auto *saveBtn = new QPushButton("Save && Rescan", &dlg);
+    auto *cancelBtn = new QPushButton("Cancel", dlg);
+    auto *saveBtn = new QPushButton("Save && Rescan", dlg);
     saveBtn->setStyleSheet(
         "QPushButton { background: #0284c7; color: white; border: 1px solid #38bdf8; "
-        "border-radius: 5px; padding: 6px 14px; font-weight: bold; }"
+        "border-radius: 5px; padding: 6px 14px; font-weight: bold; min-height: 28px; }"
         "QPushButton:hover { background: #0369a1; }");
     bottomRow->addWidget(cancelBtn);
     bottomRow->addWidget(saveBtn);
     layout->addLayout(bottomRow);
 
-    connect(resetBtn, &QPushButton::clicked, &dlg, [incList, excList, sysCheck]() {
+    QPointer<QCheckBox> safeSysCheck(sysCheck);
+    connect(resetBtn, &QPushButton::clicked, dlg, [safeIncList, safeExcList, safeSysCheck]() {
+        if (!safeIncList || !safeExcList || !safeSysCheck) {
+            return;
+        }
         FuzzyCatalogIndex defaultsIdx;
         defaultsIdx.resetFolderConfigToDefaults();
-        incList->clear();
+        safeIncList->clear();
         for (const auto &d : defaultsIdx.includedDirectories()) {
-            incList->addItem(QString::fromStdString(d));
+            safeIncList->addItem(QString::fromStdString(d));
         }
-        excList->clear();
+        safeExcList->clear();
         for (const auto &d : defaultsIdx.excludedDirectories()) {
-            excList->addItem(QString::fromStdString(d));
+            safeExcList->addItem(QString::fromStdString(d));
         }
-        sysCheck->setChecked(defaultsIdx.scanSystemAndWorkshopPaths());
+        safeSysCheck->setChecked(defaultsIdx.scanSystemAndWorkshopPaths());
     });
-    connect(cancelBtn, &QPushButton::clicked, &dlg, &QDialog::reject);
-    connect(saveBtn, &QPushButton::clicked, &dlg, &QDialog::accept);
+    connect(cancelBtn, &QPushButton::clicked, dlg, &QDialog::reject);
+    connect(saveBtn, &QPushButton::clicked, dlg, &QDialog::accept);
 
-    if (dlg.exec() == QDialog::Accepted) {
+    QPointer<VirtualizedGridWidget> safeSelf(this);
+    connect(dlg, &QDialog::accepted, this, [safeSelf, safeIncList, safeExcList, safeSysCheck]() {
+        if (!safeSelf || !safeIncList || !safeExcList || !safeSysCheck) {
+            return;
+        }
         std::vector<std::string> newInc;
-        newInc.reserve(static_cast<size_t>(incList->count()));
-        for (int i = 0; i < incList->count(); ++i) {
-            newInc.push_back(incList->item(i)->text().toStdString());
+        newInc.reserve(static_cast<size_t>(safeIncList->count()));
+        for (int i = 0; i < safeIncList->count(); ++i) {
+            newInc.push_back(safeIncList->item(i)->text().toStdString());
         }
         std::vector<std::string> newExc;
-        newExc.reserve(static_cast<size_t>(excList->count()));
-        for (int i = 0; i < excList->count(); ++i) {
-            newExc.push_back(excList->item(i)->text().toStdString());
+        newExc.reserve(static_cast<size_t>(safeExcList->count()));
+        for (int i = 0; i < safeExcList->count(); ++i) {
+            newExc.push_back(safeExcList->item(i)->text().toStdString());
         }
 
-        m_index.setIncludedDirectories(newInc);
-        m_index.setExcludedDirectories(newExc);
-        m_index.setScanSystemAndWorkshopPaths(sysCheck->isChecked());
-        (void)m_index.saveConfigToFile();
+        safeSelf->m_index.setIncludedDirectories(newInc);
+        safeSelf->m_index.setExcludedDirectories(newExc);
+        safeSelf->m_index.setScanSystemAndWorkshopPaths(safeSysCheck->isChecked());
+        (void)safeSelf->m_index.saveConfigToFile();
 
-        scanWallpapers();
-        selectFirstItemIfAvailable();
-    }
+        safeSelf->scanWallpapers();
+        safeSelf->selectFirstItemIfAvailable();
+    });
+    dlg->open();
 }
 
-void VirtualizedGridWidget::onSearchTextChanged(const QString &text)
+void VirtualizedGridWidget::applySearchText(const QString &text)
 {
     if (m_canvas) {
         m_canvas->resetHoverState();
     }
     m_index.setSearchQuery(text.toStdString());
-    int cols = m_canvas->computeColumns(m_canvas->width());
-    int vh = m_canvas->computeVirtualHeight(m_index.filteredCount(), cols);
-    onVirtualHeightChanged(vh);
-    updateStatusText();
-    m_canvas->update();
+    if (m_canvas) {
+        const int cols = m_canvas->computeColumns(m_canvas->width());
+        const int vh = m_canvas->computeVirtualHeight(m_index.filteredCount(), cols);
+        onVirtualHeightChanged(vh);
+        updateStatusText();
+        m_canvas->update();
+    }
+}
+
+void VirtualizedGridWidget::onSearchTextChanged(const QString &text)
+{
+    m_pendingSearchText = text;
+    if (m_searchDebounceTimer) {
+        m_searchDebounceTimer->start();
+    } else {
+        applySearchText(text);
+    }
 }
 
 void VirtualizedGridWidget::onSortChanged(int combo_index)
 {
+    const QVariant sortVar = m_sortCombo ? m_sortCombo->itemData(combo_index) : QVariant{};
+    if (!sortVar.isValid()) {
+        return;
+    }
+    const int rawVal = sortVar.toInt();
+    if (rawVal < static_cast<int>(SortCriteria::NameAsc) ||
+        rawVal > static_cast<int>(SortCriteria::DominantHue)) {
+        return;
+    }
     if (m_canvas) {
         m_canvas->resetHoverState();
     }
-    auto criteria = static_cast<SortCriteria>(m_sortCombo->itemData(combo_index).toInt());
-    m_index.setSorting(criteria);
-    m_canvas->update();
+    m_index.setSorting(static_cast<SortCriteria>(rawVal));
+    if (m_canvas) {
+        m_canvas->update();
+    }
 }
 
 void VirtualizedGridWidget::onScrollValueChanged(int value) { m_canvas->setScrollY(value); }
 
 void VirtualizedGridWidget::onVirtualHeightChanged(int virtual_height)
 {
-    int max_val = std::max(0, virtual_height - m_canvas->height());
+    if (!m_canvas || !m_scrollBar) {
+        return;
+    }
+    const int max_val = std::max(0, virtual_height - m_canvas->height());
+    const int clampedScroll = std::clamp(m_canvas->scrollY(), 0, max_val);
+    if (clampedScroll != m_canvas->scrollY()) {
+        m_canvas->setScrollY(clampedScroll);
+    }
+    const QSignalBlocker blocker(m_scrollBar);
     m_scrollBar->setRange(0, max_val);
     m_scrollBar->setPageStep(m_canvas->height());
+    m_scrollBar->setValue(m_canvas->scrollY());
     m_scrollBar->setVisible(max_val > 0);
 }
 
 void VirtualizedGridWidget::onPlaylistAddClicked()
 {
-    auto ids = selectedIds();
-    if (!ids.empty()) {
-        emit playlistSelectionChanged(ids);
+    const auto ids = selectedIds();
+    if (ids.empty()) {
+        return;
     }
+    for (uint32_t id : ids) {
+        if (std::find(m_playlistQueue.begin(), m_playlistQueue.end(), id) ==
+            m_playlistQueue.end()) {
+            m_playlistQueue.push_back(id);
+        }
+    }
+    if (m_playlistSelectionLabel) {
+        m_playlistSelectionLabel->setText(
+            QStringLiteral("%1 in playlist").arg(m_playlistQueue.size()));
+    }
+    emit playlistAddRequested(ids);
+    emit playlistSelectionChanged(ids);
 }
 
 void VirtualizedGridWidget::clearSelection() { m_canvas->clearSelection(); }
 
-std::vector<uint32_t> VirtualizedGridWidget::selectedIds() const
-{
-    const auto &set = m_canvas->selectedIds();
-    return std::vector<uint32_t>(set.begin(), set.end());
-}
+std::vector<uint32_t> VirtualizedGridWidget::selectedIds() const { return m_canvas->selectedIds(); }
 
 void VirtualizedGridWidget::updateStatusText()
 {

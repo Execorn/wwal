@@ -173,9 +173,26 @@ class GpuTexturePool {
         std::string media_path;
         bool decode_queued{false};
         bool cpu_ready{false};
-        bool ready{false};
         QImage thumbnail;
         std::shared_ptr<const std::vector<uint8_t>> etc2_blocks;
+        // Drop retained CPU buffers once the layer is uploaded to VRAM so 1,500 resident slots
+        // do not pin ~560 MB of duplicate QImage and ETC2 arrays in host memory.
+        struct ReadyFlag {
+            LruNode *owner{nullptr};
+            bool value{false};
+
+            operator bool() const noexcept { return value; }
+            ReadyFlag &operator=(bool v) noexcept
+            {
+                value = v;
+                if (v && owner != nullptr) {
+                    owner->thumbnail = QImage();
+                    owner->etc2_blocks.reset();
+                    owner->cpu_ready = false;
+                }
+                return *this;
+            }
+        } ready{this, false};
         LruNode *prev{nullptr};
         LruNode *next{nullptr};
     };
