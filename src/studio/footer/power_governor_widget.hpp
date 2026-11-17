@@ -14,15 +14,19 @@
 
 namespace wwal::studio {
 
+namespace detail {
+class FooterBadgeLabel;
+} // namespace detail
+
 /**
  * @brief Power Governor, Battery Policy & Auto-Pause Control Widget.
  *
  * Features:
- * - FPS cap selector (24, 30, 60, 120, 144, VSync).
+ * - FPS cap selector (24, 30, 60, 120, 144, VSync, plus custom non-preset caps).
  * - Battery Policy selector (Ignore, Reduce FPS to 30, Pause Video/Shaders).
  * - Auto-Pause policies (Fullscreen, Maximized, Occluded Workspace).
  * - Live battery and AC power status badge.
- * - Live daemon global pause reason monitor.
+ * - Live daemon global pause reason monitor surfacing all active pause flags.
  */
 class PowerGovernorWidget : public QWidget {
     Q_OBJECT
@@ -35,6 +39,11 @@ class PowerGovernorWidget : public QWidget {
      * @brief Update power governor state from daemon telemetry snapshot.
      */
     void updateFromTelemetry(const waywal_telemetry_snapshot_t &snapshot);
+
+    /**
+     * @brief Toggle compact layout hiding secondary prefix labels on narrow viewports.
+     */
+    void setCompactMode(bool compact);
 
     [[nodiscard]] uint32_t fpsCap() const noexcept { return m_fpsCap; }
     [[nodiscard]] waywal_battery_policy_t batteryPolicy() const noexcept { return m_batteryPolicy; }
@@ -62,6 +71,7 @@ class PowerGovernorWidget : public QWidget {
   private:
     void setupUi();
     void updateStatusBadges();
+    void syncFpsComboSelection(uint32_t fps);
 
     // Internal state
     uint32_t m_fpsCap{0}; // 0 = VSync
@@ -72,15 +82,18 @@ class PowerGovernorWidget : public QWidget {
     bool m_onBattery{false};
     uint16_t m_globalPauseMask{0};
     bool m_firstTelemetrySync{true};
+    bool m_compactMode{false};
 
     // UI Widgets
+    QLabel *m_fpsLabel{nullptr};
+    QLabel *m_batLabel{nullptr};
     QComboBox *m_fpsCombo{nullptr};
     QComboBox *m_batteryPolicyCombo{nullptr};
     QCheckBox *m_pauseFullscreenCheck{nullptr};
     QCheckBox *m_pauseMaximizedCheck{nullptr};
     QCheckBox *m_pauseOccludedCheck{nullptr};
-    QLabel *m_powerBadge{nullptr};
-    QLabel *m_pauseStatusBadge{nullptr};
+    detail::FooterBadgeLabel *m_powerBadge{nullptr};
+    detail::FooterBadgeLabel *m_pauseStatusBadge{nullptr};
 };
 
 } // namespace wwal::studio

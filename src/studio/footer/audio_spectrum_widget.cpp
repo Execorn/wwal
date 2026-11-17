@@ -2,45 +2,39 @@
 #include "audio_spectrum_widget.hpp"
 
 #include <QtWidgets/QHBoxLayout>
-#include <QtWidgets/QVBoxLayout>
 #include <QtWidgets/QToolTip>
-#include <QtGui/QPainter>
-#include <QtGui/QPainterPath>
-#include <QtGui/QLinearGradient>
-#include <QtGui/QRadialGradient>
-#include <QtCore/QDateTime>
+#include <QtCore/QSignalBlocker>
+#include <QtCore/QVarLengthArray>
 
-#include <cmath>
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 
 namespace wwal::studio {
 
 namespace {
 
-[[maybe_unused]] constexpr float MaxBark = 28.0f; // Schroeder Bark scale limit up to ~20 kHz
-constexpr float MinDecayRate = 9.0f;              // 1/s exponential decay constant
+constexpr float MinDecayRate = 9.0f; // 1/s exponential decay constant
 constexpr float PeakHoldDurationSec = 0.35f;
 constexpr float PeakGravity = 3.5f; // Normalized units / s^2
-
-inline float clampf(float val, float minVal, float maxVal) noexcept
-{
-    return std::max(minVal, std::min(val, maxVal));
-}
+constexpr float IdleEpsilon = 1e-4f;
 
 } // namespace
 
 float AudioSpectrumWidget::hzToBark(float hz) noexcept
 {
-    float term1 = 13.0f * std::atan(0.00076f * hz);
-    float ratio = hz / 7500.0f;
-    float term2 = 3.5f * std::atan(ratio * ratio);
+    if (!std::isfinite(hz) || hz <= 0.0f) {
+        return 0.0f;
+    }
+    const float term1 = 13.0f * std::atan(0.00076f * hz);
+    const float ratio = hz / 7500.0f;
+    const float term2 = 3.5f * std::atan(ratio * ratio);
     return term1 + term2;
 }
 
 float AudioSpectrumWidget::barkToHz(float bark) noexcept
 {
-    float z = clampf(bark, 0.0f, 30.0f);
+    const float z = detail::clampFinite(bark, 0.0f, 30.0f);
     return 600.0f * std::sinh(z / 6.0f);
 }
 
@@ -57,151 +51,226 @@ float AudioSpectrumWidget::bandCenterHz(size_t band) noexcept
 
 AudioSpectrumWidget::AudioSpectrumWidget(QWidget *parent) : QWidget(parent)
 {
-    setMinimumHeight(40);
+    setMinimumHeight(44);
     setMinimumWidth(140);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     setMouseTracking(true);
+    setFocusPolicy(Qt::StrongFocus);
+    setAccessibleName(QStringLiteral("Audio FFT Spectrum Visualizer"));
+    setAccessibleDescription(QStringLiteral(
+        "64-band Bark-scale audio spectrum; use Left and Right arrows to inspect bands"));
 
-    // Precompute center frequencies and subtle ambient idle floor
     for (size_t b = 0; b < NumBands; ++b) {
         m_centerFreqs[b] = bandCenterHz(b);
-        const float normIdx = static_cast<float>(b) / static_cast<float>(NumBands - 1);
-        const float env = 0.14f + 0.22f * std::exp(-std::pow((normIdx - 0.22f) / 0.18f, 2.0f)) +
-                          0.12f * std::exp(-std::pow((normIdx - 0.58f) / 0.20f, 2.0f));
-        m_targetBands[b] = env;
-        m_currentBands[b] = env;
-        m_peakCaps[b] = std::min(1.0f, env + 0.08f);
-        m_peakHoldTimers[b] = PeakHoldDurationSec;
-        m_peakVelocities[b] = 0.0f;
     }
-    m_targetRms = 0.22f;
-    m_currentRms = 0.22f;
-    m_peakRms = 0.30f;
 
+    initPaintResources();
     setupUi();
 
-    // 60 FPS physics and rendering timer
     connect(&m_physicsTimer, &QTimer::timeout, this, &AudioSpectrumWidget::onPhysicsTick);
     m_elapsedTimer.start();
-    if (isVisible()) {
-        m_physicsTimer.start(16);
-    }
 }
 
-void AudioSpectrumWidget::wakePhysicsTimer()
+void AudioSpectrumWidget::initPaintResources()
 {
-    if (isVisible() && !m_physicsTimer.isActive()) {
-        m_elapsedTimer.restart();
-        m_physicsTimer.start(16);
-    }
+    m_bgPanelPen = QPen(QColor(51, 65, 85, 130), 1.0);
+    m_bgPanelBrush = QBrush(QColor(15, 23, 42, 160));
+    m_focusRingPen = QPen(QColor::fromRgba(detail::tokens::FocusRing), 2.0);
+    m_focusRingPen.setJoinStyle(Qt::RoundJoin);
+
+    m_hoverBarBrush = QBrush(QColor::fromRgba(detail::tokens::TextPrimary));
+    m_peakCapBrush = QBrush(QColor(248, 250, 252, 235));
+    m_silentTickBrush = QBrush(QColor(51, 65, 85, 140));
+    m_rmsTrackBrush = QBrush(QColor(30, 41, 59, 190));
+    m_rmsPeakBrush = QBrush(QColor(248, 250, 252, 250));
+
+    m_barGradient = QLinearGradient(0.0, 1.0, 0.0, 0.0);
+    m_barGradient.setColorAt(0.0, QColor(6, 182, 212, 225));
+    m_barGradient.setColorAt(0.6, QColor(139, 92, 246, 235));
+    m_barGradient.setColorAt(1.0, QColor(236, 72, 153, 245));
+
+    m_rmsGradient = QLinearGradient(0.0, 1.0, 0.0, 0.0);
+    m_rmsGradient.setColorAt(0.0, QColor(16, 185, 129, 235));
+    m_rmsGradient.setColorAt(0.7, QColor(234, 179, 8, 235));
+    m_rmsGradient.setColorAt(1.0, QColor(239, 68, 68, 245));
+
+    m_beatRingPen = QPen(QColor(244, 114, 182, 0), 1.5);
 }
 
 void AudioSpectrumWidget::setupUi()
 {
+    setStyleSheet(
+        QStringLiteral("QLabel#audioGainLabel {"
+                       "  color: #94a3b8;"
+                       "  font-size: 11px;"
+                       "  font-weight: 600;"
+                       "}"
+                       "QLabel#audioGainValue {"
+                       "  color: #f1f5f9;"
+                       "  font-family: monospace;"
+                       "  font-size: 11px;"
+                       "  font-weight: 600;"
+                       "}"
+                       "QSlider#audioGainSlider {"
+                       "  min-height: 28px;"
+                       "  padding: 2px;"
+                       "  border: 2px solid transparent;"
+                       "  border-radius: 4px;"
+                       "}"
+                       "QSlider#audioGainSlider:focus {"
+                       "  border: 2px solid #38bdf8;"
+                       "}"
+                       "QSlider#audioGainSlider::groove:horizontal {"
+                       "  height: 4px;"
+                       "  background: #334155;"
+                       "  border-radius: 2px;"
+                       "}"
+                       "QSlider#audioGainSlider::sub-page:horizontal {"
+                       "  background: #0284c7;"
+                       "  border-radius: 2px;"
+                       "}"
+                       "QSlider#audioGainSlider::handle:horizontal {"
+                       "  background: #f8fafc;"
+                       "  border: 1px solid #38bdf8;"
+                       "  width: 12px;"
+                       "  margin-top: -4px;"
+                       "  margin-bottom: -4px;"
+                       "  border-radius: 6px;"
+                       "}"
+                       "QSlider#audioGainSlider::handle:horizontal:hover {"
+                       "  background: #38bdf8;"
+                       "}"
+                       "QCheckBox#audioMuteToggle {"
+                       "  color: #94a3b8;"
+                       "  font-size: 11px;"
+                       "  spacing: 3px;"
+                       "  min-height: 28px;"
+                       "  padding: 0px 2px;"
+                       "  border: 2px solid transparent;"
+                       "  border-radius: 4px;"
+                       "}"
+                       "QCheckBox#audioMuteToggle:hover, QCheckBox#audioMuteToggle:checked {"
+                       "  color: #f1f5f9;"
+                       "}"
+                       "QCheckBox#audioMuteToggle:focus {"
+                       "  border: 2px solid #38bdf8;"
+                       "}"
+                       "QCheckBox#audioMuteToggle::indicator {"
+                       "  width: 14px;"
+                       "  height: 14px;"
+                       "  border-radius: 3px;"
+                       "  border: 1px solid #64748b;"
+                       "  background: #181b22;"
+                       "}"
+                       "QCheckBox#audioMuteToggle::indicator:checked {"
+                       "  background: #0284c7;"
+                       "  border-color: #38bdf8;"
+                       "}"));
+
     auto *rootLayout = new QHBoxLayout(this);
     rootLayout->setContentsMargins(2, 2, 2, 2);
     rootLayout->setSpacing(4);
 
-    // Controls container on the right
     auto *controlsLayout = new QHBoxLayout();
-    controlsLayout->setSpacing(3);
+    controlsLayout->setSpacing(4);
     controlsLayout->setContentsMargins(0, 0, 0, 0);
 
-    // Beat indicator badge
-    m_beatBadge = new QLabel("BEAT", this);
-    m_beatBadge->setFixedSize(34, 22);
-    m_beatBadge->setAlignment(Qt::AlignCenter);
-    m_beatBadge->setStyleSheet("QLabel {"
-                               "  background-color: #1a1e29;"
-                               "  color: #64748b;"
-                               "  border: 1px solid #334155;"
-                               "  border-radius: 4px;"
-                               "  font-family: monospace;"
-                               "  font-size: 9px;"
-                               "  font-weight: bold;"
-                               "  padding: 1px 2px;"
-                               "}");
+    m_beatBadge = new detail::FooterBadgeLabel(QStringLiteral("BEAT"), this, QStringLiteral("BEAT"),
+                                               detail::tokens::MinTargetPx, 5);
+    m_beatBadge->setToolTip(QStringLiteral("Audio beat onset indicator"));
+    m_beatBadge->setAccessibleName(QStringLiteral("Beat onset status"));
     controlsLayout->addWidget(m_beatBadge);
+    updateBeatBadgeVisual();
 
-    // Audio status badge (PipeWire / Muted)
-    m_statusBadge = new QLabel("PW", this);
-    m_statusBadge->setToolTip("PipeWire Audio Stream Status");
-    m_statusBadge->setFixedSize(26, 22);
-    m_statusBadge->setAlignment(Qt::AlignCenter);
-    m_statusBadge->setStyleSheet("QLabel {"
-                                 "  background-color: #1a1e29;"
-                                 "  color: #10b981;"
-                                 "  border: 1px solid #065f46;"
-                                 "  border-radius: 4px;"
-                                 "  font-family: monospace;"
-                                 "  font-size: 9px;"
-                                 "  font-weight: bold;"
-                                 "  padding: 1px 2px;"
-                                 "}");
+    m_statusBadge = new detail::FooterBadgeLabel(
+        QStringLiteral("OFF"), this, QStringLiteral("DUCK"), detail::tokens::MinTargetPx, 4);
+    m_statusBadge->setToolTip(QStringLiteral("PipeWire audio stream status"));
+    m_statusBadge->setAccessibleName(QStringLiteral("PipeWire audio status"));
+    m_statusBadge->setBadgeColors(QColor::fromRgba(detail::tokens::SurfaceSlate),
+                                  QColor::fromRgba(detail::tokens::TextSecondary),
+                                  QColor::fromRgba(detail::tokens::BorderDivider));
+    m_lastStatusTone = StatusTone::Off;
     controlsLayout->addWidget(m_statusBadge);
 
-    // Sensitivity Gain Slider (0.0x to 5.0x -> slider range 0 to 500)
-    m_gainLabel = new QLabel("Gain", this);
-    m_gainLabel->setStyleSheet("color: #94a3b8; font-size: 9.5px; font-weight: 500;");
+    m_gainLabel = new QLabel(QStringLiteral("Gain"), this);
+    m_gainLabel->setObjectName(QStringLiteral("audioGainLabel"));
     controlsLayout->addWidget(m_gainLabel);
 
     m_gainSlider = new QSlider(Qt::Horizontal, this);
+    m_gainSlider->setObjectName(QStringLiteral("audioGainSlider"));
     m_gainSlider->setRange(0, 500);
-    m_gainSlider->setValue(100); // 1.00x default
-    m_gainSlider->setFixedWidth(52);
-    m_gainSlider->setToolTip("Master Audio Sensitivity Gain (0.0x - 5.0x)");
-    m_gainSlider->setStyleSheet("QSlider::groove:horizontal {"
-                                "  height: 4px;"
-                                "  background: #334155;"
-                                "  border-radius: 2px;"
-                                "}"
-                                "QSlider::sub-page:horizontal {"
-                                "  background: #06b6d4;"
-                                "  border-radius: 2px;"
-                                "}"
-                                "QSlider::handle:horizontal {"
-                                "  background: #f8fafc;"
-                                "  border: 1px solid #06b6d4;"
-                                "  width: 10px;"
-                                "  margin-top: -3px;"
-                                "  margin-bottom: -3px;"
-                                "  border-radius: 5px;"
-                                "}"
-                                "QSlider::handle:horizontal:hover {"
-                                "  background: #38bdf8;"
-                                "}");
+    m_gainSlider->setValue(100);
+    m_gainSlider->setFixedSize(48, detail::tokens::MinTargetPx);
+    m_gainSlider->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    m_gainSlider->setToolTip(QStringLiteral("Master Audio Sensitivity Gain (0.0x - 5.0x)"));
+    m_gainSlider->setAccessibleName(QStringLiteral("Audio sensitivity gain"));
     connect(m_gainSlider, &QSlider::valueChanged, this, &AudioSpectrumWidget::onGainSliderChanged);
     controlsLayout->addWidget(m_gainSlider);
 
-    m_gainValueLabel = new QLabel("1.0x", this);
-    m_gainValueLabel->setFixedWidth(30);
-    m_gainValueLabel->setStyleSheet("color: #cbd5e1; font-family: monospace; font-size: 9.5px;");
+    m_gainValueLabel = new QLabel(QStringLiteral("1.0x"), this);
+    m_gainValueLabel->setObjectName(QStringLiteral("audioGainValue"));
+    const QFontMetrics valFm(m_gainValueLabel->font());
+    m_gainValueLabel->setMinimumWidth(
+        std::max(34, valFm.horizontalAdvance(QStringLiteral("5.0x")) + 4));
     controlsLayout->addWidget(m_gainValueLabel);
 
-    // Mute on External Audio Checkbox
-    m_muteToggle = new QCheckBox("Mute", this);
-    m_muteToggle->setToolTip("Mute wallpaper audio when external application is playing");
-    m_muteToggle->setStyleSheet("QCheckBox {"
-                                "  color: #94a3b8;"
-                                "  font-size: 9.5px;"
-                                "  spacing: 3px;"
-                                "}"
-                                "QCheckBox::indicator {"
-                                "  width: 11px;"
-                                "  height: 11px;"
-                                "  border-radius: 2px;"
-                                "  border: 1px solid #475569;"
-                                "  background: #1e293b;"
-                                "}"
-                                "QCheckBox::indicator:checked {"
-                                "  background: #06b6d4;"
-                                "  border-color: #38bdf8;"
-                                "}");
+    m_muteToggle = new QCheckBox(QStringLiteral("Mute"), this);
+    m_muteToggle->setObjectName(QStringLiteral("audioMuteToggle"));
+    m_muteToggle->setMinimumSize(detail::tokens::MinTargetPx, detail::tokens::MinTargetPx);
+    m_muteToggle->setToolTip(
+        QStringLiteral("Mute wallpaper audio when external application is playing"));
+    m_muteToggle->setAccessibleName(QStringLiteral("Mute wallpaper audio on external audio"));
     connect(m_muteToggle, &QCheckBox::toggled, this, &AudioSpectrumWidget::onMuteCheckToggled);
     controlsLayout->addWidget(m_muteToggle);
 
     rootLayout->addStretch(1);
     rootLayout->addLayout(controlsLayout);
+}
+
+bool AudioSpectrumWidget::hasActivePhysics() const noexcept
+{
+    if (m_beatGlowIntensity > IdleEpsilon || m_currentBeatPulse > IdleEpsilon) {
+        if (m_beatGlowIntensity > IdleEpsilon ||
+            std::abs(m_currentBeatPulse - m_targetBeatPulse) > IdleEpsilon) {
+            return true;
+        }
+    } else if (m_targetBeatPulse > IdleEpsilon) {
+        return true;
+    }
+
+    const float scaledRms = detail::clampFinite(m_targetRms * m_sensitivityGain, 0.0f, 1.0f);
+    if (std::abs(m_currentRms - scaledRms) > IdleEpsilon ||
+        m_peakRms > m_currentRms + IdleEpsilon) {
+        return true;
+    }
+
+    for (size_t i = 0; i < NumBands; ++i) {
+        const float scaledTarget =
+            detail::clampFinite(m_targetBands[i] * m_sensitivityGain, 0.0f, 1.0f);
+        if (std::abs(m_currentBands[i] - scaledTarget) > IdleEpsilon ||
+            m_peakCaps[i] > m_currentBands[i] + IdleEpsilon) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void AudioSpectrumWidget::wakePhysicsTimer()
+{
+    if (!isVisible()) {
+        if (m_physicsTimer.isActive()) {
+            m_physicsTimer.stop();
+        }
+        return;
+    }
+    if (hasActivePhysics()) {
+        if (!m_physicsTimer.isActive()) {
+            m_elapsedTimer.restart();
+            m_physicsTimer.start(16);
+        }
+    } else if (m_physicsTimer.isActive()) {
+        m_physicsTimer.stop();
+    }
 }
 
 void AudioSpectrumWidget::updateFromTelemetry(const waywal_telemetry_snapshot_t &snapshot)
@@ -216,69 +285,115 @@ void AudioSpectrumWidget::updateAudioData(const float bands[NumBands], float rms
                                           float beatPulse, bool beatOnset, bool audioActive,
                                           bool pipewireActive, bool muteOnAudio, float audioVolume)
 {
+    bool targetsChanged = false;
     if (bands) {
         for (size_t i = 0; i < NumBands; ++i) {
-            m_targetBands[i] = clampf(bands[i], 0.0f, 1.0f);
+            const float clamped = detail::clampFinite(bands[i], 0.0f, 1.0f);
+            if (std::abs(m_targetBands[i] - clamped) > 1e-5f) {
+                m_targetBands[i] = clamped;
+                targetsChanged = true;
+            }
         }
     }
 
-    m_targetRms = clampf(rmsLevel, 0.0f, 1.0f);
-    m_targetBeatPulse = clampf(beatPulse, 0.0f, 1.0f);
+    const float clampedRms = detail::clampFinite(rmsLevel, 0.0f, 1.0f);
+    if (std::abs(m_targetRms - clampedRms) > 1e-5f) {
+        m_targetRms = clampedRms;
+        targetsChanged = true;
+    }
+
+    const float clampedBeat = detail::clampFinite(beatPulse, 0.0f, 1.0f);
+    if (std::abs(m_targetBeatPulse - clampedBeat) > 1e-5f) {
+        m_targetBeatPulse = clampedBeat;
+        targetsChanged = true;
+    }
+
     m_audioActive = audioActive;
     m_pipewireActive = pipewireActive;
-    m_audioVolume = clampf(audioVolume, 0.0f, 1.0f);
+    m_audioVolume = detail::clampFinite(audioVolume, 0.0f, 1.0f);
 
     if (beatOnset) {
         m_beatOnset = true;
         m_beatGlowIntensity = 1.0f;
         m_beatRingRadius = 0.0f;
+        targetsChanged = true;
     }
 
     if (m_muteOnAudio != muteOnAudio) {
         m_muteOnAudio = muteOnAudio;
-        QSignalBlocker blocker(m_muteToggle);
-        m_muteToggle->setChecked(muteOnAudio);
-    }
-
-    // Update status badge
-    if (m_statusBadge) {
-        if (!pipewireActive) {
-            m_statusBadge->setText("OFF");
-            m_statusBadge->setStyleSheet(
-                "QLabel { background-color: #1e293b; color: #64748b; border: 1px solid #334155; "
-                "border-radius: 4px; font-family: monospace; font-size: 9px; padding: 2px; }");
-        } else if (muteOnAudio && audioVolume < 0.05f) {
-            m_statusBadge->setText("DUCK");
-            m_statusBadge->setStyleSheet(
-                "QLabel { background-color: #3b2010; color: #fbbf24; border: 1px solid #b45309; "
-                "border-radius: 4px; font-family: monospace; font-size: 9px; padding: 2px; }");
-        } else {
-            m_statusBadge->setText("PW");
-            m_statusBadge->setStyleSheet(
-                "QLabel { background-color: #064e3b; color: #34d399; border: 1px solid #059669; "
-                "border-radius: 4px; font-family: monospace; font-size: 9px; padding: 2px; }");
+        if (m_muteToggle) {
+            const QSignalBlocker blocker(m_muteToggle);
+            m_muteToggle->setChecked(muteOnAudio);
         }
     }
 
+    if (m_statusBadge) {
+        StatusTone nextTone = StatusTone::Active;
+        if (!pipewireActive) {
+            nextTone = StatusTone::Off;
+        } else if (muteOnAudio && m_audioVolume < 0.05f) {
+            nextTone = StatusTone::Ducked;
+        }
+
+        if (nextTone != m_lastStatusTone) {
+            m_lastStatusTone = nextTone;
+            switch (nextTone) {
+            case StatusTone::Off:
+                m_statusBadge->setBadgeText(QStringLiteral("OFF"));
+                m_statusBadge->setBadgeColors(QColor::fromRgba(detail::tokens::SurfaceSlate),
+                                              QColor::fromRgba(detail::tokens::TextSecondary),
+                                              QColor::fromRgba(detail::tokens::BorderDivider));
+                m_statusBadge->setToolTip(QStringLiteral("PipeWire audio stream: Inactive"));
+                break;
+            case StatusTone::Ducked:
+                m_statusBadge->setBadgeText(QStringLiteral("DUCK"));
+                m_statusBadge->setBadgeColors(QColor::fromRgba(detail::tokens::AmberBg),
+                                              QColor::fromRgba(detail::tokens::AmberFg),
+                                              QColor::fromRgba(detail::tokens::AmberBorder));
+                m_statusBadge->setToolTip(
+                    QStringLiteral("PipeWire audio stream: Ducked by external audio"));
+                break;
+            case StatusTone::Active:
+            case StatusTone::Unset:
+                m_statusBadge->setBadgeText(QStringLiteral("PW"));
+                m_statusBadge->setBadgeColors(QColor::fromRgba(detail::tokens::EmeraldBg),
+                                              QColor::fromRgba(detail::tokens::EmeraldFg),
+                                              QColor::fromRgba(detail::tokens::EmeraldBorder));
+                m_statusBadge->setToolTip(QStringLiteral("PipeWire audio stream: Active"));
+                break;
+            }
+        }
+    }
+
+    // Apply instantaneous attack right away so synchronous callers see updated peaks immediately.
+    stepPhysics(0.0f);
     wakePhysicsTimer();
+
+    if (isVisible() && targetsChanged && !m_physicsTimer.isActive()) {
+        update();
+    }
 }
 
 void AudioSpectrumWidget::setSensitivityGain(float gain)
 {
-    gain = clampf(gain, 0.0f, 5.0f);
+    gain = detail::clampFinite(gain, 0.0f, 5.0f);
     if (std::abs(m_sensitivityGain - gain) > 0.001f) {
         m_sensitivityGain = gain;
-        int sliderVal = static_cast<int>(std::round(gain * 100.0f));
+        const int sliderVal = static_cast<int>(std::lround(gain * 100.0f));
         if (m_gainSlider && m_gainSlider->value() != sliderVal) {
-            QSignalBlocker blocker(m_gainSlider);
+            const QSignalBlocker blocker(m_gainSlider);
             m_gainSlider->setValue(sliderVal);
         }
         if (m_gainValueLabel) {
             char buf[16];
             std::snprintf(buf, sizeof(buf), "%.1fx", gain);
-            m_gainValueLabel->setText(buf);
+            m_gainValueLabel->setText(QString::fromUtf8(buf));
         }
+        stepPhysics(0.0f);
         wakePhysicsTimer();
+        if (isVisible() && !m_physicsTimer.isActive()) {
+            update();
+        }
         Q_EMIT sensitivityGainChanged(m_sensitivityGain);
     }
 }
@@ -288,7 +403,7 @@ void AudioSpectrumWidget::setMuteOnAudio(bool enabled)
     if (m_muteOnAudio != enabled) {
         m_muteOnAudio = enabled;
         if (m_muteToggle) {
-            QSignalBlocker blocker(m_muteToggle);
+            const QSignalBlocker blocker(m_muteToggle);
             m_muteToggle->setChecked(enabled);
         }
         Q_EMIT muteOnAudioToggled(m_muteOnAudio);
@@ -297,15 +412,19 @@ void AudioSpectrumWidget::setMuteOnAudio(bool enabled)
 
 void AudioSpectrumWidget::onGainSliderChanged(int value)
 {
-    float newGain = static_cast<float>(value) / 100.0f;
+    const float newGain = detail::clampFinite(static_cast<float>(value) / 100.0f, 0.0f, 5.0f);
     if (std::abs(m_sensitivityGain - newGain) > 0.001f) {
         m_sensitivityGain = newGain;
         if (m_gainValueLabel) {
             char buf[16];
             std::snprintf(buf, sizeof(buf), "%.1fx", newGain);
-            m_gainValueLabel->setText(buf);
+            m_gainValueLabel->setText(QString::fromUtf8(buf));
         }
+        stepPhysics(0.0f);
         wakePhysicsTimer();
+        if (isVisible() && !m_physicsTimer.isActive()) {
+            update();
+        }
         Q_EMIT sensitivityGainChanged(m_sensitivityGain);
     }
 }
@@ -320,184 +439,214 @@ void AudioSpectrumWidget::onMuteCheckToggled(bool checked)
 
 void AudioSpectrumWidget::onPhysicsTick()
 {
-    qint64 elapsedNs = m_elapsedTimer.nsecsElapsed();
+    if (!isVisible()) {
+        m_physicsTimer.stop();
+        return;
+    }
+
+    const qint64 elapsedNs = m_elapsedTimer.nsecsElapsed();
     m_elapsedTimer.restart();
-    float dt = static_cast<float>(elapsedNs) * 1e-9f;
-    dt = clampf(dt, 0.001f, 0.050f); // Guard against giant lag spikes
+    const float dt = detail::clampFinite(static_cast<float>(elapsedNs) * 1e-9f, 0.001f, 0.050f);
 
     stepPhysics(dt);
     update();
 
-    float maxEnergy =
-        std::max({m_currentRms, clampf(m_targetRms * m_sensitivityGain, 0.0f, 1.0f), m_peakRms,
-                  m_beatGlowIntensity, m_currentBeatPulse, m_targetBeatPulse});
-    for (size_t i = 0; i < NumBands; ++i) {
-        maxEnergy = std::max(maxEnergy, m_currentBands[i]);
-        maxEnergy = std::max(maxEnergy, clampf(m_targetBands[i] * m_sensitivityGain, 0.0f, 1.0f));
-        maxEnergy = std::max(maxEnergy, m_peakCaps[i]);
-    }
-    if (maxEnergy < 1e-4f) {
+    if (!hasActivePhysics()) {
         m_physicsTimer.stop();
     }
 }
 
 void AudioSpectrumWidget::stepPhysics(float dt)
 {
-    const float decayFactor = std::exp(-MinDecayRate * dt);
+    const float decayFactor = (dt > 0.0f) ? std::exp(-MinDecayRate * dt) : 1.0f;
 
     for (size_t i = 0; i < NumBands; ++i) {
-        float scaledTarget = clampf(m_targetBands[i] * m_sensitivityGain, 0.0f, 1.0f);
+        const float scaledTarget =
+            detail::clampFinite(m_targetBands[i] * m_sensitivityGain, 0.0f, 1.0f);
 
-        // Exponential decay with fast attack
         if (scaledTarget >= m_currentBands[i]) {
             m_currentBands[i] = scaledTarget;
-        } else {
-            m_currentBands[i] = m_currentBands[i] * decayFactor;
-            if (m_currentBands[i] < 0.001f) {
-                m_currentBands[i] = 0.0f;
+        } else if (dt > 0.0f) {
+            m_currentBands[i] = scaledTarget + (m_currentBands[i] - scaledTarget) * decayFactor;
+            if (std::abs(m_currentBands[i] - scaledTarget) < IdleEpsilon) {
+                m_currentBands[i] = scaledTarget;
             }
         }
 
-        // Peak-hold caps with gravity fall
         if (m_currentBands[i] >= m_peakCaps[i]) {
             m_peakCaps[i] = m_currentBands[i];
             m_peakHoldTimers[i] = PeakHoldDurationSec;
             m_peakVelocities[i] = 0.0f;
-        } else {
+        } else if (dt > 0.0f) {
             if (m_peakHoldTimers[i] > 0.0f) {
                 m_peakHoldTimers[i] -= dt;
             } else {
                 m_peakVelocities[i] += PeakGravity * dt;
                 m_peakCaps[i] -= m_peakVelocities[i] * dt;
-                if (m_peakCaps[i] < m_currentBands[i]) {
+                if (m_peakCaps[i] <= m_currentBands[i] + IdleEpsilon) {
                     m_peakCaps[i] = m_currentBands[i];
                     m_peakVelocities[i] = 0.0f;
                 }
             }
         }
-        m_peakCaps[i] = clampf(m_peakCaps[i], 0.0f, 1.0f);
+        m_peakCaps[i] = detail::clampFinite(m_peakCaps[i], 0.0f, 1.0f);
     }
 
-    // RMS level decay & peak
-    float scaledRms = clampf(m_targetRms * m_sensitivityGain, 0.0f, 1.0f);
+    const float scaledRms = detail::clampFinite(m_targetRms * m_sensitivityGain, 0.0f, 1.0f);
     if (scaledRms >= m_currentRms) {
         m_currentRms = scaledRms;
-    } else {
-        m_currentRms = m_currentRms * decayFactor;
+    } else if (dt > 0.0f) {
+        m_currentRms = scaledRms + (m_currentRms - scaledRms) * decayFactor;
+        if (std::abs(m_currentRms - scaledRms) < IdleEpsilon) {
+            m_currentRms = scaledRms;
+        }
     }
 
     if (m_currentRms >= m_peakRms) {
         m_peakRms = m_currentRms;
         m_peakRmsTimer = PeakHoldDurationSec;
-    } else {
+    } else if (dt > 0.0f) {
         if (m_peakRmsTimer > 0.0f) {
             m_peakRmsTimer -= dt;
         } else {
             m_peakRms -= PeakGravity * 0.5f * dt;
-            if (m_peakRms < m_currentRms) {
+            if (m_peakRms <= m_currentRms + IdleEpsilon) {
                 m_peakRms = m_currentRms;
             }
         }
     }
 
-    // Beat pulse decay
-    m_currentBeatPulse = m_currentBeatPulse * std::exp(-8.0f * dt);
-    if (m_targetBeatPulse > m_currentBeatPulse) {
+    if (m_targetBeatPulse >= m_currentBeatPulse) {
         m_currentBeatPulse = m_targetBeatPulse;
-    }
-
-    if (m_beatGlowIntensity > 0.005f) {
-        m_beatGlowIntensity *= std::exp(-10.0f * dt);
-        m_beatRingRadius += 35.0f * dt;
-    } else {
-        m_beatGlowIntensity = 0.0f;
-        m_beatOnset = false;
-    }
-
-    if (m_beatBadge) {
-        const bool active = (m_beatGlowIntensity > 0.15f || m_currentBeatPulse > 0.4f);
-        const int rawAlpha =
-            active ? std::min(220, static_cast<int>(
-                                       clampf(std::max(m_beatGlowIntensity, m_currentBeatPulse),
-                                              0.0f, 1.0f) *
-                                       255.0f))
-                   : 0;
-        const int bucket = active ? std::max(1, (rawAlpha + 7) / 8) : 0;
-        if (bucket != m_lastBeatAlphaBucket) {
-            m_lastBeatAlphaBucket = bucket;
-            if (active) {
-                char styleBuf[256];
-                std::snprintf(styleBuf, sizeof(styleBuf),
-                              "QLabel {"
-                              "  background-color: rgba(236, 72, 153, %d);"
-                              "  color: #ffffff;"
-                              "  border: 1px solid #f472b6;"
-                              "  border-radius: 4px;"
-                              "  font-family: monospace;"
-                              "  font-size: 9px;"
-                              "  font-weight: bold;"
-                              "  padding: 2px;"
-                              "}",
-                              std::min(220, bucket * 8));
-                m_beatBadge->setStyleSheet(styleBuf);
-            } else {
-                m_beatBadge->setStyleSheet("QLabel {"
-                                           "  background-color: #1a1e29;"
-                                           "  color: #64748b;"
-                                           "  border: 1px solid #334155;"
-                                           "  border-radius: 4px;"
-                                           "  font-family: monospace;"
-                                           "  font-size: 9px;"
-                                           "  font-weight: bold;"
-                                           "  padding: 2px;"
-                                           "}");
-            }
+    } else if (dt > 0.0f) {
+        m_currentBeatPulse =
+            m_targetBeatPulse + (m_currentBeatPulse - m_targetBeatPulse) * std::exp(-8.0f * dt);
+        if (std::abs(m_currentBeatPulse - m_targetBeatPulse) < IdleEpsilon) {
+            m_currentBeatPulse = m_targetBeatPulse;
         }
     }
+
+    if (dt > 0.0f) {
+        if (m_beatGlowIntensity > 0.005f) {
+            m_beatGlowIntensity *= std::exp(-10.0f * dt);
+            m_beatRingRadius += 35.0f * dt;
+        } else {
+            m_beatGlowIntensity = 0.0f;
+            m_beatOnset = false;
+        }
+    }
+
+    updateBeatBadgeVisual();
+}
+
+void AudioSpectrumWidget::updateBeatBadgeVisual()
+{
+    if (!m_beatBadge) {
+        return;
+    }
+
+    const bool active = (m_beatGlowIntensity > 0.15f || m_currentBeatPulse > 0.4f);
+    const int rawAlpha =
+        active ? std::min(220, static_cast<int>(detail::clampFinite(std::max(m_beatGlowIntensity,
+                                                                             m_currentBeatPulse),
+                                                                    0.0f, 1.0f) *
+                                                255.0f))
+               : 0;
+    const int bucket = active ? std::max(1, (rawAlpha + 7) / 8) : 0;
+    if (bucket == m_lastBeatAlphaBucket) {
+        return;
+    }
+    m_lastBeatAlphaBucket = bucket;
+
+    if (active) {
+        const int alpha = std::min(230, bucket * 8);
+        m_beatBadge->setBadgeColors(QColor(157, 23, 77, alpha),
+                                    QColor::fromRgba(detail::tokens::TextPrimary),
+                                    QColor(244, 114, 182));
+    } else {
+        m_beatBadge->setBadgeColors(QColor::fromRgba(detail::tokens::SurfaceBadgeIdle),
+                                    QColor::fromRgba(detail::tokens::TextSecondary),
+                                    QColor::fromRgba(detail::tokens::BorderDivider));
+    }
+}
+
+bool AudioSpectrumWidget::computeVisualizerGeometry(VisualizerLayout &out) const
+{
+    out.valid = false;
+    const qreal widgetWidth = static_cast<qreal>(width());
+    const qreal widgetHeight = static_cast<qreal>(height());
+    if (widgetWidth <= 0.0 || widgetHeight <= 0.0) {
+        return false;
+    }
+
+    // Use the leftmost visible control widget so hidden optional badges never shrink the plot area.
+    qreal controlsLeft = widgetWidth;
+    const std::array<const QWidget *, 6> controls = {m_beatBadge,  m_statusBadge,    m_gainLabel,
+                                                     m_gainSlider, m_gainValueLabel, m_muteToggle};
+    bool foundControl = false;
+    for (const QWidget *ctrl : controls) {
+        if (ctrl && ctrl->isVisible()) {
+            controlsLeft = std::min(controlsLeft, static_cast<qreal>(ctrl->geometry().left()));
+            foundControl = true;
+        }
+    }
+    if (!foundControl) {
+        controlsLeft = std::max(0.0, widgetWidth - 140.0);
+    }
+
+    const qreal availWidth = controlsLeft - 12.0;
+    if (availWidth < 24.0) {
+        return false;
+    }
+
+    const qreal topPadding = 4.0;
+    const qreal bottomPadding = 4.0;
+    const qreal usableHeight = std::max(10.0, widgetHeight - topPadding - bottomPadding);
+    const qreal rmsWidth = 6.0;
+    const qreal spectrumWidth = std::max(16.0, availWidth - rmsWidth - 10.0);
+
+    out.spectrumRect = QRectF(6.0, topPadding, spectrumWidth, usableHeight);
+    out.rmsRect = QRectF(6.0 + spectrumWidth + 6.0, topPadding, rmsWidth, usableHeight);
+    out.totalBg = QRectF(4.0, topPadding - 2.0, availWidth + 4.0, usableHeight + 4.0);
+    out.barSpacing = (spectrumWidth >= 140.0) ? 1.0 : 0.5;
+    out.barWidth = std::max(0.5, (spectrumWidth - (NumBands - 1) * out.barSpacing) /
+                                     static_cast<qreal>(NumBands));
+    out.barPitch = out.barWidth + out.barSpacing;
+    out.valid = true;
+    return true;
 }
 
 void AudioSpectrumWidget::paintEvent(QPaintEvent * /*event*/)
 {
+    if (!isVisible()) {
+        return;
+    }
+
+    VisualizerLayout layout;
+    if (!computeVisualizerGeometry(layout)) {
+        return;
+    }
+
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
 
-    // Calculate canvas bounds for spectrum and RMS meter
-    const float widgetWidth = static_cast<float>(width());
-    const float widgetHeight = static_cast<float>(height());
+    const qreal dpr = std::max(1.0, devicePixelRatioF());
+    const qreal halfPx = 0.5 / dpr;
+    const QRectF snappedBg = layout.totalBg.adjusted(halfPx, halfPx, -halfPx, -halfPx);
 
-    // Allocate space: Spectrum bars occupy available space to the left of the leftmost visible
-    // control
-    float controlsLeft = widgetWidth - 140.0f;
-    if (m_beatBadge && m_beatBadge->isVisible()) {
-        controlsLeft = static_cast<float>(m_beatBadge->geometry().left());
-    } else if (m_statusBadge && m_statusBadge->isVisible()) {
-        controlsLeft = static_cast<float>(m_statusBadge->geometry().left());
+    painter.setPen(m_bgPanelPen);
+    painter.setBrush(m_bgPanelBrush);
+    painter.drawRoundedRect(snappedBg, 4.0, 4.0);
+
+    renderBeatPulse(painter, layout.totalBg);
+    renderSpectrumBars(painter, layout);
+    renderRmsMeter(painter, layout.rmsRect);
+
+    if (hasFocus()) {
+        painter.setPen(m_focusRingPen);
+        painter.setBrush(Qt::NoBrush);
+        painter.drawRoundedRect(snappedBg.adjusted(1.0, 1.0, -1.0, -1.0), 4.0, 4.0);
     }
-    const float availWidth = controlsLeft - 12.0f;
-    if (availWidth < 24.0f) {
-        return;
-    }
-    const float topPadding = 4.0f;
-    const float bottomPadding = 4.0f;
-    const float usableHeight = std::max(10.0f, widgetHeight - topPadding - bottomPadding);
-
-    // RMS meter takes rightmost 6 pixels of the visualizer area
-    const float rmsWidth = 6.0f;
-    const float spectrumWidth = std::max(16.0f, availWidth - rmsWidth - 10.0f);
-
-    QRectF spectrumRect(6.0f, topPadding, spectrumWidth, usableHeight);
-    QRectF rmsRect(6.0f + spectrumWidth + 6.0f, topPadding, rmsWidth, usableHeight);
-
-    // Background panel for visualizer
-    QRectF totalBg(4.0f, topPadding - 2.0f, availWidth + 4.0f, usableHeight + 4.0f);
-    painter.setPen(QPen(QColor(51, 65, 85, 90), 1.0));
-    painter.setBrush(QColor(15, 23, 42, 140));
-    painter.drawRoundedRect(totalBg, 4.0, 4.0);
-
-    // Render components
-    renderBeatPulse(painter, totalBg);
-    renderSpectrumBars(painter, spectrumRect);
-    renderRmsMeter(painter, rmsRect);
 }
 
 void AudioSpectrumWidget::renderBeatPulse(QPainter &painter, const QRectF &rect)
@@ -505,154 +654,177 @@ void AudioSpectrumWidget::renderBeatPulse(QPainter &painter, const QRectF &rect)
     if (m_beatGlowIntensity <= 0.01f && m_currentBeatPulse <= 0.05f) {
         return;
     }
-    float pulseVal = std::max(m_beatGlowIntensity, m_currentBeatPulse);
+    const float pulseVal = std::max(m_beatGlowIntensity, m_currentBeatPulse);
     painter.save();
     painter.setClipRect(rect);
 
-    // Glowing bass pulse background aura
-    QPointF center = rect.center();
-    float maxRadius = std::max(rect.width(), rect.height()) * 0.7f;
-    QRadialGradient aura(center, maxRadius);
-    int alpha = static_cast<int>(clampf(pulseVal * 70.0f, 0.0f, 90.0f));
-    aura.setColorAt(0.0, QColor(236, 72, 153, alpha));
-    aura.setColorAt(0.5, QColor(139, 92, 246, alpha / 2));
-    aura.setColorAt(1.0, QColor(15, 23, 42, 0));
+    const QPointF center = rect.center();
+    const qreal maxRadius = std::max(rect.width(), rect.height()) * 0.7;
+    const int alpha = static_cast<int>(detail::clampFinite(pulseVal * 70.0f, 0.0f, 90.0f));
+    if (m_cachedAuraRect != rect || m_cachedAuraAlpha != alpha) {
+        m_beatAuraGradient.setCenter(center);
+        m_beatAuraGradient.setFocalPoint(center);
+        m_beatAuraGradient.setRadius(maxRadius);
+        m_beatAuraGradient.setColorAt(0.0, QColor(236, 72, 153, alpha));
+        m_beatAuraGradient.setColorAt(0.5, QColor(139, 92, 246, alpha / 2));
+        m_beatAuraGradient.setColorAt(1.0, QColor(15, 23, 42, 0));
+        m_cachedAuraRect = rect;
+        m_cachedAuraAlpha = alpha;
+    }
 
     painter.setPen(Qt::NoPen);
-    painter.setBrush(aura);
+    painter.setBrush(m_beatAuraGradient);
     painter.drawRect(rect);
 
-    // Expanding beat ripple ring
-    if (m_beatRingRadius > 0.0f && m_beatRingRadius < maxRadius) {
-        int ringAlpha = static_cast<int>(clampf(
-            m_beatGlowIntensity * 120.0f * (1.0f - (m_beatRingRadius / maxRadius)), 0.0f, 255.0f));
+    if (m_beatRingRadius > 0.0f && m_beatRingRadius < static_cast<float>(maxRadius)) {
+        const int ringAlpha = static_cast<int>(
+            detail::clampFinite(m_beatGlowIntensity * 120.0f *
+                                    (1.0f - (m_beatRingRadius / static_cast<float>(maxRadius))),
+                                0.0f, 255.0f));
         if (ringAlpha > 0) {
-            painter.setPen(QPen(QColor(244, 114, 182, ringAlpha), 1.5));
+            QColor ringColor = m_beatRingPen.color();
+            ringColor.setAlpha(ringAlpha);
+            m_beatRingPen.setColor(ringColor);
+            painter.setPen(m_beatRingPen);
             painter.setBrush(Qt::NoBrush);
-            painter.drawEllipse(center, m_beatRingRadius, m_beatRingRadius * 0.5f);
+            painter.drawEllipse(center, m_beatRingRadius, m_beatRingRadius * 0.5);
         }
     }
     painter.restore();
 }
 
-void AudioSpectrumWidget::renderSpectrumBars(QPainter &painter, const QRectF &rect)
+void AudioSpectrumWidget::renderSpectrumBars(QPainter &painter, const VisualizerLayout &layout)
 {
-    const float totalWidth = rect.width();
-    const float totalHeight = rect.height();
-    const float barSpacing = (totalWidth >= 140.0f) ? 1.0f : 0.5f;
-    const float barWidth =
-        std::max(0.5f, (totalWidth - (NumBands - 1) * barSpacing) / static_cast<float>(NumBands));
+    const QRectF &rect = layout.spectrumRect;
+    const qreal totalHeight = rect.height();
 
-    // Dynamic gradient from cyan/teal to violet/magenta
-    QLinearGradient barGradient(rect.left(), rect.bottom(), rect.left(), rect.top());
-    barGradient.setColorAt(0.0, QColor(6, 182, 212, 220));  // Cyan-500
-    barGradient.setColorAt(0.6, QColor(139, 92, 246, 230)); // Violet-500
-    barGradient.setColorAt(1.0, QColor(236, 72, 153, 240)); // Pink-500
+    if (m_cachedBarGradRect != rect) {
+        m_barGradient.setStart(rect.left(), rect.bottom());
+        m_barGradient.setFinalStop(rect.left(), rect.top());
+        m_cachedBarGradRect = rect;
+    }
 
-    painter.setPen(Qt::NoPen);
+    QVarLengthArray<QRectF, NumBands> activeBars;
+    QVarLengthArray<QRectF, NumBands> silentTicks;
+    QVarLengthArray<QRectF, NumBands> peakCaps;
+    QRectF hoveredRect;
+    bool hasHovered = false;
 
     for (size_t i = 0; i < NumBands; ++i) {
-        float x = rect.left() + static_cast<float>(i) * (barWidth + barSpacing);
-        float normVal = m_currentBands[i];
-        float barH = std::max(1.0f, normVal * totalHeight);
-        float y = rect.bottom() - barH;
+        const qreal x = rect.left() + static_cast<qreal>(i) * layout.barPitch;
+        const float normVal = m_currentBands[i];
+        const qreal barH = std::max(1.0, static_cast<qreal>(normVal) * totalHeight);
+        const qreal y = rect.bottom() - barH;
+        const QRectF barRect(x, y, layout.barWidth, barH);
 
-        QRectF barRect(x, y, barWidth, barH);
-
-        // Highlight hovered band
         if (static_cast<int>(i) == m_hoveredBand) {
-            painter.setBrush(QColor(248, 250, 252, 255));
+            hoveredRect = barRect;
+            hasHovered = true;
+        } else if (normVal <= IdleEpsilon) {
+            silentTicks.append(barRect);
         } else {
-            painter.setBrush(barGradient);
+            activeBars.append(barRect);
         }
-        painter.drawRoundedRect(barRect, 0.5, 0.5);
 
-        // Render peak cap
-        float peakNorm = m_peakCaps[i];
+        const float peakNorm = m_peakCaps[i];
         if (peakNorm > 0.02f) {
-            float peakY = static_cast<float>(rect.bottom()) - (peakNorm * totalHeight);
-            peakY = std::max(static_cast<float>(rect.top()), peakY);
-            QRectF capRect(x, peakY - 1.5f, barWidth, 1.5f);
-            painter.setBrush(QColor(255, 255, 255, 230));
-            painter.drawRect(capRect);
+            qreal peakY = rect.bottom() - (static_cast<qreal>(peakNorm) * totalHeight);
+            peakY = std::max(rect.top(), peakY);
+            peakCaps.append(QRectF(x, peakY - 1.5, layout.barWidth, 1.5));
         }
+    }
+
+    painter.setPen(Qt::NoPen);
+    if (!silentTicks.isEmpty()) {
+        painter.setBrush(m_silentTickBrush);
+        painter.drawRects(silentTicks.constData(), silentTicks.size());
+    }
+    if (!activeBars.isEmpty()) {
+        painter.setBrush(m_barGradient);
+        painter.drawRects(activeBars.constData(), activeBars.size());
+    }
+    if (hasHovered) {
+        painter.setBrush(m_hoverBarBrush);
+        painter.drawRect(hoveredRect);
+    }
+    if (!peakCaps.isEmpty()) {
+        painter.setBrush(m_peakCapBrush);
+        painter.drawRects(peakCaps.constData(), peakCaps.size());
     }
 }
 
 void AudioSpectrumWidget::renderRmsMeter(QPainter &painter, const QRectF &rect)
 {
-    const float totalHeight = rect.height();
+    const qreal totalHeight = rect.height();
 
-    // Background track
     painter.setPen(Qt::NoPen);
-    painter.setBrush(QColor(30, 41, 59, 180));
+    painter.setBrush(m_rmsTrackBrush);
     painter.drawRoundedRect(rect, 2.0, 2.0);
 
-    // Active RMS bar
-    float rmsH = std::max(0.0f, m_currentRms * totalHeight);
-    float y = rect.bottom() - rmsH;
-    QRectF fillRect(rect.left(), y, rect.width(), rmsH);
+    if (m_currentRms > IdleEpsilon) {
+        if (m_cachedRmsGradRect != rect) {
+            m_rmsGradient.setStart(rect.left(), rect.bottom());
+            m_rmsGradient.setFinalStop(rect.left(), rect.top());
+            m_cachedRmsGradRect = rect;
+        }
+        const qreal rmsH = std::max(1.0, static_cast<qreal>(m_currentRms) * totalHeight);
+        const QRectF fillRect(rect.left(), rect.bottom() - rmsH, rect.width(), rmsH);
+        painter.setBrush(m_rmsGradient);
+        painter.drawRoundedRect(fillRect, 1.5, 1.5);
+    }
 
-    QLinearGradient rmsGrad(rect.left(), rect.bottom(), rect.left(), rect.top());
-    rmsGrad.setColorAt(0.0, QColor(16, 185, 129, 230)); // Green
-    rmsGrad.setColorAt(0.7, QColor(234, 179, 8, 230));  // Yellow
-    rmsGrad.setColorAt(1.0, QColor(239, 68, 68, 240));  // Red
-
-    painter.setBrush(rmsGrad);
-    painter.drawRoundedRect(fillRect, 1.5, 1.5);
-
-    // Peak RMS needle
     if (m_peakRms > 0.02f) {
-        float peakY = rect.bottom() - (m_peakRms * totalHeight);
-        QRectF peakNeedle(rect.left() - 0.5f, peakY - 1.0f, rect.width() + 1.0f, 2.0f);
-        painter.setBrush(QColor(255, 255, 255, 250));
+        const qreal peakY =
+            std::max(rect.top(), rect.bottom() - (static_cast<qreal>(m_peakRms) * totalHeight));
+        const QRectF peakNeedle(rect.left() - 0.5, peakY - 1.0, rect.width() + 1.0, 2.0);
+        painter.setBrush(m_rmsPeakBrush);
         painter.drawRect(peakNeedle);
     }
 }
 
+void AudioSpectrumWidget::showBandTooltip(int band, const QPoint &globalPos)
+{
+    if (band < 0 || band >= static_cast<int>(NumBands)) {
+        return;
+    }
+    const float freqHz = m_centerFreqs[static_cast<size_t>(band)];
+    const float valNorm = m_currentBands[static_cast<size_t>(band)];
+    const float dB = (valNorm > 0.0001f) ? (20.0f * std::log10(valNorm)) : -80.0f;
+
+    char tipBuf[128];
+    if (freqHz >= 1000.0f) {
+        std::snprintf(tipBuf, sizeof(tipBuf), "Band #%d: %.2f kHz\nLevel: %.1f%% (%.1f dB)",
+                      band + 1, freqHz / 1000.0f, valNorm * 100.0f, dB);
+    } else {
+        std::snprintf(tipBuf, sizeof(tipBuf), "Band #%d: %.0f Hz\nLevel: %.1f%% (%.1f dB)",
+                      band + 1, freqHz, valNorm * 100.0f, dB);
+    }
+    QToolTip::showText(globalPos, QString::fromUtf8(tipBuf), this);
+}
+
 void AudioSpectrumWidget::mouseMoveEvent(QMouseEvent *event)
 {
-    const float widgetWidth = static_cast<float>(width());
-    float controlsLeft = widgetWidth - 140.0f;
-    if (m_beatBadge && m_beatBadge->isVisible()) {
-        controlsLeft = static_cast<float>(m_beatBadge->geometry().left());
-    } else if (m_statusBadge && m_statusBadge->isVisible()) {
-        controlsLeft = static_cast<float>(m_statusBadge->geometry().left());
-    }
-    const float availWidth = std::max(28.0f, controlsLeft - 12.0f);
-    const float rmsWidth = 6.0f;
-    const float spectrumWidth = std::max(16.0f, availWidth - rmsWidth - 10.0f);
-    const float barSpacing = (spectrumWidth >= 140.0f) ? 1.0f : 0.5f;
-    const float barWidth = std::max(0.5f, (spectrumWidth - (NumBands - 1) * barSpacing) /
-                                              static_cast<float>(NumBands));
-
-    float mouseX = static_cast<float>(event->pos().x());
-    float relativeX = mouseX - 6.0f;
-
-    if (relativeX >= 0.0f && relativeX <= spectrumWidth) {
-        int band = static_cast<int>(relativeX / (barWidth + barSpacing));
-        if (band >= 0 && band < static_cast<int>(NumBands)) {
-            m_hoveredBand = band;
-            float freqHz = m_centerFreqs[band];
-            float valNorm = m_currentBands[band];
-            float dB = (valNorm > 0.0001f) ? (20.0f * std::log10(valNorm)) : -80.0f;
-
-            char tipBuf[128];
-            if (freqHz >= 1000.0f) {
-                std::snprintf(tipBuf, sizeof(tipBuf), "Band #%d: %.2f kHz\nLevel: %.1f%% (%.1f dB)",
-                              band + 1, freqHz / 1000.0f, valNorm * 100.0f, dB);
-            } else {
-                std::snprintf(tipBuf, sizeof(tipBuf), "Band #%d: %.0f Hz\nLevel: %.1f%% (%.1f dB)",
-                              band + 1, freqHz, valNorm * 100.0f, dB);
+    VisualizerLayout layout;
+    if (computeVisualizerGeometry(layout)) {
+        const QPointF pos = event->position();
+        if (pos.x() >= layout.spectrumRect.left() && pos.x() <= layout.spectrumRect.right() &&
+            pos.y() >= layout.totalBg.top() && pos.y() <= layout.totalBg.bottom() &&
+            layout.barPitch > 0.0) {
+            const qreal relativeX = pos.x() - layout.spectrumRect.left();
+            const int band = std::clamp(static_cast<int>(relativeX / layout.barPitch), 0,
+                                        static_cast<int>(NumBands) - 1);
+            if (m_hoveredBand != band) {
+                m_hoveredBand = band;
+                update();
             }
-            QToolTip::showText(event->globalPosition().toPoint(), QString::fromUtf8(tipBuf), this);
-            update();
+            showBandTooltip(band, event->globalPosition().toPoint());
             return;
         }
     }
 
     if (m_hoveredBand != -1) {
         m_hoveredBand = -1;
+        QToolTip::hideText();
         update();
     }
     QWidget::mouseMoveEvent(event);
@@ -662,21 +834,85 @@ void AudioSpectrumWidget::leaveEvent(QEvent *event)
 {
     if (m_hoveredBand != -1) {
         m_hoveredBand = -1;
+        QToolTip::hideText();
         update();
     }
     QWidget::leaveEvent(event);
 }
 
+void AudioSpectrumWidget::keyPressEvent(QKeyEvent *event)
+{
+    VisualizerLayout layout;
+    if (!computeVisualizerGeometry(layout)) {
+        QWidget::keyPressEvent(event);
+        return;
+    }
+
+    int nextBand = m_hoveredBand;
+    switch (event->key()) {
+    case Qt::Key_Right:
+        nextBand =
+            (m_hoveredBand < 0) ? 0 : std::min(static_cast<int>(NumBands) - 1, m_hoveredBand + 1);
+        break;
+    case Qt::Key_Left:
+        nextBand = (m_hoveredBand < 0) ? 0 : std::max(0, m_hoveredBand - 1);
+        break;
+    case Qt::Key_Home:
+        nextBand = 0;
+        break;
+    case Qt::Key_End:
+        nextBand = static_cast<int>(NumBands) - 1;
+        break;
+    case Qt::Key_Escape:
+        if (m_hoveredBand != -1) {
+            m_hoveredBand = -1;
+            QToolTip::hideText();
+            update();
+            event->accept();
+            return;
+        }
+        QWidget::keyPressEvent(event);
+        return;
+    default:
+        QWidget::keyPressEvent(event);
+        return;
+    }
+
+    m_hoveredBand = nextBand;
+    const qreal barCenterX =
+        layout.spectrumRect.left() + (static_cast<qreal>(nextBand) + 0.5) * layout.barPitch;
+    const QPoint localAnchor(static_cast<int>(std::lround(barCenterX)),
+                             static_cast<int>(std::lround(layout.spectrumRect.center().y())));
+    showBandTooltip(nextBand, mapToGlobal(localAnchor));
+    update();
+    event->accept();
+}
+
+void AudioSpectrumWidget::focusOutEvent(QFocusEvent *event)
+{
+    if (m_hoveredBand != -1) {
+        m_hoveredBand = -1;
+        QToolTip::hideText();
+    }
+    update();
+    QWidget::focusOutEvent(event);
+}
+
 void AudioSpectrumWidget::resizeEvent(QResizeEvent *event)
 {
     QWidget::resizeEvent(event);
-    const bool wide = (width() >= 290);
-    if (m_beatBadge)
-        m_beatBadge->setVisible(wide);
-    if (m_gainLabel)
-        m_gainLabel->setVisible(wide);
-    if (m_gainValueLabel)
-        m_gainValueLabel->setVisible(wide);
+    const int w = width();
+    const bool showBeat = (w >= 320);
+    const bool showGainDetails = (w >= 390);
+    if (m_beatBadge && m_beatBadge->isVisible() != showBeat) {
+        m_beatBadge->setVisible(showBeat);
+    }
+    if (m_gainLabel && m_gainLabel->isVisible() != showGainDetails) {
+        m_gainLabel->setVisible(showGainDetails);
+    }
+    if (m_gainValueLabel && m_gainValueLabel->isVisible() != showGainDetails) {
+        m_gainValueLabel->setVisible(showGainDetails);
+    }
 }
 
 void AudioSpectrumWidget::showEvent(QShowEvent *event)

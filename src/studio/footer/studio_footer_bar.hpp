@@ -5,6 +5,7 @@
 #include <QtWidgets/QWidget>
 #include <QtWidgets/QLabel>
 #include <QtCore/QTimer>
+#include <QtGui/QResizeEvent>
 
 #include "audio_spectrum_widget.hpp"
 #include "power_governor_widget.hpp"
@@ -40,6 +41,8 @@ class StudioFooterBar : public QWidget {
      */
     void setStatusMessage(const QString &msg, int timeoutMs = 3000);
 
+    [[nodiscard]] QSize minimumSizeHint() const override;
+
     [[nodiscard]] AudioSpectrumWidget *audioSpectrum() const noexcept { return m_audioSpectrum; }
     [[nodiscard]] PowerGovernorWidget *powerGovernor() const noexcept { return m_powerGovernor; }
     [[nodiscard]] TelemetryHudWidget *telemetryHud() const noexcept { return m_telemetryHud; }
@@ -57,11 +60,15 @@ class StudioFooterBar : public QWidget {
     // Forwarded telemetry selection
     void outputSelected(const QString &outputName);
 
+  protected:
+    void resizeEvent(QResizeEvent *event) override;
+
   private Q_SLOTS:
     void onStatusMessageTimeout();
 
   private:
     void setupUi();
+    void updateResponsiveLayout(int totalWidth);
 
     // Sub-components
     PowerGovernorWidget *m_powerGovernor{nullptr};
