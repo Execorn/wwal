@@ -781,9 +781,16 @@ static void test_cow_pool_eviction_on_overflow(void)
     assert_no_gl_error("cow_pool_eviction");
 }
 
+static int cmp_double_asc(const void *a, const void *b)
+{
+    double da = *(const double *)a;
+    double db = *(const double *)b;
+    return (da > db) - (da < db);
+}
+
 static void benchmark_4k_brush_and_undo(void)
 {
-    printf("[+] Benchmarking 4K (3840x2160) r=128px brush dabs & 50-stroke CoW undo/redo...\n");
+    printf("[+] Benchmarking 4K (3840x2160) r=128px brush dabs, 40-dab stroke p50 & CoW undo...\n");
     const uint32_t w = 3840, h = 2160;
     we_gpu_brush_ctx_t *bench_ctx = we_gpu_brush_create(WE_BRUSH_POOL_DEFAULT_CAPS);
     assert(bench_ctx != NULL);
@@ -814,6 +821,40 @@ static void benchmark_4k_brush_and_undo(void)
     assert(we_gpu_brush_dispatch_dabs(bench_ctx, &dab, 1u, NULL));
     assert(we_gpu_brush_end_stroke(bench_ctx, NULL));
     glFinish();
+
+    /* Benchmark 40-dab batched 4K RGBA8 stroke latency (target p50 <= 2.0 ms). */
+    we_brush_params_t stroke40_p = mask_p;
+    stroke40_p.radius_px = 48.0f;
+    we_brush_dab_t batch40[40];
+    for (int i = 0; i < 40; i++) {
+        float t0x = 400.0f + (float)i * 22.0f;
+        float t0y = 400.0f + (float)i * 12.0f;
+        batch40[i] = (we_brush_dab_t){
+            .ax = t0x,
+            .ay = t0y,
+            .bx = t0x + 22.0f,
+            .by = t0y + 12.0f,
+            .radius_a = 48.0f,
+            .radius_b = 48.0f,
+            .opacity_eff = 0.8f,
+        };
+    }
+
+    double stroke_ms[11];
+    for (int iter = 0; iter < 11; iter++) {
+        assert(we_gpu_brush_begin_stroke(bench_ctx, (uint64_t)(8900 + iter), &stroke40_p));
+        glFinish();
+        uint64_t s0 = get_time_us();
+        assert(we_gpu_brush_dispatch_dabs(bench_ctx, batch40, 40u, NULL));
+        glFinish();
+        uint64_t s1 = get_time_us();
+        assert(we_gpu_brush_end_stroke(bench_ctx, NULL));
+        stroke_ms[iter] = (double)(s1 - s0) / 1000.0;
+    }
+    double measured_strokes[10];
+    memcpy(measured_strokes, &stroke_ms[1], sizeof(measured_strokes));
+    qsort(measured_strokes, 10u, sizeof(double), cmp_double_asc);
+    double stroke_p50_ms = (measured_strokes[4] + measured_strokes[5]) * 0.5;
 
     /* Benchmark 50 color dabs at r=128 px */
     assert(we_gpu_brush_begin_stroke(bench_ctx, 9050u, &mask_p));
@@ -887,10 +928,18 @@ static void benchmark_4k_brush_and_undo(void)
 
     we_brush_stats_t st;
     we_gpu_brush_get_stats(bench_ctx, &st);
+    printf("    -> 4K RGBA8 40-Dab Stroke p50: %.3f ms (target <= 2.000 ms)\n", stroke_p50_ms);
     printf("    -> 4K Color Dab (r=128): %.3f ms/dab | Dual-Kawase Blur: %.3f ms/dab\n",
            avg_color_ms, avg_kawase_ms);
     printf("    -> 50-Stroke 4K CoW Undo (r=48): %.1f us/stroke | Active Pool Slots: %u / %u\n",
            avg_undo_us, st.active_pool_slots, st.max_pool_slots);
+
+#ifdef WWAL_PERF_GATES
+    const char *strict_env = getenv("WWAL_STRICT_PERF_ASSERTS");
+    if (strict_env && strcmp(strict_env, "1") == 0) {
+        assert(stroke_p50_ms <= 2.0);
+    }
+#endif
 
     we_gpu_brush_destroy(bench_ctx);
     destroy_test_canvas(&canvas);
@@ -1307,10 +1356,14 @@ static void test_live_stroke0_undo_and_unbind_scene(void)
     assert(px[16u * 256u + 16u] == 0u);
     free(px);
 
-    /* Stroke 20 occupies all 4 slots itself -> undo lacks headroom and must fail without
-     * self-eviction. */
+    /* Reject duplicate stroke_id collisions cleanly. */
+    assert(!we_gpu_brush_begin_stroke(pool4, 10u, &p));
+
+    /* Stroke 20 occupies all 4 slots itself -> in-place scratch swap allows symmetric
+     * undo/redo without self-eviction and without leaking pool slots. */
     we_gpu_brush_unbind_scene(pool4, &canvas.scene);
     assert(we_gpu_brush_bind_target(pool4, &canvas.scene, 42, 0xFFFFFFFFu, 0));
+    p.target_value = 1.0f;
     assert(we_gpu_brush_begin_stroke(pool4, 20u, &p));
     we_brush_dab_t d0123[4] = {
         {.ax = 16.0f,
@@ -1326,11 +1379,47 @@ static void test_live_stroke0_undo_and_unbind_scene(void)
     };
     assert(we_gpu_brush_dispatch_dabs(pool4, d0123, 4u, NULL));
     assert(we_gpu_brush_end_stroke(pool4, NULL));
+    assert(!we_gpu_brush_begin_stroke(pool4, 20u, &p));
 
-    assert(!we_gpu_brush_undo_stroke(pool4, 20u));
+    assert(we_gpu_brush_undo_stroke(pool4, 20u));
+    px = NULL;
+    len = 0;
+    assert(we_gpu_brush_readback_texels(pool4, WE_TEX_FMT_R8, &px, &len));
+    assert(px[16u * 256u + 16u] == 0u);
+    free(px);
+
     we_brush_stats_t st;
     we_gpu_brush_get_stats(pool4, &st);
     assert(st.active_pool_slots == 4u);
+
+    assert(we_gpu_brush_redo_stroke(pool4, 20u));
+    px = NULL;
+    len = 0;
+    assert(we_gpu_brush_readback_texels(pool4, WE_TEX_FMT_R8, &px, &len));
+    assert(px[16u * 256u + 16u] == 255u);
+    free(px);
+    we_gpu_brush_get_stats(pool4, &st);
+    assert(st.active_pool_slots == 4u);
+
+    /* Coexisting strokes (1+3=4) must NOT evict stroke 19 when undoing stroke 22. */
+    we_gpu_brush_unbind_scene(pool4, &canvas.scene);
+    assert(we_gpu_brush_bind_target(pool4, &canvas.scene, 42, 0xFFFFFFFFu, 0));
+    p.target_value = 0.5f;
+    assert(we_gpu_brush_begin_stroke(pool4, 19u, &p));
+    assert(we_gpu_brush_dispatch_dabs(pool4, &d0, 1u, NULL));
+    assert(we_gpu_brush_end_stroke(pool4, NULL));
+    assert(we_gpu_brush_begin_stroke(pool4, 22u, &p));
+    assert(we_gpu_brush_dispatch_dabs(pool4, d123, 3u, NULL));
+    assert(we_gpu_brush_end_stroke(pool4, NULL));
+    assert(we_gpu_brush_undo_stroke(pool4, 22u));
+    assert(we_gpu_brush_undo_stroke(pool4, 19u));
+    px = NULL;
+    len = 0;
+    assert(we_gpu_brush_readback_texels(pool4, WE_TEX_FMT_R8, &px, &len));
+    assert(px[16u * 256u + 16u] == 255u);
+    free(px);
+    assert(we_gpu_brush_redo_stroke(pool4, 19u));
+    assert(we_gpu_brush_redo_stroke(pool4, 22u));
 
     /* Verify scene-scoped eviction and active stroke abort on we_gpu_brush_unbind_scene. */
     test_canvas_t canvas2;
@@ -1353,6 +1442,237 @@ static void test_live_stroke0_undo_and_unbind_scene(void)
     destroy_test_canvas(&canvas);
     destroy_test_canvas(&canvas2);
     assert_no_gl_error("live_stroke0_undo_unbind_scene");
+}
+
+static void test_lifecycle_and_readback_safety(headless_gles_t *gl)
+{
+    printf("[+] Running lifecycle, EGL_NO_CONTEXT, dim checks & strip readback...\n");
+    we_gpu_brush_ctx_t *ctx = we_gpu_brush_create(32u);
+    assert(ctx != NULL);
+
+    /* Verify mid-stroke unbind_scene restores mip/filter/wrap state. */
+    test_canvas_t mip_c;
+    init_test_canvas(&mip_c, WE_TEX_FMT_RGBA8888, 128u, 128u, GL_RGBA8, GL_RGBA, NULL, false);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)mip_c.tex.gl_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 4);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    assert(we_gpu_brush_bind_target(ctx, &mip_c.scene, 42, 0xFFFFFFFFu, 0));
+    we_brush_params_t p = {
+        .channel = WE_BRUSH_CHAN_COLOR_RGBA8,
+        .op_mode = WE_BRUSH_OP_ADD_BUILDUP,
+        .radius_px = 12.0f,
+        .hardness = 1.0f,
+        .falloff_power = 1.0f,
+        .opacity = 1.0f,
+        .color_rgba = {1.0f, 0.5f, 0.25f, 1.0f},
+    };
+    assert(we_gpu_brush_begin_stroke(ctx, 9901u, &p));
+    we_brush_dab_t dab = {
+        .ax = 64.0f,
+        .ay = 64.0f,
+        .bx = 64.0f,
+        .by = 64.0f,
+        .radius_a = 12.0f,
+        .radius_b = 12.0f,
+        .opacity_eff = 1.0f,
+    };
+    assert(we_gpu_brush_dispatch_dabs(ctx, &dab, 1u, NULL));
+    we_gpu_brush_unbind_scene(ctx, &mip_c.scene);
+
+    GLint max_lvl = -1, min_f = 0, mag_f = 0, wrap_s = 0, wrap_t = 0;
+    glBindTexture(GL_TEXTURE_2D, (GLuint)mip_c.tex.gl_tex);
+    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, &max_lvl);
+    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &min_f);
+    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, &mag_f);
+    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, &wrap_s);
+    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, &wrap_t);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    assert(max_lvl == 4);
+    assert(min_f == GL_LINEAR_MIPMAP_LINEAR);
+    assert(mag_f == GL_NEAREST);
+    assert(wrap_s == GL_REPEAT && wrap_t == GL_REPEAT);
+
+    /* Reject mismatched and oversized dimensions cleanly in bind_target. */
+    mip_c.tex.texture_width = 64u;
+    assert(!we_gpu_brush_bind_target(ctx, &mip_c.scene, 42, 0xFFFFFFFFu, 0));
+    mip_c.tex.texture_width = 20000u;
+    assert(!we_gpu_brush_bind_target(ctx, &mip_c.scene, 42, 0xFFFFFFFFu, 0));
+    mip_c.tex.texture_width = 128u;
+    assert(we_gpu_brush_bind_target(ctx, &mip_c.scene, 42, 0xFFFFFFFFu, 0));
+
+    /* Test EGL_NO_CONTEXT guards on end_stroke, redo_stroke, and safe destroy. */
+    assert(we_gpu_brush_begin_stroke(ctx, 9902u, &p));
+    assert(we_gpu_brush_dispatch_dabs(ctx, &dab, 1u, NULL));
+    assert(eglMakeCurrent(gl->dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT));
+    assert(!we_gpu_brush_end_stroke(ctx, NULL));
+    assert(!we_gpu_brush_redo_stroke(ctx, 9902u));
+    we_gpu_brush_destroy(ctx);
+    assert(eglMakeCurrent(gl->dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, gl->ctx));
+    assert_no_gl_error("egl_no_context_destroy");
+    destroy_test_canvas(&mip_c);
+
+    /* Large R8 canvas (> 64 MiB RGBA staging equivalent) must use bounded strip readback. */
+    GLint max_tex_sz = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex_sz);
+    if (max_tex_sz >= 8192) {
+        we_gpu_brush_ctx_t *big_ctx = we_gpu_brush_create(32u);
+        assert(big_ctx != NULL);
+        test_canvas_t big_r8;
+        init_test_canvas(&big_r8, WE_TEX_FMT_R8, 8192u, 4096u, GL_R8, GL_RED, NULL, true);
+        assert(we_gpu_brush_bind_target(big_ctx, &big_r8.scene, 42, 0xFFFFFFFFu, 0));
+        we_brush_params_t r8_p = {
+            .channel = WE_BRUSH_CHAN_MASK_R8,
+            .op_mode = WE_BRUSH_OP_ADD_BUILDUP,
+            .radius_px = 8.0f,
+            .hardness = 1.0f,
+            .falloff_power = 1.0f,
+            .opacity = 1.0f,
+            .target_value = 1.0f,
+        };
+        assert(we_gpu_brush_begin_stroke(big_ctx, 9903u, &r8_p));
+        we_brush_dab_t corner = {
+            .ax = 32.0f,
+            .ay = 32.0f,
+            .bx = 32.0f,
+            .by = 32.0f,
+            .radius_a = 8.0f,
+            .radius_b = 8.0f,
+            .opacity_eff = 1.0f,
+        };
+        assert(we_gpu_brush_dispatch_dabs(big_ctx, &corner, 1u, NULL));
+        assert(we_gpu_brush_end_stroke(big_ctx, NULL));
+
+        uint8_t *big_px = NULL;
+        size_t big_len = 0;
+        assert(we_gpu_brush_readback_texels(big_ctx, WE_TEX_FMT_R8, &big_px, &big_len));
+        assert(big_len == (size_t)8192u * 4096u);
+        assert(big_px[32u * 8192u + 32u] >= 250u);
+        assert(big_px[0] == 0u);
+        free(big_px);
+        we_gpu_brush_destroy(big_ctx);
+        destroy_test_canvas(&big_r8);
+        assert_no_gl_error("strip_readback");
+    }
+}
+
+static void test_uneven_capsule_no_hourglass(void)
+{
+    printf("[+] Verifying uneven capsule SDF without hourglass pinch...\n");
+    we_gpu_brush_ctx_t *ctx = we_gpu_brush_create(32u);
+    assert(ctx != NULL);
+
+    /* Endpoint ra=60, rb=4, length=80 has tangent radius ~44.8 at midpoint vs 32 linear. */
+    we_brush_dab_t taper = {
+        .ax = 80.0f,
+        .ay = 128.0f,
+        .bx = 160.0f,
+        .by = 128.0f,
+        .radius_a = 60.0f,
+        .radius_b = 4.0f,
+        .opacity_eff = 1.0f,
+        .flow_dir_x = 1.0f,
+        .flow_dir_y = 0.0f,
+    };
+
+    /* 1. R8 Mask channel */
+    test_canvas_t r8_c;
+    init_test_canvas(&r8_c, WE_TEX_FMT_R8, 256u, 256u, GL_R8, GL_RED, NULL, true);
+    assert(we_gpu_brush_bind_target(ctx, &r8_c.scene, 42, 0xFFFFFFFFu, 0));
+    we_brush_params_t r8_p = {
+        .channel = WE_BRUSH_CHAN_MASK_R8,
+        .op_mode = WE_BRUSH_OP_ADD_BUILDUP,
+        .radius_px = 60.0f,
+        .hardness = 1.0f,
+        .falloff_power = 1.0f,
+        .opacity = 1.0f,
+        .target_value = 1.0f,
+    };
+    assert(we_gpu_brush_begin_stroke(ctx, 9910u, &r8_p));
+    assert(we_gpu_brush_dispatch_dabs(ctx, &taper, 1u, NULL));
+    assert(we_gpu_brush_end_stroke(ctx, NULL));
+    uint8_t *px = NULL;
+    size_t len = 0;
+    assert(we_gpu_brush_readback_texels(ctx, WE_TEX_FMT_R8, &px, &len));
+    assert(px[(128u - 36u) * 256u + 120u] >= 240u);
+    assert(px[(128u + 36u) * 256u + 120u] >= 240u);
+    assert(px[(128u - 48u) * 256u + 120u] == 0u);
+    free(px);
+    destroy_test_canvas(&r8_c);
+
+    /* 2. RG88 Flow channel */
+    test_canvas_t rg_c;
+    uint8_t *flow_init = malloc(256u * 256u * 2u);
+    assert(flow_init != NULL);
+    for (size_t i = 0; i < 256u * 256u; i++) {
+        flow_init[i * 2u + 0u] = WE_BRUSH_FLOW_NEUTRAL_U8;
+        flow_init[i * 2u + 1u] = WE_BRUSH_FLOW_NEUTRAL_U8;
+    }
+    init_test_canvas(&rg_c, WE_TEX_FMT_RG88, 256u, 256u, GL_RG8, GL_RG, flow_init, true);
+    free(flow_init);
+    assert(we_gpu_brush_bind_target(ctx, &rg_c.scene, 42, 0xFFFFFFFFu, 0));
+    we_brush_params_t fg_p = {
+        .channel = WE_BRUSH_CHAN_FLOW_RG88,
+        .op_mode = WE_BRUSH_OP_FLOW_PAINT,
+        .radius_px = 60.0f,
+        .hardness = 1.0f,
+        .falloff_power = 1.0f,
+        .opacity = 1.0f,
+        .flow_strength = 1.0f,
+    };
+    assert(we_gpu_brush_begin_stroke(ctx, 9911u, &fg_p));
+    assert(we_gpu_brush_dispatch_dabs(ctx, &taper, 1u, NULL));
+    assert(we_gpu_brush_end_stroke(ctx, NULL));
+    px = NULL;
+    assert(we_gpu_brush_readback_texels(ctx, WE_TEX_FMT_RG88, &px, &len));
+    assert(px[((128u - 36u) * 256u + 120u) * 2u] >= 240u);
+    free(px);
+    destroy_test_canvas(&rg_c);
+
+    /* 3. Blur fragment shader path */
+    uint8_t *chk = malloc(256u * 256u * 4u);
+    assert(chk != NULL);
+    for (uint32_t y = 0; y < 256u; y++) {
+        for (uint32_t x = 0; x < 256u; x++) {
+            uint8_t v = ((x ^ y) & 1u) ? 255u : 0u;
+            size_t idx = ((size_t)y * 256u + x) * 4u;
+            chk[idx + 0u] = v;
+            chk[idx + 1u] = v;
+            chk[idx + 2u] = v;
+            chk[idx + 3u] = 255u;
+        }
+    }
+    test_canvas_t blur_c;
+    init_test_canvas(&blur_c, WE_TEX_FMT_RGBA8888, 256u, 256u, GL_RGBA8, GL_RGBA, chk, false);
+    free(chk);
+    assert(we_gpu_brush_bind_target(ctx, &blur_c.scene, 42, 0xFFFFFFFFu, 0));
+    we_brush_params_t bl_p = {
+        .channel = WE_BRUSH_CHAN_BLUR,
+        .op_mode = WE_BRUSH_OP_BLUR_MASKED,
+        .radius_px = 60.0f,
+        .hardness = 1.0f,
+        .falloff_power = 1.0f,
+        .opacity = 1.0f,
+        .blur_radius_px = 6.0f,
+    };
+    assert(we_gpu_brush_begin_stroke(ctx, 9912u, &bl_p));
+    assert(we_gpu_brush_dispatch_dabs(ctx, &taper, 1u, NULL));
+    assert(we_gpu_brush_end_stroke(ctx, NULL));
+    px = NULL;
+    assert(we_gpu_brush_readback_texels(ctx, WE_TEX_FMT_RGBA8888, &px, &len));
+    /* Blurred checkerboard converges near ~128 vs unblurred 0/255 outside the convex hull. */
+    uint8_t mid_val = px[((128u - 36u) * 256u + 120u) * 4u];
+    assert(mid_val > 64u && mid_val < 192u);
+    free(px);
+    destroy_test_canvas(&blur_c);
+
+    we_gpu_brush_destroy(ctx);
+    assert_no_gl_error("uneven_capsule");
 }
 
 int main(void)
@@ -1391,6 +1711,8 @@ int main(void)
 
     test_cow_pool_eviction_on_overflow();
     test_live_stroke0_undo_and_unbind_scene();
+    test_lifecycle_and_readback_safety(&gl);
+    test_uneven_capsule_no_hourglass();
     benchmark_4k_brush_and_undo();
 
     destroy_headless_gles31(&gl);

@@ -68,6 +68,39 @@ static const char *k_brush_copy_in_frag =
     "    else                            fragColor = s;\n"
     "}\n";
 
+/* Guard degenerate concentric cones so sqrt/division never emits NaN. */
+#define WE_BRUSH_UNEVEN_CAPSULE_SDF_GLSL                                                           \
+    "float uneven_capsule_sdf(vec2 p, vec2 a, vec2 b, float ra, float rb) {\n"                     \
+    "    vec2 pa = p - a;\n"                                                                       \
+    "    vec2 ba = b - a;\n"                                                                       \
+    "    float l2 = dot(ba, ba);\n"                                                                \
+    "    float rr = ra - rb;\n"                                                                    \
+    "    if (l2 < 1e-6 || l2 <= rr * rr) {\n"                                                      \
+    "        return (ra >= rb) ? (length(pa) - ra) : (length(p - b) - rb);\n"                      \
+    "    }\n"                                                                                      \
+    "    float a2 = max(l2 - rr * rr, 1e-6);\n"                                                    \
+    "    float il2 = 1.0 / l2;\n"                                                                  \
+    "    float y = dot(pa, ba);\n"                                                                 \
+    "    float z = y - l2;\n"                                                                      \
+    "    vec2 d = pa * l2 - ba * y;\n"                                                             \
+    "    float x2 = dot(d, d);\n"                                                                  \
+    "    float y2 = y * y * l2;\n"                                                                 \
+    "    float z2 = z * z * l2;\n"                                                                 \
+    "    float k = sign(rr) * rr * rr * x2;\n"                                                     \
+    "    if (sign(z) * a2 * z2 > k) return sqrt(x2 + z2) * il2 - rb;\n"                            \
+    "    if (sign(y) * a2 * y2 < k) return sqrt(x2 + y2) * il2 - ra;\n"                            \
+    "    return (sqrt(x2 * a2 * il2) + y * rr) * il2 - ra;\n"                                      \
+    "}\n"                                                                                          \
+    "float eval_capsule_weight(vec2 p, vec2 a, vec2 b, float ra, float rb, float hardness, float " \
+    "falloff_p, float op) {\n"                                                                     \
+    "    float dist = uneven_capsule_sdf(p, a, b, ra, rb);\n"                                      \
+    "    float feather = max((1.0 - clamp(hardness, 0.0, 0.999)) * max(ra, rb), 0.75);\n"          \
+    "    float mask = 1.0 - smoothstep(-feather, 0.0, dist);\n"                                    \
+    "    float shaped = (mask > 0.0) ? pow(clamp(mask, 0.0, 1.0), clamp(falloff_p, 0.25, 4.0)) : " \
+    "0.0;\n"                                                                                       \
+    "    return clamp(shaped * op, 0.0, 1.0);\n"                                                   \
+    "}\n"
+
 static const char *k_brush_r8_mask_frag =
     "#version 310 es\n"
     "precision highp float;\n"
@@ -85,36 +118,9 @@ static const char *k_brush_r8_mask_frag =
     "uniform int u_Mode;\n"
     "uniform int u_IsColorRgba;\n"
     "uniform vec4 u_ColorRgba;\n"
-    "out vec4 fragColor;\n"
-    "float sdUnevenCapsule(vec2 p, vec2 pa, vec2 pb, float ra, float rb) {\n"
-    "    p -= pa;\n"
-    "    pb -= pa;\n"
-    "    float h = dot(pb, pb);\n"
-    "    if (h < 1e-6) return length(p) - max(ra, rb);\n"
-    "    vec2 q = vec2(dot(p, vec2(pb.y, -pb.x)), dot(p, pb)) / h;\n"
-    "    q.x = abs(q.x);\n"
-    "    float b = ra - rb;\n"
-    "    vec2 c = vec2(sqrt(max(h - b * b, 0.0)), b);\n"
-    "    float k = c.x * q.y - c.y * q.x;\n"
-    "    float m = dot(c, q);\n"
-    "    float n = dot(q, q);\n"
-    "    if (k < 0.0) return sqrt(h * n) - ra;\n"
-    "    if (k > c.x) return sqrt(h * (n + 1.0 - 2.0 * q.y)) - rb;\n"
-    "    return m - ra;\n"
-    "}\n"
-    "void main() {\n"
-    "    vec2 ba = u_PointB - u_PointA;\n"
-    "    float denom = dot(ba, ba);\n"
-    "    float t = (denom > 1e-6) ? clamp(dot(v_LocalPx - u_PointA, ba) / denom, 0.0, 1.0) : 0.0;\n"
-    "    float rLoc = max(mix(u_RadiusA, u_RadiusB, t), 0.5);\n"
-    "    float dist = sdUnevenCapsule(v_LocalPx, u_PointA, u_PointB, u_RadiusA, u_RadiusB) + "
-    "rLoc;\n"
-    "    float inner = clamp(u_Hardness, 0.0, 0.999);\n"
-    "    float edgeT = clamp((dist / rLoc - inner) / max(1.0 - inner, 1.0 / rLoc), 0.0, 1.0);\n"
-    "    float shaped = (edgeT <= 0.0) ? 0.0 : pow(edgeT, max(u_FalloffPower, 0.05));\n"
-    "    float falloff = 1.0 - smoothstep(0.0, 1.0, shaped);\n"
-    "    float aa = 1.0 - smoothstep(rLoc - 0.75, rLoc + 0.75, dist);\n"
-    "    float w = clamp(falloff * aa, 0.0, 1.0) * u_Opacity;\n"
+    "out vec4 fragColor;\n" WE_BRUSH_UNEVEN_CAPSULE_SDF_GLSL "void main() {\n"
+    "    float w = eval_capsule_weight(v_LocalPx, u_PointA, u_PointB, u_RadiusA, u_RadiusB, "
+    "u_Hardness, u_FalloffPower, u_Opacity);\n"
     "    if (u_IsColorRgba != 0) {\n"
     "        vec4 dst = texture(u_ScratchSrc, v_Uv);\n"
     "        float effW = clamp(w * u_ColorRgba.a, 0.0, 1.0);\n"
@@ -159,20 +165,10 @@ static const char *k_brush_rg88_flow_frag =
     "uniform int u_Mode;\n"
     "out vec4 fragColor;\n"
     "const vec2 kFlowNeutral = vec2(128.0 / 255.0);\n"
-    "const float kFlowScale  = 127.0 / 255.0;\n"
-    "void main() {\n"
+    "const float kFlowScale  = 127.0 / 255.0;\n" WE_BRUSH_UNEVEN_CAPSULE_SDF_GLSL "void main() {\n"
     "    vec2 dstVec = (texture(u_ScratchSrc, v_Uv).rg - kFlowNeutral) / kFlowScale;\n"
-    "    vec2 pa = v_LocalPx - u_PointA;\n"
-    "    vec2 ba = u_PointB - u_PointA;\n"
-    "    float denom = dot(ba, ba);\n"
-    "    float segT = (denom > 1e-6) ? clamp(dot(pa, ba) / denom, 0.0, 1.0) : 0.0;\n"
-    "    float rLoc = max(mix(u_RadiusA, u_RadiusB, segT), 0.5);\n"
-    "    float dist = length(pa - ba * segT);\n"
-    "    float inner = clamp(u_Hardness, 0.0, 0.999);\n"
-    "    float edgeT = clamp((dist / rLoc - inner) / max(1.0 - inner, 1.0 / rLoc), 0.0, 1.0);\n"
-    "    float shaped = (edgeT <= 0.0) ? 0.0 : pow(edgeT, max(u_FalloffPower, 0.05));\n"
-    "    float w = (1.0 - smoothstep(0.0, 1.0, shaped))\n"
-    "            * (1.0 - smoothstep(rLoc - 0.75, rLoc + 0.75, dist)) * u_Opacity;\n"
+    "    float w = eval_capsule_weight(v_LocalPx, u_PointA, u_PointB, u_RadiusA, u_RadiusB, "
+    "u_Hardness, u_FalloffPower, u_Opacity);\n"
     "    vec2 outVec = dstVec;\n"
     "    if (u_Mode == 0)      outVec = mix(dstVec, u_FlowDir, w);\n"
     "    else if (u_Mode == 1) outVec = mix(dstVec, vec2(0.0), w);\n"
@@ -270,20 +266,10 @@ static const char *k_brush_smudge_blur_composite_frag =
     "}\n"
     "vec2 clampBlurUv(vec2 uv) {\n"
     "    return clamp(uv, u_BlurUvClamp.xy, u_BlurUvClamp.zw);\n"
-    "}\n"
-    "void main() {\n"
+    "}\n" WE_BRUSH_UNEVEN_CAPSULE_SDF_GLSL "void main() {\n"
     "    vec4 orig = texture(u_OrigTex, clampUv(v_Uv));\n"
-    "    vec2 pa = v_LocalPx - u_PointA;\n"
-    "    vec2 ba = u_PointB - u_PointA;\n"
-    "    float denom = dot(ba, ba);\n"
-    "    float segT = (denom > 1e-6) ? clamp(dot(pa, ba) / denom, 0.0, 1.0) : 0.0;\n"
-    "    float rLoc = max(mix(u_RadiusA, u_RadiusB, segT), 0.5);\n"
-    "    float dist = length(pa - ba * segT);\n"
-    "    float inner = clamp(u_Hardness, 0.0, 0.999);\n"
-    "    float edgeT = clamp((dist / rLoc - inner) / max(1.0 - inner, 1.0 / rLoc), 0.0, 1.0);\n"
-    "    float shaped = (edgeT <= 0.0) ? 0.0 : pow(edgeT, max(u_FalloffPower, 0.05));\n"
-    "    float w = (1.0 - smoothstep(0.0, 1.0, shaped))\n"
-    "            * (1.0 - smoothstep(rLoc - 0.75, rLoc + 0.75, dist)) * u_Opacity;\n"
+    "    float w = eval_capsule_weight(v_LocalPx, u_PointA, u_PointB, u_RadiusA, u_RadiusB, "
+    "u_Hardness, u_FalloffPower, u_Opacity);\n"
     "    if (u_OpMode == 0) {\n"
     "        fragColor = mix(orig, texture(u_BlurredTex, clampBlurUv(v_Uv * u_BlurUvScale)), w);\n"
     "    } else {\n"
@@ -297,6 +283,100 @@ static const char *k_brush_smudge_blur_composite_frag =
     "    }\n"
     "}\n";
 
+static const char *k_brush_dab_accum_comp_hdr =
+    "#version 310 es\n"
+    "precision highp float;\n"
+    "precision highp int;\n"
+    "layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;\n"
+    "layout(rgba8, binding = 0) uniform readonly highp image2D u_canvas_src;\n"
+    "layout(rgba8, binding = 1) uniform writeonly highp image2D u_canvas_dst;\n"
+    "struct GpuBrushDab {\n"
+    "    vec4  p0_r0;\n"
+    "    vec4  p1_r1;\n"
+    "    vec4  flow_dir_pad;\n"
+    "    ivec4 bbox;\n"
+    "};\n"
+    "layout(std140, binding = 2) uniform BrushBatchUbo {\n"
+    "    vec4  brush_rgba;\n"
+    "    ivec4 tile_origin_size;\n"
+    "    uvec4 mode_chan_count;\n"
+    "    vec4  scalar_params;\n"
+    "    GpuBrushDab dabs[32];\n"
+    "};\n" WE_BRUSH_UNEVEN_CAPSULE_SDF_GLSL;
+
+static const char *k_brush_dab_accum_comp_main =
+    "void main() {\n"
+    "    ivec2 local_xy = ivec2(gl_GlobalInvocationID.xy);\n"
+    "    if (local_xy.x >= tile_origin_size.z || local_xy.y >= tile_origin_size.w) {\n"
+    "        return;\n"
+    "    }\n"
+    "    ivec2 pix = tile_origin_size.xy + local_xy;\n"
+    "    vec2 sample_pos = vec2(pix) + vec2(0.5);\n"
+    "    vec4 px = imageLoad(u_canvas_src, pix);\n"
+    "    uint op_mode = mode_chan_count.x;\n"
+    "    uint channel = mode_chan_count.y;\n"
+    "    uint count = min(mode_chan_count.z, 32u);\n"
+    "    const vec2 kFlowNeutral = vec2(128.0 / 255.0);\n"
+    "    const float kFlowScale = 127.0 / 255.0;\n"
+    "    for (uint i = 0u; i < count; i++) {\n"
+    "        ivec4 bb = dabs[i].bbox;\n"
+    "        if (pix.x < bb.x || pix.y < bb.y || pix.x >= bb.z || pix.y >= bb.w) {\n"
+    "            continue;\n"
+    "        }\n"
+    "        float w = eval_capsule_weight(\n"
+    "            sample_pos, dabs[i].p0_r0.xy, dabs[i].p1_r1.xy,\n"
+    "            dabs[i].p0_r0.z, dabs[i].p1_r1.z,\n"
+    "            scalar_params.x, scalar_params.z, dabs[i].p0_r0.w);\n"
+    "        if (w <= 0.0) {\n"
+    "            continue;\n"
+    "        }\n"
+    "        if (channel == 1u) {\n"
+    "            vec2 dst_v = (px.rg - kFlowNeutral) / kFlowScale;\n"
+    "            vec2 src_v = dabs[i].flow_dir_pad.xy;\n"
+    "            vec2 res_v = dst_v;\n"
+    "            if (op_mode == 5u) {\n"
+    "                res_v = mix(dst_v, vec2(0.0), w);\n"
+    "            } else if (op_mode == 6u) {\n"
+    "                vec2 combed = dst_v + src_v * w;\n"
+    "                float mag = length(combed);\n"
+    "                res_v = (mag > 1.0) ? (combed / mag) : combed;\n"
+    "            } else {\n"
+    "                res_v = mix(dst_v, src_v, w);\n"
+    "            }\n"
+    "            px = vec4(clamp(kFlowNeutral + res_v * kFlowScale, 0.0, 1.0), 0.0, 1.0);\n"
+    "        } else if (channel == 0u) {\n"
+    "            float d = px.r;\n"
+    "            float res = d;\n"
+    "            if (op_mode == 1u) {\n"
+    "                res = max(d, scalar_params.y * w);\n"
+    "            } else if (op_mode == 2u) {\n"
+    "                res = clamp(d - w, 0.0, 1.0);\n"
+    "            } else if (op_mode == 3u) {\n"
+    "                res = clamp(d * (1.0 - w), 0.0, 1.0);\n"
+    "            } else {\n"
+    "                res = clamp(d + (scalar_params.y - d) * w, 0.0, 1.0);\n"
+    "            }\n"
+    "            px = vec4(res, res, res, res);\n"
+    "        } else {\n"
+    "            float effW = clamp(w * brush_rgba.a, 0.0, 1.0);\n"
+    "            if (op_mode == 1u) {\n"
+    "                px = max(px, vec4(brush_rgba.rgb, 1.0) * effW);\n"
+    "            } else if (op_mode == 2u) {\n"
+    "                px = clamp(px - brush_rgba * w, 0.0, 1.0);\n"
+    "            } else if (op_mode == 3u) {\n"
+    "                px = vec4(px.rgb, clamp(px.a * (1.0 - w), 0.0, 1.0));\n"
+    "            } else {\n"
+    "                float outA = clamp(px.a + effW * (1.0 - px.a), 0.0, 1.0);\n"
+    "                vec3 outRgb = (outA > 1e-6)\n"
+    "                    ? (px.rgb * px.a * (1.0 - effW) + brush_rgba.rgb * effW) / outA\n"
+    "                    : vec3(0.0);\n"
+    "                px = vec4(clamp(outRgb, 0.0, 1.0), outA);\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "    imageStore(u_canvas_dst, pix, px);\n"
+    "}\n";
+
 /* ========================================================================= */
 /* Internal Context, GL State Guard & CoW Tile History                       */
 /* ========================================================================= */
@@ -308,7 +388,26 @@ typedef struct {
     uint32_t post_slot; /* UINT32_MAX until first undo captures post-stroke pixels */
 } brush_tile_record_t;
 
-#define WE_BRUSH_MAX_CANVAS_DIM 16384u
+#define WE_BRUSH_MAX_CANVAS_DIM    16384u
+#define WE_BRUSH_COMPUTE_MAX_BATCH 32u
+
+typedef struct {
+    float p0_r0[4];
+    float p1_r1[4];
+    float flow_dir_pad[4];
+    int32_t bbox[4];
+} brush_compute_dab_t;
+
+typedef struct {
+    float brush_rgba[4];
+    int32_t tile_origin_size[4];
+    uint32_t mode_chan_count[4];
+    float scalar_params[4];
+    brush_compute_dab_t dabs[WE_BRUSH_COMPUTE_MAX_BATCH];
+} brush_compute_ubo_t;
+
+_Static_assert(sizeof(brush_compute_dab_t) == 64u, "std140 brush_compute_dab_t size");
+_Static_assert(sizeof(brush_compute_ubo_t) == 2112u, "std140 brush_compute_ubo_t size");
 
 typedef struct {
     uint64_t stroke_id;
@@ -343,6 +442,17 @@ typedef struct {
     GLboolean prev_dither;
     GLboolean prev_color_mask[4];
 } brush_gl_state_t;
+
+typedef struct {
+    GLint prev_ubo;
+    GLint prev_ubo_slot2;
+    GLint prev_img_name[2];
+    GLint prev_img_level[2];
+    GLint prev_img_layered[2];
+    GLint prev_img_layer[2];
+    GLint prev_img_access[2];
+    GLint prev_img_format[2];
+} brush_compute_gl_state_t;
 
 struct we_gpu_brush_ctx {
     /* Shared quad geometry */
@@ -441,10 +551,18 @@ struct we_gpu_brush_ctx {
     GLuint readback_pbo[2];
     size_t readback_pbo_bytes[2];
     uint32_t readback_pbo_idx;
+    uint8_t *readback_strip_buf;
+    size_t readback_strip_cap;
     EGLDisplay egl_dpy;
+    EGLContext owner_egl_ctx;
     PFNEGLCREATESYNCKHRPROC fn_eglCreateSyncKHR;
     PFNEGLDESTROYSYNCKHRPROC fn_eglDestroySyncKHR;
     PFNEGLCLIENTWAITSYNCKHRPROC fn_eglClientWaitSyncKHR;
+
+    /* GLES 3.1 compute batching */
+    GLuint prog_compute_dab;
+    GLuint dab_ubo;
+    bool has_compute;
 
     /* 64x64 CoW GL_TEXTURE_2D_ARRAY undo/redo pool */
     GLuint pool_tex;
@@ -577,13 +695,43 @@ static void restore_gl_state(const brush_gl_state_t *st)
     glUseProgram((GLuint)st->prev_prog);
 }
 
-static GLuint compile_stage(GLenum stage, const char *src, const char *label)
+static void save_compute_gl_state(brush_compute_gl_state_t *cst)
+{
+    glGetIntegerv(GL_UNIFORM_BUFFER_BINDING, &cst->prev_ubo);
+    glGetIntegeri_v(GL_UNIFORM_BUFFER_BINDING, 2u, &cst->prev_ubo_slot2);
+    for (GLuint i = 0; i < 2u; i++) {
+        glGetIntegeri_v(GL_IMAGE_BINDING_NAME, i, &cst->prev_img_name[i]);
+        glGetIntegeri_v(GL_IMAGE_BINDING_LEVEL, i, &cst->prev_img_level[i]);
+        glGetIntegeri_v(GL_IMAGE_BINDING_LAYERED, i, &cst->prev_img_layered[i]);
+        glGetIntegeri_v(GL_IMAGE_BINDING_LAYER, i, &cst->prev_img_layer[i]);
+        glGetIntegeri_v(GL_IMAGE_BINDING_ACCESS, i, &cst->prev_img_access[i]);
+        glGetIntegeri_v(GL_IMAGE_BINDING_FORMAT, i, &cst->prev_img_format[i]);
+    }
+}
+
+static void restore_compute_gl_state(const brush_compute_gl_state_t *cst)
+{
+    for (GLuint i = 0; i < 2u; i++) {
+        if (cst->prev_img_name[i] != 0) {
+            glBindImageTexture(i, (GLuint)cst->prev_img_name[i], cst->prev_img_level[i],
+                               (GLboolean)cst->prev_img_layered[i], cst->prev_img_layer[i],
+                               (GLenum)cst->prev_img_access[i], (GLenum)cst->prev_img_format[i]);
+        } else {
+            glBindImageTexture(i, 0u, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
+        }
+    }
+    glBindBufferBase(GL_UNIFORM_BUFFER, 2u, (GLuint)cst->prev_ubo_slot2);
+    glBindBuffer(GL_UNIFORM_BUFFER, (GLuint)cst->prev_ubo);
+}
+
+static GLuint compile_stage_parts(GLenum stage, const char *const *parts, GLsizei count,
+                                  const char *label)
 {
     GLuint sh = glCreateShader(stage);
     if (!sh) {
         return 0;
     }
-    glShaderSource(sh, 1, &src, NULL);
+    glShaderSource(sh, count, parts, NULL);
     glCompileShader(sh);
     GLint ok = GL_FALSE;
     glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
@@ -595,6 +743,11 @@ static GLuint compile_stage(GLenum stage, const char *src, const char *label)
         return 0;
     }
     return sh;
+}
+
+static GLuint compile_stage(GLenum stage, const char *src, const char *label)
+{
+    return compile_stage_parts(stage, &src, 1, label);
 }
 
 static GLuint link_brush_program(GLuint vs, const char *frag_src, const char *label)
@@ -720,6 +873,32 @@ static bool init_brush_programs(we_gpu_brush_ctx_t *ctx)
     ctx->loc_sb_blur_uv_scale = glGetUniformLocation(ctx->prog_smudge_blur, "u_BlurUvScale");
     ctx->loc_sb_op_mode = glGetUniformLocation(ctx->prog_smudge_blur, "u_OpMode");
 
+    GLint maj = 0, min_v = 0;
+    glGetIntegerv(GL_MAJOR_VERSION, &maj);
+    glGetIntegerv(GL_MINOR_VERSION, &min_v);
+    if (maj > 3 || (maj == 3 && min_v >= 1)) {
+        const char *cs_parts[2] = {k_brush_dab_accum_comp_hdr, k_brush_dab_accum_comp_main};
+        GLuint cs = compile_stage_parts(GL_COMPUTE_SHADER, cs_parts, 2, "brush_dab_accum.comp");
+        if (cs) {
+            GLuint cprog = glCreateProgram();
+            if (cprog) {
+                glAttachShader(cprog, cs);
+                glLinkProgram(cprog);
+                GLint linked = GL_FALSE;
+                glGetProgramiv(cprog, GL_LINK_STATUS, &linked);
+                if (linked) {
+                    ctx->prog_compute_dab = cprog;
+                } else {
+                    char log_buf[1024] = {0};
+                    glGetProgramInfoLog(cprog, sizeof(log_buf), NULL, log_buf);
+                    WAYWAL_LOG_WARN("we_gpu_brush: compute link fallback: %s", log_buf);
+                    glDeleteProgram(cprog);
+                }
+            }
+            glDeleteShader(cs);
+        }
+    }
+
     return true;
 }
 
@@ -820,11 +999,15 @@ static bool ensure_scratch_fbos(we_gpu_brush_ctx_t *ctx)
 static void release_stroke_record_slots(we_gpu_brush_ctx_t *ctx, brush_stroke_record_t *rec)
 {
     for (uint32_t i = 0; i < rec->tile_count; i++) {
-        if (rec->tiles[i].pre_slot != UINT32_MAX && ctx->free_count < ctx->pool_cap) {
-            ctx->free_slots[ctx->free_count++] = rec->tiles[i].pre_slot;
+        uint32_t pre = rec->tiles[i].pre_slot;
+        uint32_t post = rec->tiles[i].post_slot;
+        if (pre != UINT32_MAX && ctx->free_count < ctx->pool_cap) {
+            ctx->free_slots[ctx->free_count++] = pre;
         }
-        if (rec->tiles[i].post_slot != UINT32_MAX && ctx->free_count < ctx->pool_cap) {
-            ctx->free_slots[ctx->free_count++] = rec->tiles[i].post_slot;
+        /* Skip in-place swaps where post_slot aliases pre_slot so the slot is never double-freed.
+         */
+        if (post != UINT32_MAX && post != pre && ctx->free_count < ctx->pool_cap) {
+            ctx->free_slots[ctx->free_count++] = post;
         }
     }
     free(rec->tiles);
@@ -905,6 +1088,7 @@ we_gpu_brush_ctx_t *we_gpu_brush_create(uint32_t pool_slot_capacity)
     }
 
     ctx->egl_dpy = eglGetCurrentDisplay();
+    ctx->owner_egl_ctx = eglGetCurrentContext();
     ctx->fn_eglCreateSyncKHR = (PFNEGLCREATESYNCKHRPROC)eglGetProcAddress("eglCreateSyncKHR");
     ctx->fn_eglDestroySyncKHR = (PFNEGLDESTROYSYNCKHRPROC)eglGetProcAddress("eglDestroySyncKHR");
     ctx->fn_eglClientWaitSyncKHR =
@@ -936,6 +1120,23 @@ we_gpu_brush_ctx_t *we_gpu_brush_create(uint32_t pool_slot_capacity)
         restore_gl_state(&gl_st);
         we_gpu_brush_destroy(ctx);
         return NULL;
+    }
+
+    if (ctx->prog_compute_dab != 0) {
+        GLint prev_ubo = 0;
+        glGetIntegerv(GL_UNIFORM_BUFFER_BINDING, &prev_ubo);
+        glGenBuffers(1, &ctx->dab_ubo);
+        if (ctx->dab_ubo) {
+            while (glGetError() != GL_NO_ERROR) {
+            }
+            glBindBuffer(GL_UNIFORM_BUFFER, ctx->dab_ubo);
+            glBufferData(GL_UNIFORM_BUFFER, (GLsizeiptr)sizeof(brush_compute_ubo_t), NULL,
+                         GL_DYNAMIC_DRAW);
+            if (glGetError() == GL_NO_ERROR) {
+                ctx->has_compute = true;
+            }
+            glBindBuffer(GL_UNIFORM_BUFFER, (GLuint)prev_ubo);
+        }
     }
 
     glGenFramebuffers(1, &ctx->canvas_fbo);
@@ -981,8 +1182,30 @@ void we_gpu_brush_destroy(we_gpu_brush_ctx_t *ctx)
     free(ctx->active_tiles);
     free(ctx->dirty_bitset);
     free(ctx->free_slots);
+    free(ctx->readback_strip_buf);
 
-    if (eglGetCurrentContext() != EGL_NO_CONTEXT) {
+    EGLContext cur_ctx = eglGetCurrentContext();
+    bool can_delete_gl = (cur_ctx != EGL_NO_CONTEXT && cur_ctx == ctx->owner_egl_ctx);
+    bool made_current = false;
+    EGLDisplay prev_dpy = EGL_NO_DISPLAY;
+    EGLSurface prev_draw = EGL_NO_SURFACE;
+    EGLSurface prev_read = EGL_NO_SURFACE;
+    EGLContext prev_ctx = EGL_NO_CONTEXT;
+    if (!can_delete_gl && ctx->egl_dpy != EGL_NO_DISPLAY && ctx->owner_egl_ctx != EGL_NO_CONTEXT) {
+        prev_dpy = eglGetCurrentDisplay();
+        prev_draw = eglGetCurrentSurface(EGL_DRAW);
+        prev_read = eglGetCurrentSurface(EGL_READ);
+        prev_ctx = cur_ctx;
+        if (eglMakeCurrent(ctx->egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx->owner_egl_ctx) ==
+            EGL_TRUE) {
+            made_current = true;
+            can_delete_gl = true;
+        } else {
+            (void)eglGetError();
+        }
+    }
+
+    if (can_delete_gl) {
         if (ctx->prog_copy_in)
             glDeleteProgram(ctx->prog_copy_in);
         if (ctx->prog_r8_mask)
@@ -995,6 +1218,10 @@ void we_gpu_brush_destroy(we_gpu_brush_ctx_t *ctx)
             glDeleteProgram(ctx->prog_kawase_up);
         if (ctx->prog_smudge_blur)
             glDeleteProgram(ctx->prog_smudge_blur);
+        if (ctx->prog_compute_dab)
+            glDeleteProgram(ctx->prog_compute_dab);
+        if (ctx->dab_ubo)
+            glDeleteBuffers(1, &ctx->dab_ubo);
 
         destroy_scratch_fbos(ctx);
         if (ctx->canvas_fbo)
@@ -1011,6 +1238,15 @@ void we_gpu_brush_destroy(we_gpu_brush_ctx_t *ctx)
             glDeleteBuffers(1, &ctx->vbo);
         if (ctx->vao)
             glDeleteVertexArrays(1, &ctx->vao);
+    }
+
+    if (made_current) {
+        EGLDisplay restore_dpy = (prev_dpy != EGL_NO_DISPLAY) ? prev_dpy : ctx->egl_dpy;
+        if (restore_dpy != EGL_NO_DISPLAY) {
+            if (!eglMakeCurrent(restore_dpy, prev_draw, prev_read, prev_ctx)) {
+                (void)eglGetError();
+            }
+        }
     }
 
     free(ctx);
@@ -1189,28 +1425,21 @@ bool we_gpu_brush_bind_target(we_gpu_brush_ctx_t *ctx, struct we_scene *scene, i
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, (GLuint)wt->gl_tex);
 
-    uint32_t w = wt->texture_width;
-    uint32_t h = wt->texture_height;
-    if (w == 0 || h == 0) {
-        GLint gw = 0, gh = 0;
-        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &gw);
-        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &gh);
-        if (gw <= 0 || gh <= 0) {
-            restore_gl_state(&gl_st);
-            return false;
-        }
-        if (gw > (GLint)WE_BRUSH_MAX_CANVAS_DIM)
-            gw = (GLint)WE_BRUSH_MAX_CANVAS_DIM;
-        if (gh > (GLint)WE_BRUSH_MAX_CANVAS_DIM)
-            gh = (GLint)WE_BRUSH_MAX_CANVAS_DIM;
-        w = (uint32_t)gw;
-        h = (uint32_t)gh;
-    } else {
-        if (w > WE_BRUSH_MAX_CANVAS_DIM)
-            w = WE_BRUSH_MAX_CANVAS_DIM;
-        if (h > WE_BRUSH_MAX_CANVAS_DIM)
-            h = WE_BRUSH_MAX_CANVAS_DIM;
+    GLint gw = 0, gh = 0;
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &gw);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &gh);
+    if (gw <= 0 || gh <= 0 || gw > (GLint)WE_BRUSH_MAX_CANVAS_DIM ||
+        gh > (GLint)WE_BRUSH_MAX_CANVAS_DIM) {
+        restore_gl_state(&gl_st);
+        return false;
     }
+    if ((wt->texture_width != 0u && wt->texture_width != (uint32_t)gw) ||
+        (wt->texture_height != 0u && wt->texture_height != (uint32_t)gh)) {
+        restore_gl_state(&gl_st);
+        return false;
+    }
+    uint32_t w = (uint32_t)gw;
+    uint32_t h = (uint32_t)gh;
 
     GLint internal_fmt = 0, lvl1_w = 0;
     GLint saved_max_lvl = 0, saved_min = GL_LINEAR, saved_mag = GL_LINEAR;
@@ -1285,7 +1514,25 @@ void we_gpu_brush_unbind_scene(we_gpu_brush_ctx_t *ctx, const struct we_scene *s
     }
 
     if (scene == NULL || ctx->bound_scene == scene) {
-        if (ctx->in_stroke) {
+        bool was_in_stroke = ctx->in_stroke;
+        if (was_in_stroke && eglGetCurrentContext() != EGL_NO_CONTEXT && ctx->bound_tex &&
+            ctx->bound_tex->gl_tex != 0 && glIsTexture((GLuint)ctx->bound_tex->gl_tex)) {
+            brush_gl_state_t gl_st;
+            save_gl_state(&gl_st);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, (GLuint)ctx->bound_tex->gl_tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, ctx->saved_max_level);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, ctx->saved_min_filter);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, ctx->saved_mag_filter);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, ctx->saved_wrap_s);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, ctx->saved_wrap_t);
+            if (ctx->has_mipmaps && ctx->saved_max_level > 0) {
+                glGenerateMipmap(GL_TEXTURE_2D);
+            }
+            glBindTexture(GL_TEXTURE_2D, 0);
+            restore_gl_state(&gl_st);
+        }
+        if (was_in_stroke) {
             for (uint32_t i = 0; i < ctx->active_tile_count; i++) {
                 free_pool_slot(ctx, ctx->active_tiles[i].pre_slot);
             }
@@ -1336,11 +1583,14 @@ static bool brush_params_valid(const we_brush_params_t *p)
     return true;
 }
 
+static brush_stroke_record_t *find_stroke_record(we_gpu_brush_ctx_t *ctx, uint64_t stroke_id);
+
 bool we_gpu_brush_begin_stroke(we_gpu_brush_ctx_t *ctx, uint64_t stroke_id,
                                const we_brush_params_t *params)
 {
     if (!ctx || !ctx->bound_tex || ctx->bound_tex->gl_tex == 0 || !brush_params_valid(params) ||
-        ctx->in_stroke || eglGetCurrentContext() == EGL_NO_CONTEXT) {
+        ctx->in_stroke || eglGetCurrentContext() == EGL_NO_CONTEXT ||
+        find_stroke_record(ctx, stroke_id) != NULL) {
         return false;
     }
 
@@ -2078,6 +2328,98 @@ static void render_dab_chunks(we_gpu_brush_ctx_t *ctx, const we_brush_dab_t *dab
     }
 }
 
+static void dispatch_compute_cluster(we_gpu_brush_ctx_t *ctx, const uint32_t *dab_indices,
+                                     uint32_t count, const we_brush_dab_t *dabs, int32_t ux0,
+                                     int32_t uy0, int32_t ux1, int32_t uy1, int32_t cw, int32_t ch)
+{
+    int32_t uw = ux1 - ux0;
+    int32_t uh = uy1 - uy0;
+    if (uw <= 0 || uh <= 0 || count == 0u || count > WE_BRUSH_COMPUTE_MAX_BATCH) {
+        return;
+    }
+
+    run_copy_in_pass(ctx, ux0, uy0, ux1, uy1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+
+    const we_brush_params_t *p = &ctx->active_params;
+    brush_compute_ubo_t ubo;
+    for (int i = 0; i < 4; i++) {
+        ubo.brush_rgba[i] = p->color_rgba[i];
+    }
+    ubo.tile_origin_size[0] = 0;
+    ubo.tile_origin_size[1] = 0;
+    ubo.tile_origin_size[2] = uw;
+    ubo.tile_origin_size[3] = uh;
+    uint32_t norm_op = p->op_mode;
+    if (p->channel == WE_BRUSH_CHAN_FLOW_RG88) {
+        if (norm_op != WE_BRUSH_OP_FLOW_ERASE && norm_op != WE_BRUSH_OP_FLOW_COMB) {
+            norm_op = WE_BRUSH_OP_FLOW_PAINT;
+        }
+    } else if (norm_op > WE_BRUSH_OP_ERASE) {
+        norm_op = WE_BRUSH_OP_ADD_BUILDUP;
+    }
+    ubo.mode_chan_count[0] = norm_op;
+    ubo.mode_chan_count[1] = p->channel;
+    ubo.mode_chan_count[2] = count;
+    ubo.mode_chan_count[3] = 0u;
+    ubo.scalar_params[0] = p->hardness;
+    ubo.scalar_params[1] = p->target_value;
+    ubo.scalar_params[2] = p->falloff_power;
+    ubo.scalar_params[3] = 0.0f;
+
+    float fscale = fminf(fmaxf(p->flow_strength, 0.0f), 1.0f);
+    for (uint32_t k = 0; k < count; k++) {
+        const we_brush_dab_t *d = &dabs[dab_indices[k]];
+        int32_t dx0 = 0, dy0 = 0, dx1 = 0, dy1 = 0;
+        (void)dab_compute_clamped_rect(d, cw, ch, &dx0, &dy0, &dx1, &dy1);
+
+        float ra = fminf(fmaxf(d->radius_a, 0.5f), 512.0f);
+        float rb = fminf(fmaxf(d->radius_b, 0.5f), 512.0f);
+        float op = fminf(fmaxf(d->opacity_eff, 0.0f), 1.0f);
+
+        brush_compute_dab_t *cd = &ubo.dabs[k];
+        cd->p0_r0[0] = d->ax - (float)ux0;
+        cd->p0_r0[1] = d->ay - (float)uy0;
+        cd->p0_r0[2] = ra;
+        cd->p0_r0[3] = op;
+        cd->p1_r1[0] = d->bx - (float)ux0;
+        cd->p1_r1[1] = d->by - (float)uy0;
+        cd->p1_r1[2] = rb;
+        cd->p1_r1[3] = 0.0f;
+
+        float fx = d->flow_dir_x * fscale;
+        float fy = ((d->flags & 1u) ? -d->flow_dir_y : d->flow_dir_y) * fscale;
+        float mag = hypotf(fx, fy);
+        if (mag > 1.0f) {
+            fx /= mag;
+            fy /= mag;
+        }
+        cd->flow_dir_pad[0] = fx;
+        cd->flow_dir_pad[1] = fy;
+        cd->flow_dir_pad[2] = 0.0f;
+        cd->flow_dir_pad[3] = 0.0f;
+        cd->bbox[0] = dx0 - ux0;
+        cd->bbox[1] = dy0 - uy0;
+        cd->bbox[2] = dx1 - ux0;
+        cd->bbox[3] = dy1 - uy0;
+    }
+
+    size_t upload_bytes = (size_t)((const uint8_t *)&ubo.dabs[count] - (const uint8_t *)&ubo);
+    glBindBuffer(GL_UNIFORM_BUFFER, ctx->dab_ubo);
+    glBufferSubData(GL_UNIFORM_BUFFER, 0, (GLsizeiptr)upload_bytes, &ubo);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 2u, ctx->dab_ubo);
+
+    glUseProgram(ctx->prog_compute_dab);
+    glBindImageTexture(0u, ctx->scratch_tex[0], 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
+    glBindImageTexture(1u, ctx->scratch_tex[1], 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    glDispatchCompute(((GLuint)uw + 15u) / 16u, ((GLuint)uh + 15u) / 16u, 1u);
+    glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+    glBindImageTexture(0u, 0u, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
+    glBindImageTexture(1u, 0u, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
+    run_write_back_pass(ctx, 1u, ux0, uy0, ux0, uy0, ux1, uy1);
+}
+
 bool we_gpu_brush_dispatch_dabs(we_gpu_brush_ctx_t *ctx, const we_brush_dab_t *dabs,
                                 uint32_t dab_count, we_brush_dirty_rect_t *out_dirty_rect)
 {
@@ -2108,12 +2450,75 @@ bool we_gpu_brush_dispatch_dabs(we_gpu_brush_ctx_t *ctx, const we_brush_dab_t *d
         (p->channel == WE_BRUSH_CHAN_BLUR || p->channel == WE_BRUSH_CHAN_SMUDGE ||
          p->op_mode == WE_BRUSH_OP_BLUR_MASKED || p->op_mode == WE_BRUSH_OP_SMUDGE_ADV);
 
-    for (uint32_t i = 0; i < dab_count; i++) {
-        int32_t dx0, dy0, dx1, dy1;
-        if (!dab_compute_clamped_rect(&dabs[i], cw, ch, &dx0, &dy0, &dx1, &dy1)) {
-            continue;
+    if (!needs_halo && ctx->has_compute) {
+        brush_compute_gl_state_t cst;
+        save_compute_gl_state(&cst);
+
+        uint32_t i = 0u;
+        while (i < dab_count) {
+            int32_t dx0, dy0, dx1, dy1;
+            if (!dab_compute_clamped_rect(&dabs[i], cw, ch, &dx0, &dy0, &dx1, &dy1)) {
+                i++;
+                continue;
+            }
+            if ((dx1 - dx0) > (int32_t)WE_BRUSH_SCRATCH_MAX_DIM ||
+                (dy1 - dy0) > (int32_t)WE_BRUSH_SCRATCH_MAX_DIM) {
+                render_dab_chunks(ctx, &dabs[i], dx0, dy0, dx1, dy1, cw, ch, false);
+                i++;
+                continue;
+            }
+
+            uint32_t batch_idx[WE_BRUSH_COMPUTE_MAX_BATCH];
+            batch_idx[0] = i;
+            uint32_t batch_cnt = 1u;
+            int32_t ux0 = dx0, uy0 = dy0, ux1 = dx1, uy1 = dy1;
+            uint64_t sum_area = (uint64_t)(dx1 - dx0) * (uint64_t)(dy1 - dy0);
+            uint32_t j = i + 1u;
+
+            while (j < dab_count && batch_cnt < WE_BRUSH_COMPUTE_MAX_BATCH) {
+                int32_t sx0, sy0, sx1, sy1;
+                if (!dab_compute_clamped_rect(&dabs[j], cw, ch, &sx0, &sy0, &sx1, &sy1)) {
+                    j++;
+                    continue;
+                }
+                int32_t cx0 = sx0 < ux0 ? sx0 : ux0;
+                int32_t cy0 = sy0 < uy0 ? sy0 : uy0;
+                int32_t cx1 = sx1 > ux1 ? sx1 : ux1;
+                int32_t cy1 = sy1 > uy1 ? sy1 : uy1;
+                int32_t bw = cx1 - cx0;
+                int32_t bh = cy1 - cy0;
+                if (bw > (int32_t)WE_BRUSH_SCRATCH_MAX_DIM ||
+                    bh > (int32_t)WE_BRUSH_SCRATCH_MAX_DIM) {
+                    break;
+                }
+                uint64_t dab_area = (uint64_t)(sx1 - sx0) * (uint64_t)(sy1 - sy0);
+                uint64_t cand_area = (uint64_t)bw * (uint64_t)bh;
+                uint64_t new_sum = sum_area + dab_area;
+                if (cand_area > 65536ULL && cand_area > new_sum * 4ULL) {
+                    break;
+                }
+                ux0 = cx0;
+                uy0 = cy0;
+                ux1 = cx1;
+                uy1 = cy1;
+                sum_area = new_sum;
+                batch_idx[batch_cnt++] = j;
+                j++;
+            }
+
+            dispatch_compute_cluster(ctx, batch_idx, batch_cnt, dabs, ux0, uy0, ux1, uy1, cw, ch);
+            i = j;
         }
-        render_dab_chunks(ctx, &dabs[i], dx0, dy0, dx1, dy1, cw, ch, needs_halo);
+
+        restore_compute_gl_state(&cst);
+    } else {
+        for (uint32_t i = 0; i < dab_count; i++) {
+            int32_t dx0, dy0, dx1, dy1;
+            if (!dab_compute_clamped_rect(&dabs[i], cw, ch, &dx0, &dy0, &dx1, &dy1)) {
+                continue;
+            }
+            render_dab_chunks(ctx, &dabs[i], dx0, dy0, dx1, dy1, cw, ch, needs_halo);
+        }
     }
 
     glBindVertexArray(0);
@@ -2137,7 +2542,9 @@ bool we_gpu_brush_dispatch_dabs(we_gpu_brush_ctx_t *ctx, const we_brush_dab_t *d
 
 bool we_gpu_brush_end_stroke(we_gpu_brush_ctx_t *ctx, uint32_t *out_captured_tile_count)
 {
-    if (!ctx || !ctx->in_stroke || !ctx->bound_tex) {
+    if (!ctx || !ctx->in_stroke || !ctx->bound_tex || ctx->bound_tex->gl_tex == 0 ||
+        eglGetCurrentContext() == EGL_NO_CONTEXT ||
+        find_stroke_record(ctx, ctx->active_stroke_id) != NULL) {
         return false;
     }
 
@@ -2230,9 +2637,47 @@ static void copy_pool_slot_to_canvas(we_gpu_brush_ctx_t *ctx, GLuint target_tex,
     glBlitFramebuffer(0, 0, cw, ch, px, py, px + cw, py + ch, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 }
 
+static void swap_canvas_and_pool_slot(we_gpu_brush_ctx_t *ctx, GLuint target_tex, uint32_t canvas_w,
+                                      uint32_t canvas_h, uint16_t tx, uint16_t ty, uint32_t slot)
+{
+    int32_t px = (int32_t)tx * (int32_t)WE_BRUSH_TILE_SIZE;
+    int32_t py = (int32_t)ty * (int32_t)WE_BRUSH_TILE_SIZE;
+    int32_t cw = (int32_t)canvas_w - px;
+    int32_t ch = (int32_t)canvas_h - py;
+    if (cw > (int32_t)WE_BRUSH_TILE_SIZE)
+        cw = (int32_t)WE_BRUSH_TILE_SIZE;
+    if (ch > (int32_t)WE_BRUSH_TILE_SIZE)
+        ch = (int32_t)WE_BRUSH_TILE_SIZE;
+    if (cw <= 0 || ch <= 0) {
+        return;
+    }
+
+    /* Ping-pong via scratch_fbo[0] when pool_cap cannot allocate a second tile copy. */
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, ctx->canvas_fbo);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target_tex, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, ctx->scratch_fbo[0]);
+    glBlitFramebuffer(px, py, px + cw, py + ch, 0, 0, cw, ch, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, ctx->pool_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, ctx->canvas_fbo);
+    copy_pool_slot_to_canvas(ctx, target_tex, canvas_w, canvas_h, tx, ty, slot);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 0, 0, 0);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, ctx->scratch_fbo[0]);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, ctx->pool_fbo);
+    glFramebufferTextureLayer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, ctx->pool_tex, 0,
+                              (GLint)slot);
+    glBlitFramebuffer(0, 0, cw, ch, 0, 0, cw, ch, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glFramebufferTextureLayer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 0, 0, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
 bool we_gpu_brush_undo_stroke(we_gpu_brush_ctx_t *ctx, uint64_t stroke_id)
 {
-    if (!ctx || ctx->in_stroke || !ctx->bound_tex || eglGetCurrentContext() == EGL_NO_CONTEXT) {
+    if (!ctx || ctx->in_stroke || !ctx->bound_tex || ctx->bound_tex->gl_tex == 0 ||
+        eglGetCurrentContext() == EGL_NO_CONTEXT) {
         return false;
     }
     brush_stroke_record_t *rec = find_stroke_record(ctx, stroke_id);
@@ -2240,16 +2685,30 @@ bool we_gpu_brush_undo_stroke(we_gpu_brush_ctx_t *ctx, uint64_t stroke_id)
         return false;
     }
 
-    /* Pre-allocate all missing post-tile slots before mutating the stroke record or evicting it. */
-    uint32_t missing_posts = 0;
+    uint32_t missing_posts = 0u;
+    bool needs_scratch_swap = false;
     for (uint32_t i = 0; i < rec->tile_count; i++) {
-        if (rec->tiles[i].post_slot == UINT32_MAX) {
+        uint32_t pre = rec->tiles[i].pre_slot;
+        uint32_t post = rec->tiles[i].post_slot;
+        if (post == UINT32_MAX) {
             missing_posts++;
+        } else if (post == pre) {
+            needs_scratch_swap = true;
         }
     }
 
+    uint32_t free_now =
+        ctx->free_count +
+        (ctx->pool_cap > ctx->next_fresh_slot ? ctx->pool_cap - ctx->next_fresh_slot : 0u);
+    /* Avoid evicting live neighboring strokes on full pools; swap via scratch_fbo[0] instead. */
+    bool use_in_place_swap = (missing_posts > 0u) && (missing_posts > free_now);
+    if (use_in_place_swap) {
+        needs_scratch_swap = true;
+    }
+
+    /* Pre-allocate separate post slots when free slots exist so repeat undo/redo avoids scratch. */
     uint32_t *post_slots = NULL;
-    if (missing_posts > 0) {
+    if (missing_posts > 0u && !use_in_place_swap) {
         post_slots = malloc((size_t)missing_posts * sizeof(uint32_t));
         if (!post_slots) {
             return false;
@@ -2262,25 +2721,35 @@ bool we_gpu_brush_undo_stroke(we_gpu_brush_ctx_t *ctx, uint64_t stroke_id)
                     free_pool_slot(ctx, post_slots[k]);
                 }
                 free(post_slots);
-                return false;
+                use_in_place_swap = true;
+                needs_scratch_swap = true;
+                post_slots = NULL;
+                break;
             }
             post_slots[alloc_done++] = slot;
         }
-        rec = find_stroke_record(ctx, stroke_id);
-        if (!rec) {
-            for (uint32_t k = 0; k < missing_posts; k++) {
-                free_pool_slot(ctx, post_slots[k]);
+        if (!use_in_place_swap) {
+            rec = find_stroke_record(ctx, stroke_id);
+            if (!rec) {
+                for (uint32_t k = 0; k < missing_posts; k++) {
+                    free_pool_slot(ctx, post_slots[k]);
+                }
+                free(post_slots);
+                return false;
             }
-            free(post_slots);
-            return false;
         }
     }
 
     brush_gl_state_t gl_st;
     save_gl_state(&gl_st);
 
-    if (missing_posts > 0) {
-        /* Capture post-stroke tiles lazily on first undo so redo remains symmetric and O(K). */
+    if (needs_scratch_swap && !ensure_scratch_fbos(ctx)) {
+        free(post_slots);
+        restore_gl_state(&gl_st);
+        return false;
+    }
+
+    if (post_slots != NULL) {
         glBindFramebuffer(GL_READ_FRAMEBUFFER, ctx->canvas_fbo);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, ctx->pool_fbo);
 
@@ -2301,16 +2770,35 @@ bool we_gpu_brush_undo_stroke(we_gpu_brush_ctx_t *ctx, uint64_t stroke_id)
         free(post_slots);
     }
 
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, ctx->pool_fbo);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, ctx->canvas_fbo);
+    bool bound_cow_fbos = false;
     for (uint32_t i = 0; i < rec->tile_count; i++) {
-        const brush_tile_record_t *tr = &rec->tiles[i];
-        copy_pool_slot_to_canvas(ctx, rec->target_gl_tex, rec->canvas_w, rec->canvas_h, tr->tx,
-                                 tr->ty, tr->pre_slot);
+        brush_tile_record_t *tr = &rec->tiles[i];
+        if (tr->post_slot == UINT32_MAX || tr->post_slot == tr->pre_slot) {
+            if (bound_cow_fbos) {
+                glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 0, 0, 0);
+                glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0,
+                                       0);
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                bound_cow_fbos = false;
+            }
+            swap_canvas_and_pool_slot(ctx, rec->target_gl_tex, rec->canvas_w, rec->canvas_h, tr->tx,
+                                      tr->ty, tr->pre_slot);
+            tr->post_slot = tr->pre_slot;
+        } else {
+            if (!bound_cow_fbos) {
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, ctx->pool_fbo);
+                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, ctx->canvas_fbo);
+                bound_cow_fbos = true;
+            }
+            copy_pool_slot_to_canvas(ctx, rec->target_gl_tex, rec->canvas_w, rec->canvas_h, tr->tx,
+                                     tr->ty, tr->pre_slot);
+        }
     }
-    glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 0, 0, 0);
-    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (bound_cow_fbos) {
+        glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 0, 0, 0);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
 
     if (ctx->has_mipmaps && ctx->saved_max_level > 0) {
         glActiveTexture(GL_TEXTURE0);
@@ -2326,32 +2814,60 @@ bool we_gpu_brush_undo_stroke(we_gpu_brush_ctx_t *ctx, uint64_t stroke_id)
 
 bool we_gpu_brush_redo_stroke(we_gpu_brush_ctx_t *ctx, uint64_t stroke_id)
 {
-    if (!ctx || ctx->in_stroke || !ctx->bound_tex) {
+    if (!ctx || ctx->in_stroke || !ctx->bound_tex || ctx->bound_tex->gl_tex == 0 ||
+        eglGetCurrentContext() == EGL_NO_CONTEXT) {
         return false;
     }
     brush_stroke_record_t *rec = find_stroke_record(ctx, stroke_id);
     if (!rec || !rec->is_undone || rec->target_gl_tex != (GLuint)ctx->bound_tex->gl_tex) {
         return false;
     }
+    bool needs_scratch_swap = false;
     for (uint32_t i = 0; i < rec->tile_count; i++) {
         if (rec->tiles[i].post_slot == UINT32_MAX) {
             return false;
+        }
+        if (rec->tiles[i].post_slot == rec->tiles[i].pre_slot) {
+            needs_scratch_swap = true;
         }
     }
 
     brush_gl_state_t gl_st;
     save_gl_state(&gl_st);
 
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, ctx->pool_fbo);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, ctx->canvas_fbo);
+    if (needs_scratch_swap && !ensure_scratch_fbos(ctx)) {
+        restore_gl_state(&gl_st);
+        return false;
+    }
+
+    bool bound_cow_fbos = false;
     for (uint32_t i = 0; i < rec->tile_count; i++) {
         const brush_tile_record_t *tr = &rec->tiles[i];
-        copy_pool_slot_to_canvas(ctx, rec->target_gl_tex, rec->canvas_w, rec->canvas_h, tr->tx,
-                                 tr->ty, tr->post_slot);
+        if (tr->post_slot == tr->pre_slot) {
+            if (bound_cow_fbos) {
+                glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 0, 0, 0);
+                glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0,
+                                       0);
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                bound_cow_fbos = false;
+            }
+            swap_canvas_and_pool_slot(ctx, rec->target_gl_tex, rec->canvas_w, rec->canvas_h, tr->tx,
+                                      tr->ty, tr->pre_slot);
+        } else {
+            if (!bound_cow_fbos) {
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, ctx->pool_fbo);
+                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, ctx->canvas_fbo);
+                bound_cow_fbos = true;
+            }
+            copy_pool_slot_to_canvas(ctx, rec->target_gl_tex, rec->canvas_w, rec->canvas_h, tr->tx,
+                                     tr->ty, tr->post_slot);
+        }
     }
-    glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 0, 0, 0);
-    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (bound_cow_fbos) {
+        glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 0, 0, 0);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
 
     if (ctx->has_mipmaps && ctx->saved_max_level > 0) {
         glActiveTexture(GL_TEXTURE0);
@@ -2363,6 +2879,23 @@ bool we_gpu_brush_redo_stroke(we_gpu_brush_ctx_t *ctx, uint64_t stroke_id)
     rec->is_undone = false;
     restore_gl_state(&gl_st);
     return true;
+}
+
+static void pack_rgba_to_target(uint8_t *dst, const uint8_t *src_rgba, size_t npx,
+                                uint32_t expected_format)
+{
+    if (expected_format == WE_TEX_FMT_RGBA8888) {
+        memcpy(dst, src_rgba, npx * 4u);
+    } else if (expected_format == WE_TEX_FMT_RG88) {
+        for (size_t i = 0; i < npx; i++) {
+            dst[i * 2u + 0u] = src_rgba[i * 4u + 0u];
+            dst[i * 2u + 1u] = src_rgba[i * 4u + 1u];
+        }
+    } else {
+        for (size_t i = 0; i < npx; i++) {
+            dst[i] = src_rgba[i * 4u + 0u];
+        }
+    }
 }
 
 bool we_gpu_brush_readback_texels(we_gpu_brush_ctx_t *ctx, uint32_t expected_format,
@@ -2421,105 +2954,115 @@ bool we_gpu_brush_readback_texels(we_gpu_brush_ctx_t *ctx, uint32_t expected_for
     glReadBuffer(GL_COLOR_ATTACHMENT0);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
 
-    uint32_t pbo_slot = ctx->readback_pbo_idx & 1u;
-    ctx->readback_pbo_idx = (ctx->readback_pbo_idx + 1u) & 1u;
-    if (ctx->readback_pbo[pbo_slot] == 0) {
-        glGenBuffers(1, &ctx->readback_pbo[pbo_slot]);
-    }
+    static const size_t k_max_single_pbo_bytes = 64u * 1024u * 1024u;
+    static const size_t k_max_strip_bytes = 4u * 1024u * 1024u;
 
     const uint8_t *mapped = NULL;
-    bool pbo_ready = false;
-    if (ctx->readback_pbo[pbo_slot] != 0) {
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, ctx->readback_pbo[pbo_slot]);
-        if (ctx->readback_pbo_bytes[pbo_slot] < rgba_bytes) {
-            while (glGetError() != GL_NO_ERROR) {
-            }
-            glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)rgba_bytes, NULL, GL_STREAM_READ);
-            if (glGetError() == GL_NO_ERROR) {
-                ctx->readback_pbo_bytes[pbo_slot] = rgba_bytes;
+    if (rgba_bytes <= k_max_single_pbo_bytes) {
+        uint32_t pbo_slot = ctx->readback_pbo_idx & 1u;
+        ctx->readback_pbo_idx = (ctx->readback_pbo_idx + 1u) & 1u;
+        if (ctx->readback_pbo[pbo_slot] == 0) {
+            glGenBuffers(1, &ctx->readback_pbo[pbo_slot]);
+        }
+
+        bool pbo_ready = false;
+        if (ctx->readback_pbo[pbo_slot] != 0) {
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, ctx->readback_pbo[pbo_slot]);
+            if (ctx->readback_pbo_bytes[pbo_slot] < rgba_bytes) {
+                while (glGetError() != GL_NO_ERROR) {
+                }
+                glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)rgba_bytes, NULL, GL_STREAM_READ);
+                if (glGetError() == GL_NO_ERROR) {
+                    ctx->readback_pbo_bytes[pbo_slot] = rgba_bytes;
+                    pbo_ready = true;
+                }
+            } else {
                 pbo_ready = true;
             }
-        } else {
-            pbo_ready = true;
-        }
-        if (pbo_ready) {
-            while (glGetError() != GL_NO_ERROR) {
-            }
-            glReadPixels(0, 0, (GLsizei)ctx->canvas_w, (GLsizei)ctx->canvas_h, GL_RGBA,
-                         GL_UNSIGNED_BYTE, NULL);
-            if (glGetError() == GL_NO_ERROR) {
-                if (ctx->egl_dpy != EGL_NO_DISPLAY && ctx->fn_eglCreateSyncKHR &&
-                    ctx->fn_eglClientWaitSyncKHR && ctx->fn_eglDestroySyncKHR) {
-                    EGLSyncKHR sync =
-                        ctx->fn_eglCreateSyncKHR(ctx->egl_dpy, EGL_SYNC_FENCE_KHR, NULL);
-                    if (sync != EGL_NO_SYNC_KHR) {
-                        glFlush();
-                        (void)ctx->fn_eglClientWaitSyncKHR(
-                            ctx->egl_dpy, sync, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, EGL_FOREVER_KHR);
-                        ctx->fn_eglDestroySyncKHR(ctx->egl_dpy, sync);
-                    }
-                } else {
-                    GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-                    if (sync) {
-                        glFlush();
-                        (void)glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, UINT64_MAX);
-                        glDeleteSync(sync);
-                    }
+            if (pbo_ready) {
+                while (glGetError() != GL_NO_ERROR) {
                 }
-                mapped = (const uint8_t *)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0,
-                                                           (GLsizeiptr)rgba_bytes, GL_MAP_READ_BIT);
+                glReadPixels(0, 0, (GLsizei)ctx->canvas_w, (GLsizei)ctx->canvas_h, GL_RGBA,
+                             GL_UNSIGNED_BYTE, NULL);
+                if (glGetError() == GL_NO_ERROR) {
+                    if (ctx->egl_dpy != EGL_NO_DISPLAY && ctx->fn_eglCreateSyncKHR &&
+                        ctx->fn_eglClientWaitSyncKHR && ctx->fn_eglDestroySyncKHR) {
+                        EGLSyncKHR sync =
+                            ctx->fn_eglCreateSyncKHR(ctx->egl_dpy, EGL_SYNC_FENCE_KHR, NULL);
+                        if (sync != EGL_NO_SYNC_KHR) {
+                            glFlush();
+                            (void)ctx->fn_eglClientWaitSyncKHR(ctx->egl_dpy, sync,
+                                                               EGL_SYNC_FLUSH_COMMANDS_BIT_KHR,
+                                                               EGL_FOREVER_KHR);
+                            ctx->fn_eglDestroySyncKHR(ctx->egl_dpy, sync);
+                        }
+                    } else {
+                        GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+                        if (sync) {
+                            glFlush();
+                            (void)glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, UINT64_MAX);
+                            glDeleteSync(sync);
+                        }
+                    }
+                    mapped = (const uint8_t *)glMapBufferRange(
+                        GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)rgba_bytes, GL_MAP_READ_BIT);
+                }
             }
-        }
-    }
-
-    uint8_t *fallback_rgba = NULL;
-    const uint8_t *src_rgba = mapped;
-    if (!src_rgba) {
-        if (ctx->readback_pbo[pbo_slot] != 0) {
-            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-        }
-        fallback_rgba = malloc(rgba_bytes);
-        if (!fallback_rgba) {
-            glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
-            glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prev_pbo);
-            glPixelStorei(GL_PACK_ALIGNMENT, prev_pack_align);
-            restore_gl_state(&gl_st);
-            free(dst);
-            return false;
-        }
-        while (glGetError() != GL_NO_ERROR) {
-        }
-        glReadPixels(0, 0, (GLsizei)ctx->canvas_w, (GLsizei)ctx->canvas_h, GL_RGBA,
-                     GL_UNSIGNED_BYTE, fallback_rgba);
-        if (glGetError() != GL_NO_ERROR) {
-            free(fallback_rgba);
-            glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
-            glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prev_pbo);
-            glPixelStorei(GL_PACK_ALIGNMENT, prev_pack_align);
-            restore_gl_state(&gl_st);
-            free(dst);
-            return false;
-        }
-        src_rgba = fallback_rgba;
-    }
-
-    if (expected_format == WE_TEX_FMT_RGBA8888) {
-        memcpy(dst, src_rgba, out_bytes);
-    } else if (expected_format == WE_TEX_FMT_RG88) {
-        for (size_t i = 0; i < npx; i++) {
-            dst[i * 2u + 0u] = src_rgba[i * 4u + 0u];
-            dst[i * 2u + 1u] = src_rgba[i * 4u + 1u];
-        }
-    } else {
-        for (size_t i = 0; i < npx; i++) {
-            dst[i] = src_rgba[i * 4u + 0u];
         }
     }
 
     if (mapped) {
+        pack_rgba_to_target(dst, mapped, npx, expected_format);
         glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+    } else {
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        size_t row_rgba_bytes = (size_t)ctx->canvas_w * 4u;
+        uint32_t strip_h = (uint32_t)(k_max_strip_bytes / row_rgba_bytes);
+        if (strip_h == 0u) {
+            strip_h = 1u;
+        }
+        if (strip_h > ctx->canvas_h) {
+            strip_h = ctx->canvas_h;
+        }
+        size_t strip_bytes = row_rgba_bytes * (size_t)strip_h;
+        if (ctx->readback_strip_cap < strip_bytes) {
+            uint8_t *grown = realloc(ctx->readback_strip_buf, strip_bytes);
+            if (!grown) {
+                glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0,
+                                       0);
+                glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prev_pbo);
+                glPixelStorei(GL_PACK_ALIGNMENT, prev_pack_align);
+                restore_gl_state(&gl_st);
+                free(dst);
+                return false;
+            }
+            ctx->readback_strip_buf = grown;
+            ctx->readback_strip_cap = strip_bytes;
+        }
+
+        for (uint32_t y = 0; y < ctx->canvas_h; y += strip_h) {
+            uint32_t cur_h = ctx->canvas_h - y;
+            if (cur_h > strip_h) {
+                cur_h = strip_h;
+            }
+            while (glGetError() != GL_NO_ERROR) {
+            }
+            glReadPixels(0, (GLint)y, (GLsizei)ctx->canvas_w, (GLsizei)cur_h, GL_RGBA,
+                         GL_UNSIGNED_BYTE, ctx->readback_strip_buf);
+            if (glGetError() != GL_NO_ERROR) {
+                glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0,
+                                       0);
+                glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prev_pbo);
+                glPixelStorei(GL_PACK_ALIGNMENT, prev_pack_align);
+                restore_gl_state(&gl_st);
+                free(dst);
+                return false;
+            }
+            size_t row_px = (size_t)cur_h * (size_t)ctx->canvas_w;
+            pack_rgba_to_target(dst + ((size_t)y * (size_t)ctx->canvas_w * bpp),
+                                ctx->readback_strip_buf, row_px, expected_format);
+        }
     }
-    free(fallback_rgba);
 
     glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
     glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prev_pbo);
