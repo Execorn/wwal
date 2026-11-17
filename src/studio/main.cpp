@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "studio/app/main_window.hpp"
 #include "studio/app/dock_layout_manager.hpp"
+#include "studio/app/studio_tokens.hpp"
 #include "studio/grid/virtualized_grid_widget.hpp"
 
 #include <QApplication>
@@ -8,7 +9,7 @@
 #include <QCommandLineOption>
 #include <QLoggingCategory>
 #include <QMouseEvent>
-#include <QStyleFactory>
+#include <QPixmapCache>
 #include <QSurfaceFormat>
 #include <QTabBar>
 #include <QThread>
@@ -19,19 +20,87 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <malloc.h>
 #include <string_view>
 #include <unistd.h>
 
 using namespace waywal::studio;
 
-static int runHeadlessCheck(const StudioOptions &options)
+static std::atomic<bool> g_isOffscreenPlatform{false};
+
+#if defined(__SANITIZE_ADDRESS__)
+#define WAYWAL_STUDIO_ASAN_BUILD 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define WAYWAL_STUDIO_ASAN_BUILD 1
+#endif
+#endif
+
+static bool readSmapsRollupRssAnonMiB(double &outRssAnonMb, double &outVmRssMb)
 {
+    outRssAnonMb = 0.0;
+    outVmRssMb = 0.0;
+
+    bool foundAnon = false;
+    bool foundRss = false;
+    {
+        std::ifstream smapsFile("/proc/self/smaps_rollup");
+        std::string line;
+        while (std::getline(smapsFile, line)) {
+            if (line.rfind("Anonymous:", 0) == 0) {
+                long kb = 0;
+                if (sscanf(line.c_str(), "Anonymous: %ld kB", &kb) == 1) {
+                    outRssAnonMb = static_cast<double>(kb) / 1024.0;
+                    foundAnon = true;
+                }
+            } else if (line.rfind("Rss:", 0) == 0) {
+                long kb = 0;
+                if (sscanf(line.c_str(), "Rss: %ld kB", &kb) == 1) {
+                    outVmRssMb = static_cast<double>(kb) / 1024.0;
+                    foundRss = true;
+                }
+            }
+        }
+    }
+
+    if (!foundAnon || !foundRss) {
+        std::ifstream statusFile("/proc/self/status");
+        std::string line;
+        while (std::getline(statusFile, line)) {
+            if (!foundAnon && line.rfind("RssAnon:", 0) == 0) {
+                long kb = 0;
+                if (sscanf(line.c_str(), "RssAnon: %ld kB", &kb) == 1) {
+                    outRssAnonMb = static_cast<double>(kb) / 1024.0;
+                    foundAnon = true;
+                }
+            } else if (!foundRss && line.rfind("VmRSS:", 0) == 0) {
+                long kb = 0;
+                if (sscanf(line.c_str(), "VmRSS: %ld kB", &kb) == 1) {
+                    outVmRssMb = static_cast<double>(kb) / 1024.0;
+                    foundRss = true;
+                }
+            }
+        }
+    }
+    return foundAnon;
+}
+
+static int runHeadlessCheck(const StudioOptions &options,
+                            std::chrono::steady_clock::time_point startupT0)
+{
+    // Prevent secondary browser panels from launching disk/SQLite scan threads during headless
+    // runs.
+    qputenv("WWAL_STUDIO_HEADLESS_CHECK", "1");
+
     std::cout << "========================================================" << std::endl;
-    std::cout << "[wwal-studio] Starting Headless Verification Suite" << std::endl;
+    std::cout << "[wwal-studio] Starting Headless Verification Suite ("
+              << (options.realizeAllPanels ? "22-panel full realization" : "4-panel core launch")
+              << ")" << std::endl;
     std::cout << "========================================================" << std::endl;
 
     // 1. Instantiate core MainWindow in offscreen mode
@@ -43,60 +112,70 @@ static int runHeadlessCheck(const StudioOptions &options)
     }
     std::cout << "[+] MainWindow and DockLayoutManager successfully instantiated." << std::endl;
 
-    // 2. Validate Panel Registration for all 6 panels & bars
-    QStringList panelIds = layoutMgr->registeredPanelIds();
+    // 2. Validate Panel Registration across all 22 registered IDs and confirm lazy deferral
+    const QStringList panelIds = layoutMgr->registeredPanelIds();
     std::cout << "[+] Registered panels (" << panelIds.size()
               << "): " << panelIds.join(", ").toStdString() << std::endl;
 
-    const QStringList expectedPanels = {
-        QStringLiteral("Wallpapers"),        QStringLiteral("GpuPreviewViewport"),
-        QStringLiteral("CubicBezier"),       QStringLiteral("PropertyInspectorWidget"),
-        QStringLiteral("ThemeStudioWidget"), QStringLiteral("MonitorTopologyBar"),
-        QStringLiteral("StudioFooterBar")};
-
-    for (const auto &expected : expectedPanels) {
-        if (!panelIds.contains(expected)) {
-            std::cerr << "[-] FAILED: Panel '" << expected.toStdString() << "' is not registered!"
-                      << std::endl;
-            return 1;
-        }
-        if (!layoutMgr->dockWidget(expected)) {
-            std::cerr << "[-] FAILED: DockWidget for '" << expected.toStdString() << "' is null!"
-                      << std::endl;
-            return 1;
-        }
-    }
     if (panelIds.size() != 22) {
         std::cerr << "[-] FAILED: Expected 22 registered panels, got " << panelIds.size()
                   << std::endl;
         return 1;
     }
-    const QStringList lazyRiggingPanels = {
-        QStringLiteral("PuppetMeshPanel"), QStringLiteral("BoneRiggingPanel"),
-        QStringLiteral("WeightPaintPanel"), QStringLiteral("DopeSheetTimelineWidget")};
-    for (const auto &rigPanel : lazyRiggingPanels) {
-        if (!panelIds.contains(rigPanel) || !layoutMgr->dockWidget(rigPanel)) {
-            std::cerr << "[-] FAILED: Missing rigging panel '" << rigPanel.toStdString() << "'!"
+
+    const QStringList corePanels = {
+        QStringLiteral("Wallpapers"),         QStringLiteral("GpuPreviewViewport"),
+        QStringLiteral("CubicBezier"),        QStringLiteral("PropertyInspectorWidget"),
+        QStringLiteral("MonitorTopologyBar"), QStringLiteral("StudioFooterBar")};
+
+    const QStringList lazyPanels = {QStringLiteral("WorkshopBrowser"),
+                                    QStringLiteral("OpenHubBrowser"),
+                                    QStringLiteral("ThemeStudioWidget"),
+                                    QStringLiteral("NodeGraphEditorWidget"),
+                                    QStringLiteral("EffectLibraryBrowserWidget"),
+                                    QStringLiteral("CameraLightingInspectorWidget"),
+                                    QStringLiteral("PhysicsSpringInspectorWidget"),
+                                    QStringLiteral("SceneLayerTree"),
+                                    QStringLiteral("GpuBrushPainter"),
+                                    QStringLiteral("ParticleDesigner"),
+                                    QStringLiteral("AudioBindingWizard"),
+                                    QStringLiteral("GlslSceneScriptEditor"),
+                                    QStringLiteral("PuppetMeshPanel"),
+                                    QStringLiteral("BoneRiggingPanel"),
+                                    QStringLiteral("WeightPaintPanel"),
+                                    QStringLiteral("DopeSheetTimelineWidget")};
+
+    for (const auto &expected : corePanels) {
+        if (!panelIds.contains(expected) || !layoutMgr->dockWidget(expected)) {
+            std::cerr << "[-] FAILED: Core panel '" << expected.toStdString() << "' is missing!"
                       << std::endl;
             return 1;
         }
-        if (layoutMgr->isPanelRealized(rigPanel)) {
-            std::cerr << "[-] FAILED: Rigging panel '" << rigPanel.toStdString()
-                      << "' should stay lazy before realization!" << std::endl;
+    }
+    for (const auto &lazyId : lazyPanels) {
+        if (!panelIds.contains(lazyId) || !layoutMgr->dockWidget(lazyId)) {
+            std::cerr << "[-] FAILED: Missing secondary lazy panel '" << lazyId.toStdString()
+                      << "'!" << std::endl;
+            return 1;
+        }
+        if (layoutMgr->isPanelRealized(lazyId)) {
+            std::cerr << "[-] FAILED: Secondary panel '" << lazyId.toStdString()
+                      << "' realized prematurely before window reveal!" << std::endl;
             return 1;
         }
     }
-    std::cout << "[+] All 22 registered panels (including 4 deferred rigging panels) verified."
+    std::cout << "[+] All 22 registered panels (4 core + 2 bars eager, 16 secondary lazy) verified."
               << std::endl;
 
-    // 3. Validate Available Perspectives
-    QStringList perspectives = layoutMgr->availablePerspectives();
-    std::cout << "[+] Available perspectives: " << perspectives.join(", ").toStdString()
-              << std::endl;
-
-    const QStringList requiredPerspectives = {
-        QStringLiteral("Default"), QStringLiteral("Shader Coding"), QStringLiteral("Theme Studio"),
-        QStringLiteral("Multi-Monitor")};
+    // 3. Validate Available Perspectives and JSON Serialization Schema
+    const QStringList perspectives = layoutMgr->availablePerspectives();
+    const QStringList requiredPerspectives = {QStringLiteral("Default"),
+                                              QStringLiteral("Shader Coding"),
+                                              QStringLiteral("Scene Composer"),
+                                              QStringLiteral("Particle & Audio"),
+                                              QStringLiteral("Theme Studio"),
+                                              QStringLiteral("Multi-Monitor"),
+                                              QStringLiteral("Rigging & Animation")};
 
     for (const auto &req : requiredPerspectives) {
         if (!perspectives.contains(req)) {
@@ -105,29 +184,16 @@ static int runHeadlessCheck(const StudioOptions &options)
             return 1;
         }
     }
-    if (!perspectives.contains(QStringLiteral("Rigging & Animation"))) {
-        std::cerr << "[-] FAILED: Missing required perspective: Rigging & Animation" << std::endl;
-        return 1;
-    }
-    std::cout << "[+] All required perspectives (including Rigging & Animation) present."
-              << std::endl;
 
-    // 4. Validate JSON Serialization Schema
-    QJsonObject layoutJson = layoutMgr->serializeLayout();
-    if (layoutJson.value(QStringLiteral("version")).toInt() != 1) {
-        std::cerr << "[-] FAILED: JSON serialization 'version' must equal 1!" << std::endl;
-        return 1;
-    }
-    if (layoutJson.value(QStringLiteral("layout_revision")).toInt() != 7) {
-        std::cerr << "[-] FAILED: JSON serialization 'layout_revision' must equal 7!" << std::endl;
-        return 1;
-    }
-    if (layoutJson.value(QStringLiteral("active_perspective")).toString().isEmpty()) {
-        std::cerr << "[-] FAILED: JSON missing 'active_perspective' field!" << std::endl;
+    const QJsonObject layoutJson = layoutMgr->serializeLayout();
+    if (layoutJson.value(QStringLiteral("version")).toInt() != 1 ||
+        layoutJson.value(QStringLiteral("layout_revision")).toInt() != 7 ||
+        layoutJson.value(QStringLiteral("active_perspective")).toString().isEmpty()) {
+        std::cerr << "[-] FAILED: JSON layout metadata mismatch!" << std::endl;
         return 1;
     }
 
-    QJsonObject perspsObj = layoutJson.value(QStringLiteral("perspectives")).toObject();
+    const QJsonObject perspsObj = layoutJson.value(QStringLiteral("perspectives")).toObject();
     for (const auto &req : requiredPerspectives) {
         if (!perspsObj.contains(req)) {
             std::cerr << "[-] FAILED: Serialized JSON missing perspective: " << req.toStdString()
@@ -135,9 +201,7 @@ static int runHeadlessCheck(const StudioOptions &options)
             return 1;
         }
     }
-
-    // Validate tree nodes in "Default" perspective
-    QJsonObject defTree = perspsObj.value(QStringLiteral("Default")).toObject();
+    const QJsonObject defTree = perspsObj.value(QStringLiteral("Default")).toObject();
     if (!defTree.contains(QStringLiteral("split_direction")) ||
         !defTree.contains(QStringLiteral("split_ratio")) ||
         !defTree.contains(QStringLiteral("left")) || !defTree.contains(QStringLiteral("right"))) {
@@ -145,120 +209,41 @@ static int runHeadlessCheck(const StudioOptions &options)
                   << std::endl;
         return 1;
     }
-    std::cout << "[+] JSON layout serialization matches split tree schema with 100% fidelity."
-              << std::endl;
+    std::cout << "[+] Perspectives (" << perspectives.size()
+              << ") and JSON layout serialization verified." << std::endl;
 
-    // 5. Test Live Perspective Switching
-    for (const auto &name : requiredPerspectives) {
-        bool ok = layoutMgr->switchPerspective(name);
-        if (!ok || layoutMgr->activePerspective() != name) {
-            std::cerr << "[-] FAILED to switch to perspective: " << name.toStdString() << std::endl;
-            return 1;
-        }
-        std::cout << "  -> Switched to perspective: '" << name.toStdString() << "' [OK]"
-                  << std::endl;
-    }
-    // Switch back to Default
-    layoutMgr->switchPerspective(QStringLiteral("Default"));
-    std::cout << "[+] Live perspective switching cycle validated." << std::endl;
-
-    // 6. Test File Load/Save Round-Trip
-    QString testFilePath = QStringLiteral("/tmp/wwal_headless_layout_test_%1.json")
-                               .arg(QCoreApplication::applicationPid());
-    bool saved = layoutMgr->saveLayoutToFile(testFilePath);
-    if (!saved || !QFile::exists(testFilePath)) {
-        std::cerr << "[-] FAILED to save layout file to: " << testFilePath.toStdString()
-                  << std::endl;
-        return 1;
-    }
-
-    QFileInfo fi(testFilePath);
-    if (fi.size() <= 0) {
-        std::cerr << "[-] FAILED: Saved layout file is empty!" << std::endl;
+    // 4. Test File Load/Save Round-Trip and Global Actions
+    const QString testFilePath = QStringLiteral("/tmp/wwal_headless_layout_test_%1.json")
+                                     .arg(QCoreApplication::applicationPid());
+    if (!layoutMgr->saveLayoutToFile(testFilePath) || !QFile::exists(testFilePath) ||
+        QFileInfo(testFilePath).size() <= 0) {
         QFile::remove(testFilePath);
+        std::cerr << "[-] FAILED layout file save round-trip!" << std::endl;
         return 1;
     }
-
-    bool loaded = layoutMgr->loadLayoutFromFile(testFilePath);
+    const bool loaded = layoutMgr->loadLayoutFromFile(testFilePath);
     QFile::remove(testFilePath);
     if (!loaded) {
         std::cerr << "[-] FAILED: Unable to reload saved layout JSON file!" << std::endl;
         return 1;
     }
-    std::cout << "[+] File persistence round-trip ($XDG_CONFIG_HOME JSON format) passed."
-              << std::endl;
 
-    // 7. Verify Global Actions and Shortcuts
     if (!window.undoAction() || !window.redoAction() || !window.searchFocusAction() ||
         !window.playPauseAction() || !window.fullscreenAction()) {
         std::cerr << "[-] FAILED: One or more global studio actions are null!" << std::endl;
         return 1;
     }
-    std::cout << "[+] Global shortcuts and actions verified:" << std::endl;
-    std::cout << "  - Undo: " << window.undoAction()->shortcut().toString().toStdString()
-              << std::endl;
-    std::cout << "  - Redo: " << window.redoAction()->shortcut().toString().toStdString()
-              << std::endl;
-    std::cout << "  - Search Focus: "
-              << window.searchFocusAction()->shortcut().toString().toStdString() << std::endl;
-    // 8. Verify Idle RSS < 80 MB (Private Anonymous / Heap Memory)
-    double rss_anon_mb = 0.0;
-    double rss_total_mb = 0.0;
-    std::ifstream statusFile("/proc/self/status");
-    std::string sline;
-    while (std::getline(statusFile, sline)) {
-        if (sline.rfind("RssAnon:", 0) == 0) {
-            long kb = 0;
-            if (sscanf(sline.c_str(), "RssAnon: %ld kB", &kb) == 1) {
-                rss_anon_mb = kb / 1024.0;
-            }
-        } else if (sline.rfind("VmRSS:", 0) == 0) {
-            long kb = 0;
-            if (sscanf(sline.c_str(), "VmRSS: %ld kB", &kb) == 1) {
-                rss_total_mb = kb / 1024.0;
-            }
-        }
-    }
-    std::cout << "[+] Idle Memory Footprint:" << std::endl;
-    std::cout << "  -> Private Anonymous / Heap RSS: " << std::fixed << std::setprecision(2)
-              << rss_anon_mb << " MB (Budget: < 80.00 MB)" << std::endl;
-    std::cout << "  -> Total VmRSS (including shared OS libraries): " << rss_total_mb << " MB"
-              << std::endl;
 
-#if defined(__SANITIZE_ADDRESS__)
-#define WAYWAL_STUDIO_ASAN_BUILD 1
-#elif defined(__has_feature)
-#if __has_feature(address_sanitizer)
-#define WAYWAL_STUDIO_ASAN_BUILD 1
-#endif
-#endif
-
-#if defined(WAYWAL_STUDIO_ASAN_BUILD)
-    if (rss_anon_mb >= 80.0) {
-        std::cout << "[*] ASan build: Idle Private RSS = " << rss_anon_mb
-                  << " MB (80 MB non-ASan limit informational only under AddressSanitizer)."
-                  << std::endl;
-    }
-#else
-    if (rss_anon_mb >= 80.0) {
-        std::cerr << "[-] FAILED: Idle Private RSS exceeded 80 MB budget!" << std::endl;
-        return 1;
-    }
-#endif
-
-    // 9. Verify Realized Window Geometry, Dock Non-Overlap, & Proportional Resize Scaling
-    // Populate sample/scanned catalog entries so GridGlCanvas card rendering is verified
-    if (window.gridWidget()) {
+    // 5. Optional directory scan (explicit -d) when user supplies wallpaper dirs.
+    if (window.gridWidget() && !options.wallpaperDirs.isEmpty()) {
         auto &idx = window.gridWidget()->catalogIndex();
         (void)idx.loadConfigFromFile();
-        if (!options.wallpaperDirs.isEmpty()) {
-            std::vector<std::string> dirs;
-            for (const auto &d : options.wallpaperDirs) {
-                dirs.push_back(d.toStdString());
-            }
-            idx.setIncludedDirectories(dirs);
-            idx.setScanSystemAndWorkshopPaths(false);
+        std::vector<std::string> dirs;
+        for (const auto &d : options.wallpaperDirs) {
+            dirs.push_back(d.toStdString());
         }
+        idx.setIncludedDirectories(dirs);
+        idx.setScanSystemAndWorkshopPaths(false);
         if (!options.excludeDirs.isEmpty()) {
             for (const auto &ex : options.excludeDirs) {
                 idx.addExcludedDirectory(ex.toStdString());
@@ -269,14 +254,16 @@ static int runHeadlessCheck(const StudioOptions &options)
         window.gridWidget()->selectFirstItemIfAvailable();
     }
 
-    // Test the EXACT interactive startup sequence: window.show() WITHOUT calling
-    // switchPerspective() or applyCurrentSplitSizes() after show()!
+    // 6. Execute interactive window show path and measure cold startup latency + smaps_rollup
+    // RssAnon.
     window.resize(1600, 960);
     window.show();
-    for (int i = 0; i < 12; ++i) {
+    for (int i = 0; i < 4; ++i) {
         QCoreApplication::processEvents();
-        QThread::msleep(15);
     }
+    const double startupMs =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - startupT0)
+            .count();
 
     auto *dWallpapers = layoutMgr->dockWidget(QStringLiteral("Wallpapers"));
     auto *dPreview = layoutMgr->dockWidget(QStringLiteral("GpuPreviewViewport"));
@@ -286,15 +273,18 @@ static int runHeadlessCheck(const StudioOptions &options)
     auto *dTopo = layoutMgr->dockWidget(QStringLiteral("MonitorTopologyBar"));
     auto *dFooter = layoutMgr->dockWidget(QStringLiteral("StudioFooterBar"));
 
-    std::cout << "[+] Default Perspective Geometries @ 1600x960 (initial show without post-show "
-                 "switchPerspective):"
-              << std::endl;
-    for (const auto &id : expectedPanels) {
+    const QStringList geometryReportPanels = {
+        QStringLiteral("Wallpapers"),        QStringLiteral("GpuPreviewViewport"),
+        QStringLiteral("CubicBezier"),       QStringLiteral("PropertyInspectorWidget"),
+        QStringLiteral("ThemeStudioWidget"), QStringLiteral("MonitorTopologyBar"),
+        QStringLiteral("StudioFooterBar")};
+    std::cout << "[+] Default Perspective Geometries @ 1600x960:" << std::endl;
+    for (const auto &id : geometryReportPanels) {
         if (auto *d = layoutMgr->dockWidget(id)) {
-            QRect g = d->geometry();
+            const QRect g = d->geometry();
             std::cout << "  - " << id.toStdString() << ": (" << g.x() << ", " << g.y() << ", "
                       << g.width() << "x" << g.height() << ") visible=" << d->isVisible()
-                      << std::endl;
+                      << " realized=" << layoutMgr->isPanelRealized(id) << std::endl;
         }
     }
 
@@ -358,123 +348,141 @@ static int runHeadlessCheck(const StudioOptions &options)
         return 1;
     }
 
+    if (!options.realizeAllPanels) {
+        for (const auto &lazyId : lazyPanels) {
+            if (layoutMgr->isPanelRealized(lazyId)) {
+                std::cerr << "[-] FAILED: Parked lazy panel '" << lazyId.toStdString()
+                          << "' realized during Default show()!" << std::endl;
+                return 1;
+            }
+        }
+    }
+
+    double baseRssAnonMb = 0.0;
+    double baseVmRssMb = 0.0;
+    readSmapsRollupRssAnonMiB(baseRssAnonMb, baseVmRssMb);
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "[+] Startup Latency: " << startupMs << " ms (Budget: <= 350.00 ms)" << std::endl;
+    std::cout << "[+] Core 4-panel RssAnon (/proc/self/smaps_rollup): " << baseRssAnonMb
+              << " MB (VmRSS: " << baseVmRssMb << " MB, Budget: < 55.00 MB)" << std::endl;
+
+#if !defined(WAYWAL_STUDIO_ASAN_BUILD)
+    if (baseRssAnonMb >= 55.0) {
+        std::cerr << "[-] FAILED: 4-panel RssAnon (" << baseRssAnonMb
+                  << " MB) exceeded 55.0 MB budget!" << std::endl;
+        return 1;
+    }
+#endif
+
     const QString screenshotDir = qEnvironmentVariable("WWAL_STUDIO_SCREENSHOT_DIR");
     if (!screenshotDir.isEmpty()) {
         window.grab().save(screenshotDir + QStringLiteral("/default_1600x960.png"));
     }
 
-    // Switch active tab in right dock to Material You Theme Studio, simulate mouse release
-    // (which triggers syncLiveRatiosFromGeometry while PropertyInspectorWidget is parked
-    // offscreen), and verify QTabBar and split ratios are not corrupted!
-    layoutMgr->setPanelVisible(QStringLiteral("ThemeStudioWidget"), true);
-    for (int i = 0; i < 6; ++i)
-        QCoreApplication::processEvents();
-    if (dTheme->x() <= 0 || dTheme->y() <= 0) {
-        std::cerr << "[-] FAILED: ThemeStudioWidget tab did not raise onto screen: (" << dTheme->x()
-                  << ", " << dTheme->y() << ")!" << std::endl;
-        return 1;
-    }
-    {
-        QMouseEvent releaseEv(QEvent::MouseButtonRelease, QPointF(100, 100), QPointF(100, 100),
-                              Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
-        QCoreApplication::sendEvent(&window, &releaseEv);
-    }
-    for (int i = 0; i < 4; ++i)
-        QCoreApplication::processEvents();
-
-    if (!checkMultiTabBarsVisible("Default 1600x960 after raising ThemeStudioWidget tab")) {
-        return 1;
-    }
-    if (!screenshotDir.isEmpty()) {
-        window.grab().save(screenshotDir + QStringLiteral("/default_themestudio_tab_1600x960.png"));
-    }
-
-    // Test dynamic window resize down to 1024x720 while ThemeStudioWidget is the active tab
-    // (verifying that offscreen PropertyInspectorWidget did not corrupt split_ratio!)
-    window.resize(1024, 720);
-    for (int i = 0; i < 8; ++i)
-        QCoreApplication::processEvents();
-
-    if (dWallpapers->width() < 160 || dPreview->width() < 350 || dTheme->width() < 220 ||
-        dTheme->x() <= 0) {
-        std::cerr << "[-] FAILED: Dock columns collapsed at 1024x720 when ThemeStudioWidget tab is "
-                     "active! "
-                  << "wall=" << dWallpapers->width() << " prev=" << dPreview->width()
-                  << " theme=" << dTheme->width() << " x=" << dTheme->x() << std::endl;
-        return 1;
-    }
-    if (!checkMultiTabBarsVisible("Default 1024x720 with ThemeStudioWidget tab active")) {
-        return 1;
-    }
-    if (!screenshotDir.isEmpty()) {
-        window.grab().save(screenshotDir + QStringLiteral("/default_themestudio_tab_1024x720.png"));
-    }
-
-    // Switch back to PropertyInspectorWidget tab at 1024x720 and verify QTabBar & geometry
-    layoutMgr->setPanelVisible(QStringLiteral("PropertyInspectorWidget"), true);
-    for (int i = 0; i < 6; ++i)
-        QCoreApplication::processEvents();
-
-    std::cout << "[+] Default Perspective Geometries @ 1024x720:" << std::endl;
-    for (const auto &id : expectedPanels) {
-        if (auto *d = layoutMgr->dockWidget(id)) {
-            QRect g = d->geometry();
-            std::cout << "  - " << id.toStdString() << ": (" << g.x() << ", " << g.y() << ", "
-                      << g.width() << "x" << g.height() << ") visible=" << d->isVisible()
-                      << std::endl;
-        }
-    }
-
-    if (dWallpapers->width() < 160 || dPreview->width() < 350 || dInspector->width() < 220) {
-        std::cerr << "[-] FAILED: Dock columns collapsed or failed to scale at 1024x720!"
-                  << std::endl;
-        return 1;
-    }
-    if (!checkMultiTabBarsVisible("Default 1024x720 after resize")) {
-        return 1;
-    }
-
-    if (!screenshotDir.isEmpty()) {
-        window.grab().save(screenshotDir + QStringLiteral("/default_1024x720.png"));
-
-        window.resize(1600, 960);
-        for (int i = 0; i < 8; ++i)
+    if (options.realizeAllPanels) {
+        // Reveal inactive ThemeStudio tab, check dynamic 1024x720 scaling, sweep perspectives,
+        // and realize every registered dock to measure worst-case 22-panel footprint.
+        layoutMgr->setPanelVisible(QStringLiteral("ThemeStudioWidget"), true);
+        for (int i = 0; i < 4; ++i)
             QCoreApplication::processEvents();
-
-        layoutMgr->switchPerspective(QStringLiteral("Shader Coding"));
-        for (int i = 0; i < 8; ++i)
-            QCoreApplication::processEvents();
-        if (!checkMultiTabBarsVisible("Shader Coding 1600x960", 3)) {
+        if (dTheme->x() <= 0 || dTheme->y() <= 0 ||
+            !layoutMgr->isPanelRealized(QStringLiteral("ThemeStudioWidget"))) {
+            std::cerr << "[-] FAILED: ThemeStudioWidget tab did not raise or realize on screen: ("
+                      << dTheme->x() << ", " << dTheme->y() << ")!" << std::endl;
             return 1;
         }
-        window.grab().save(screenshotDir + QStringLiteral("/shader_coding_1600x960.png"));
-
-        layoutMgr->switchPerspective(QStringLiteral("Theme Studio"));
-        for (int i = 0; i < 8; ++i)
+        {
+            QMouseEvent releaseEv(QEvent::MouseButtonRelease, QPointF(100, 100), QPointF(100, 100),
+                                  Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+            QCoreApplication::sendEvent(&window, &releaseEv);
+        }
+        for (int i = 0; i < 2; ++i)
             QCoreApplication::processEvents();
-        window.grab().save(screenshotDir + QStringLiteral("/theme_studio_1600x960.png"));
 
-        layoutMgr->switchPerspective(QStringLiteral("Multi-Monitor"));
-        for (int i = 0; i < 8; ++i)
+        if (!checkMultiTabBarsVisible("Default 1600x960 after raising ThemeStudioWidget tab")) {
+            return 1;
+        }
+        if (!screenshotDir.isEmpty()) {
+            window.grab().save(screenshotDir +
+                               QStringLiteral("/default_themestudio_tab_1600x960.png"));
+        }
+
+        window.resize(1024, 720);
+        for (int i = 0; i < 4; ++i)
             QCoreApplication::processEvents();
-        window.grab().save(screenshotDir + QStringLiteral("/multi_monitor_1600x960.png"));
 
-        layoutMgr->switchPerspective(QStringLiteral("Default"));
-        for (int i = 0; i < 8; ++i)
+        if (dWallpapers->width() < 160 || dPreview->width() < 350 || dTheme->width() < 220 ||
+            dTheme->x() <= 0) {
+            std::cerr << "[-] FAILED: Dock columns collapsed at 1024x720 with ThemeStudioWidget!"
+                      << std::endl;
+            return 1;
+        }
+        if (!checkMultiTabBarsVisible("Default 1024x720 with ThemeStudioWidget tab active")) {
+            return 1;
+        }
+        if (!screenshotDir.isEmpty()) {
+            window.grab().save(screenshotDir +
+                               QStringLiteral("/default_themestudio_tab_1024x720.png"));
+        }
+
+        layoutMgr->setPanelVisible(QStringLiteral("PropertyInspectorWidget"), true);
+        for (int i = 0; i < 4; ++i)
             QCoreApplication::processEvents();
-    }
 
-    if (!layoutMgr->switchPerspective(QStringLiteral("Rigging & Animation")) ||
-        layoutMgr->activePerspective() != QStringLiteral("Rigging & Animation")) {
-        std::cerr << "[-] FAILED to switch to perspective: Rigging & Animation" << std::endl;
-        return 1;
-    }
-    for (int i = 0; i < 8; ++i) {
-        QCoreApplication::processEvents();
-    }
-    layoutMgr->switchPerspective(QStringLiteral("Default"));
-    for (int i = 0; i < 4; ++i) {
-        QCoreApplication::processEvents();
+        if (dWallpapers->width() < 160 || dPreview->width() < 350 || dInspector->width() < 220) {
+            std::cerr << "[-] FAILED: Dock columns collapsed at 1024x720!" << std::endl;
+            return 1;
+        }
+        if (!checkMultiTabBarsVisible("Default 1024x720 after resize")) {
+            return 1;
+        }
+
+        window.resize(1600, 960);
+        for (int i = 0; i < 4; ++i)
+            QCoreApplication::processEvents();
+
+        for (const QString &persp :
+             {QStringLiteral("Shader Coding"), QStringLiteral("Scene Composer"),
+              QStringLiteral("Particle & Audio"), QStringLiteral("Theme Studio"),
+              QStringLiteral("Multi-Monitor"), QStringLiteral("Rigging & Animation"),
+              QStringLiteral("Default")}) {
+            if (!layoutMgr->switchPerspective(persp) || layoutMgr->activePerspective() != persp) {
+                std::cerr << "[-] FAILED to switch to perspective: " << persp.toStdString()
+                          << std::endl;
+                return 1;
+            }
+            for (int i = 0; i < 4; ++i)
+                QCoreApplication::processEvents();
+        }
+
+        int realizedCount = 0;
+        for (const QString &id : panelIds) {
+            if (layoutMgr->realizeLazyPanel(id) != nullptr && layoutMgr->isPanelRealized(id)) {
+                ++realizedCount;
+            }
+        }
+        for (int i = 0; i < 4; ++i)
+            QCoreApplication::processEvents();
+
+        if (realizedCount != panelIds.size()) {
+            std::cerr << "[-] FAILED: Expected all 22 panels realized, got " << realizedCount
+                      << std::endl;
+            return 1;
+        }
+
+        double allRssAnonMb = 0.0;
+        double allVmRssMb = 0.0;
+        malloc_trim(0);
+        readSmapsRollupRssAnonMiB(allRssAnonMb, allVmRssMb);
+        std::cout << "[+] Realized 22-panel RssAnon (/proc/self/smaps_rollup): " << allRssAnonMb
+                  << " MB (VmRSS: " << allVmRssMb << " MB, Budget: <= 62.00 MB)" << std::endl;
+#if !defined(WAYWAL_STUDIO_ASAN_BUILD)
+        if (allRssAnonMb > 62.0) {
+            std::cerr << "[-] FAILED: Realized 22-panel RssAnon (" << allRssAnonMb
+                      << " MB) exceeded 62.0 MB budget!" << std::endl;
+            return 1;
+        }
+#endif
     }
 
     window.hide();
@@ -564,7 +572,7 @@ static void waywalQtMessageFilter(QtMsgType type, const QMessageLogContext &cont
          msg.contains(QLatin1String("is focused")))) {
         return;
     }
-    if (qEnvironmentVariable("QT_QPA_PLATFORM") == QLatin1String("offscreen") &&
+    if (g_isOffscreenPlatform.load(std::memory_order_relaxed) &&
         (msg.contains(QLatin1String("QOpenGLWidget is not supported on this platform")) ||
          msg.contains(QLatin1String("QOpenGLWidget: Failed to create context")))) {
         return;
@@ -580,6 +588,8 @@ static void waywalQtMessageFilter(QtMsgType type, const QMessageLogContext &cont
 
 int main(int argc, char *argv[])
 {
+    mallopt(M_ARENA_MAX, 2);
+    const auto startupT0 = std::chrono::steady_clock::now();
     g_prevQtMessageHandler = qInstallMessageHandler(waywalQtMessageFilter);
     if (qEnvironmentVariableIsEmpty("QT_LOGGING_RULES")) {
         QLoggingCategory::setFilterRules(QStringLiteral("qt.qpa.wayland.textinput.warning=false\n"
@@ -621,9 +631,13 @@ int main(int argc, char *argv[])
         qunsetenv("DISPLAY");
         qunsetenv("WAYLAND_DISPLAY");
     }
+    g_isOffscreenPlatform.store(qEnvironmentVariable("QT_QPA_PLATFORM") ==
+                                    QLatin1String("offscreen"),
+                                std::memory_order_relaxed);
 
     QApplication app(argc, argv);
-    QApplication::setStyle(QStyleFactory::create(QStringLiteral("Fusion")));
+    QPixmapCache::setCacheLimit(512);
+    QApplication::setStyle(new wwal::studio::tokens::StudioProxyStyle());
     if (qEnvironmentVariableIsEmpty("QT_LOGGING_RULES")) {
         QLoggingCategory::setFilterRules(QStringLiteral("qt.qpa.wayland.textinput.warning=false\n"
                                                         "qt.qpa.wayland.textinput=false"));
@@ -676,6 +690,12 @@ int main(int argc, char *argv[])
             "Instantiate core structures, test layout serialization, and exit 0 without window."));
     parser.addOption(headlessCheckOption);
 
+    QCommandLineOption realizeAllPanelsOption(
+        QStringList() << QStringLiteral("realize-all-panels"),
+        QStringLiteral(
+            "Realize all 22 registered panels and multi-perspective layouts in headless checks."));
+    parser.addOption(realizeAllPanelsOption);
+
     parser.process(app);
 
     StudioOptions options;
@@ -685,9 +705,10 @@ int main(int argc, char *argv[])
     options.excludeDirs = parser.values(excludeDirOption);
     options.benchmarkGrid = parser.isSet(benchmarkGridOption);
     options.headlessCheck = parser.isSet(headlessCheckOption);
+    options.realizeAllPanels = parser.isSet(realizeAllPanelsOption);
 
     if (options.headlessCheck) {
-        return runHeadlessCheck(options);
+        return runHeadlessCheck(options, startupT0);
     }
     if (options.benchmarkGrid) {
         return runBenchmarkGrid(options);

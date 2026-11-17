@@ -27,9 +27,13 @@
 #include <DockAreaWidget.h>
 #endif
 
+namespace wwal::studio {
+class LazyPanelHost;
+} // namespace wwal::studio
+
 namespace waywal::studio {
 
-class LazyPanelHost;
+using wwal::studio::LazyPanelHost;
 
 /**
  * @brief Sleek custom dark titlebar for dock panels.
@@ -58,6 +62,7 @@ class StudioDockTitleBar : public QWidget {
 
   protected:
     void mouseDoubleClickEvent(QMouseEvent *event) override;
+    void paintEvent(QPaintEvent *event) override;
 
   private:
     QDockWidget *m_parentDock{nullptr};
@@ -187,6 +192,7 @@ class DockLayoutManager : public QObject {
     void collectDocksInTree(const QJsonObject &node, QSet<QString> &outIds);
     void setupDefaultPerspectives();
     void attachDockChildFilters();
+    void realizeVisibleLazyHosts();
     int computeWorkspaceTopBound() const;
     int computeWindowChromeHeight() const;
     void reconcileTabBarVisibility();

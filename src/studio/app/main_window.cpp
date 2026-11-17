@@ -2,14 +2,20 @@
 #include "studio/app/main_window.hpp"
 #include "studio/app/dock_layout_manager.hpp"
 #include "studio/app/studio_session_context.hpp"
+#include "studio/app/studio_tokens.hpp"
 #include "waywal/ipc_proto_authoring.h"
 #include "waywal/we_mesh_cdt.h"
 #include "waywal/we_mesh_rig.h"
 #include "waywal/we_puppet.h"
 
 #include <QApplication>
+#include <QDoubleSpinBox>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QMenuBar>
 #include <QMenu>
+#include <QSlider>
 #include <QToolBar>
 #include <QStatusBar>
 #include <QKeySequence>
@@ -94,7 +100,7 @@ class MonitorTopologyBar : public QWidget {
         auto *btnRefresh = new QPushButton(QStringLiteral("Refresh"), controlsBox);
         btnRefresh->setAccessibleName(QStringLiteral("Refresh displays"));
         btnRefresh->setToolTip(QStringLiteral("Refresh connected Wayland outputs"));
-        btnRefresh->setMinimumHeight(26);
+        btnRefresh->setMinimumHeight(wwal::studio::tokens::kTouchTargetMinPx);
         connect(btnRefresh, &QPushButton::clicked, this, [this]() {
             if (m_canvas) {
                 m_canvas->refreshFromWayland();
@@ -105,7 +111,7 @@ class MonitorTopologyBar : public QWidget {
         auto *btnSpan = new QPushButton(QStringLiteral("Span"), controlsBox);
         btnSpan->setAccessibleName(QStringLiteral("Span displays"));
         btnSpan->setCheckable(true);
-        btnSpan->setMinimumHeight(26);
+        btnSpan->setMinimumHeight(wwal::studio::tokens::kTouchTargetMinPx);
         btnSpan->setToolTip(QStringLiteral("Span wallpaper across all displays"));
         topBtnRow->addWidget(btnSpan, 1);
         ctrlLayout->addLayout(topBtnRow);
@@ -114,12 +120,13 @@ class MonitorTopologyBar : public QWidget {
         scaleRow->setContentsMargins(0, 0, 0, 0);
         scaleRow->setSpacing(8);
         auto *scaleLbl = new QLabel(QStringLiteral("Scale"), controlsBox);
-        scaleLbl->setStyleSheet(QStringLiteral("color: #cbd5e1; font-size: 11px;"));
+        scaleLbl->setObjectName(QStringLiteral("StudioMutedLabel"));
+        wwal::studio::tokens::applySecondaryTextRole(scaleLbl, QColor(0xcb, 0xd5, 0xe1));
         scaleRow->addWidget(scaleLbl);
 
         auto *comboScaling = new QComboBox(controlsBox);
         comboScaling->setAccessibleName(QStringLiteral("Wallpaper scaling mode"));
-        comboScaling->setMinimumHeight(26);
+        comboScaling->setMinimumHeight(wwal::studio::tokens::kTouchTargetMinPx);
         comboScaling->addItem(QStringLiteral("Fill"), static_cast<int>(WAYWAL_SCALING_FILL));
         comboScaling->addItem(QStringLiteral("Fit"), static_cast<int>(WAYWAL_SCALING_FIT));
         comboScaling->addItem(QStringLiteral("Stretch"), static_cast<int>(WAYWAL_SCALING_STRETCH));
@@ -266,6 +273,8 @@ class MonitorTopologyBar : public QWidget {
 #include <QSet>
 #include <algorithm>
 #include <array>
+#include <limits>
+#include <unordered_set>
 
 namespace waywal::studio {
 
@@ -313,12 +322,13 @@ void composeBoneLocalMat4(const float pos[3], const float angle[3], const float 
     out[15] = 1.0f;
 }
 
-std::vector<std::array<float, 16>>
-resolveBoneWorldMatrices(const std::vector<we_mdl_bone_t> &bones,
-                         const std::vector<std::array<float, 16>> &localMats)
+void resolveBoneWorldMatricesInto(const std::vector<we_mdl_bone_t> &bones,
+                                  const std::vector<std::array<float, 16>> &localMats,
+                                  std::vector<std::array<float, 16>> &worldMats,
+                                  std::vector<uint8_t> &visitState, std::vector<size_t> &stack)
 {
     const size_t boneCount = std::min(bones.size(), localMats.size());
-    std::vector<std::array<float, 16>> worldMats(boneCount);
+    worldMats.resize(boneCount);
     auto mulColMajor = [](const float *a, const float *b, float *out) {
         for (int col = 0; col < 4; ++col) {
             for (int row = 0; row < 4; ++row) {
@@ -329,8 +339,7 @@ resolveBoneWorldMatrices(const std::vector<we_mdl_bone_t> &bones,
         }
     };
 
-    std::vector<uint8_t> visitState(boneCount, 0u);
-    std::vector<size_t> stack;
+    visitState.assign(boneCount, 0u);
     stack.reserve(boneCount);
     for (size_t i = 0; i < boneCount; ++i) {
         if (visitState[i] == 2u) {
@@ -359,7 +368,152 @@ resolveBoneWorldMatrices(const std::vector<we_mdl_bone_t> &bones,
             visitState[idx] = 2u;
         }
     }
+}
+
+std::vector<std::array<float, 16>>
+resolveBoneWorldMatrices(const std::vector<we_mdl_bone_t> &bones,
+                         const std::vector<std::array<float, 16>> &localMats)
+{
+    std::vector<std::array<float, 16>> worldMats;
+    std::vector<uint8_t> visitState;
+    std::vector<size_t> stack;
+    resolveBoneWorldMatricesInto(bones, localMats, worldMats, visitState, stack);
     return worldMats;
+}
+
+[[nodiscard]] we_scene_node_kind_t parseSceneNodeKindJson(const QJsonValue &val)
+{
+    if (val.isDouble()) {
+        const int raw = val.toInt(0);
+        if (raw >= 0 && raw <= static_cast<int>(WE_NODE_CAMERA3D)) {
+            return static_cast<we_scene_node_kind_t>(raw);
+        }
+    }
+    const QString s = val.toString().trimmed().toLower();
+    if (s.contains(QStringLiteral("particle"))) {
+        return WE_NODE_PARTICLE;
+    }
+    if (s.contains(QStringLiteral("sound")) || s.contains(QStringLiteral("audio"))) {
+        return WE_NODE_SOUND;
+    }
+    if (s.contains(QStringLiteral("text"))) {
+        return WE_NODE_TEXT;
+    }
+    if (s.contains(QStringLiteral("light"))) {
+        return WE_NODE_LIGHT;
+    }
+    if (s.contains(QStringLiteral("camera"))) {
+        return WE_NODE_CAMERA3D;
+    }
+    return WE_NODE_IMAGE;
+}
+
+[[nodiscard]] std::vector<SceneLayerNode> parseSceneLayerNodesJson(const QString &sceneTreeJson)
+{
+    std::vector<SceneLayerNode> parsedNodes;
+    const QJsonDocument doc = QJsonDocument::fromJson(sceneTreeJson.toUtf8());
+    QJsonArray arr;
+    if (doc.isArray()) {
+        arr = doc.array();
+    } else if (doc.isObject()) {
+        const QJsonObject root = doc.object();
+        if (root.contains(QStringLiteral("objects"))) {
+            arr = root.value(QStringLiteral("objects")).toArray();
+        } else if (root.contains(QStringLiteral("layers"))) {
+            arr = root.value(QStringLiteral("layers")).toArray();
+        } else if (root.contains(QStringLiteral("nodes"))) {
+            arr = root.value(QStringLiteral("nodes")).toArray();
+        }
+    }
+    std::unordered_set<int32_t> explicitIds;
+    for (const QJsonValue &entry : arr) {
+        if (!entry.isObject()) {
+            continue;
+        }
+        const int rawId = entry.toObject().value(QStringLiteral("id")).toInt(-1);
+        if (rawId >= 0) {
+            explicitIds.insert(rawId);
+        }
+    }
+    std::unordered_set<int32_t> assignedIds;
+    int32_t nextFallbackId = 0;
+    parsedNodes.reserve(static_cast<size_t>(arr.size()));
+    uint32_t fallbackZ = 0u;
+    for (const QJsonValue &entry : arr) {
+        if (!entry.isObject()) {
+            continue;
+        }
+        const QJsonObject obj = entry.toObject();
+        SceneLayerNode node;
+        const int rawId = obj.value(QStringLiteral("id")).toInt(-1);
+        if (rawId >= 0 && !assignedIds.contains(rawId)) {
+            node.id = rawId;
+        } else {
+            while (explicitIds.contains(nextFallbackId) || assignedIds.contains(nextFallbackId)) {
+                ++nextFallbackId;
+            }
+            node.id = nextFallbackId++;
+        }
+        assignedIds.insert(node.id);
+        node.parentId = obj.contains(QStringLiteral("parentId"))
+                            ? obj.value(QStringLiteral("parentId")).toInt(-1)
+                            : obj.value(QStringLiteral("parent_id")).toInt(-1);
+        const int zRaw =
+            obj.contains(QStringLiteral("zOrderIndex"))
+                ? obj.value(QStringLiteral("zOrderIndex")).toInt(static_cast<int>(fallbackZ))
+                : obj.value(QStringLiteral("z_order")).toInt(static_cast<int>(fallbackZ));
+        node.zOrderIndex = static_cast<uint32_t>(std::max(0, zRaw));
+        node.kind = obj.contains(QStringLiteral("kind"))
+                        ? parseSceneNodeKindJson(obj.value(QStringLiteral("kind")))
+                        : parseSceneNodeKindJson(obj.value(QStringLiteral("type")));
+        node.visible = obj.value(QStringLiteral("visible")).toBool(true);
+        node.locked = obj.value(QStringLiteral("locked")).toBool(false);
+        node.name = obj.value(QStringLiteral("name")).toString();
+        parsedNodes.push_back(std::move(node));
+        ++fallbackZ;
+    }
+    return parsedNodes;
+}
+
+[[nodiscard]] uint32_t resolveActivePropertyComponentIndex(const PropertyRowWidget *row,
+                                                           float baseline)
+{
+    if (!row) {
+        return 0u;
+    }
+    const auto spinBoxes = row->findChildren<QDoubleSpinBox *>();
+    for (int i = 0; i < spinBoxes.size(); ++i) {
+        if (spinBoxes[i] && spinBoxes[i]->hasFocus()) {
+            return static_cast<uint32_t>(i);
+        }
+    }
+    const auto sliders = row->findChildren<QSlider *>();
+    for (int i = 0; i < sliders.size(); ++i) {
+        if (sliders[i] && sliders[i]->hasFocus()) {
+            return static_cast<uint32_t>(i);
+        }
+    }
+    const auto &vals = row->property().currentValues;
+    uint32_t bestIdx = 0u;
+    float bestDiff = std::numeric_limits<float>::max();
+    for (size_t i = 0; i < vals.size(); ++i) {
+        const float diff = std::fabs(vals[i] - baseline);
+        if (diff < bestDiff) {
+            bestDiff = diff;
+            bestIdx = static_cast<uint32_t>(i);
+        }
+    }
+    return bestIdx;
+}
+
+template <typename PanelT>
+PanelT *ensureLazyPanel(const QPointer<PanelT> &member, const char *panelId,
+                        DockLayoutManager *layoutMgr)
+{
+    if (!member && layoutMgr) {
+        layoutMgr->realizeLazyPanel(QLatin1String(panelId));
+    }
+    return member.data();
 }
 
 QString resolveLocalWwpkgFile(const QString &packageIdOrPath,
@@ -751,9 +905,9 @@ MainWindow::MainWindow(const StudioOptions &options, QWidget *parent)
         m_layoutManager->resetToDefaultPerspective();
     }
 
-    // 11. Scan wallpaper catalog asynchronously in interactive mode
+    // Defer directory scanning past the initial paint frame so startup latency stays bounded.
     if (!m_options.headlessCheck && !m_options.benchmarkGrid && m_gridWidget) {
-        QTimer::singleShot(0, this, [this]() {
+        QTimer::singleShot(120, this, [this]() {
             if (m_gridWidget) {
                 auto &idx = m_gridWidget->catalogIndex();
                 (void)idx.loadConfigFromFile();
@@ -920,32 +1074,73 @@ VirtualizedGridWidget *MainWindow::gridWidget() const { return m_gridWidget; }
 GpuPreviewViewport *MainWindow::previewViewport() const { return m_previewViewport; }
 CubicBezierEditorWidget *MainWindow::bezierEditor() const { return m_bezierEditor; }
 PropertyInspectorWidget *MainWindow::propertyInspector() const { return m_propertyInspector; }
-ThemeStudioWidget *MainWindow::themeStudio() const { return m_themeStudio; }
+ThemeStudioWidget *MainWindow::themeStudio() const
+{
+    return ensureLazyPanel(m_themeStudio, "ThemeStudioWidget", m_layoutManager);
+}
 StudioFooterBar *MainWindow::footerBar() const { return m_footerBar; }
-WorkshopBrowserWidget *MainWindow::workshopBrowser() const { return m_workshopBrowser; }
-OpenHubBrowserWidget *MainWindow::openHubBrowser() const { return m_openHubBrowser; }
-NodeGraphEditorWidget *MainWindow::nodeGraphEditor() const { return m_nodeGraphEditor; }
+WorkshopBrowserWidget *MainWindow::workshopBrowser() const
+{
+    return ensureLazyPanel(m_workshopBrowser, "WorkshopBrowser", m_layoutManager);
+}
+OpenHubBrowserWidget *MainWindow::openHubBrowser() const
+{
+    return ensureLazyPanel(m_openHubBrowser, "OpenHubBrowser", m_layoutManager);
+}
+NodeGraphEditorWidget *MainWindow::nodeGraphEditor() const
+{
+    return ensureLazyPanel(m_nodeGraphEditor, "NodeGraphEditorWidget", m_layoutManager);
+}
 EffectLibraryBrowserWidget *MainWindow::effectLibraryBrowser() const
 {
-    return m_effectLibraryBrowser;
+    return ensureLazyPanel(m_effectLibraryBrowser, "EffectLibraryBrowserWidget", m_layoutManager);
 }
 CameraLightingInspectorWidget *MainWindow::cameraLightingInspector() const
 {
-    return m_cameraLightingInspector;
+    return ensureLazyPanel(m_cameraLightingInspector, "CameraLightingInspectorWidget",
+                           m_layoutManager);
 }
 PhysicsSpringInspectorWidget *MainWindow::physicsSpringInspector() const
 {
-    return m_physicsSpringInspector;
+    return ensureLazyPanel(m_physicsSpringInspector, "PhysicsSpringInspectorWidget",
+                           m_layoutManager);
 }
-SceneLayerTreeWidget *MainWindow::sceneLayerTree() const { return m_sceneLayerTree; }
-GpuBrushPainterWidget *MainWindow::brushPainter() const { return m_brushPainter; }
-ParticleDesignerWidget *MainWindow::particleDesigner() const { return m_particleDesigner; }
-AudioBindingWizard *MainWindow::audioBindingWizard() const { return m_audioBindingWizard; }
-GlslSceneScriptEditorWidget *MainWindow::codeEditor() const { return m_codeEditor; }
-PuppetMeshPanel *MainWindow::puppetMeshPanel() const { return m_puppetMeshPanel; }
-BoneRiggingPanel *MainWindow::boneRiggingPanel() const { return m_boneRiggingPanel; }
-WeightPaintPanel *MainWindow::weightPaintPanel() const { return m_weightPaintPanel; }
-DopeSheetTimelineWidget *MainWindow::dopeSheetTimeline() const { return m_dopeSheetTimeline; }
+SceneLayerTreeWidget *MainWindow::sceneLayerTree() const
+{
+    return ensureLazyPanel(m_sceneLayerTree, "SceneLayerTree", m_layoutManager);
+}
+GpuBrushPainterWidget *MainWindow::brushPainter() const
+{
+    return ensureLazyPanel(m_brushPainter, "GpuBrushPainter", m_layoutManager);
+}
+ParticleDesignerWidget *MainWindow::particleDesigner() const
+{
+    return ensureLazyPanel(m_particleDesigner, "ParticleDesigner", m_layoutManager);
+}
+AudioBindingWizard *MainWindow::audioBindingWizard() const
+{
+    return ensureLazyPanel(m_audioBindingWizard, "AudioBindingWizard", m_layoutManager);
+}
+GlslSceneScriptEditorWidget *MainWindow::codeEditor() const
+{
+    return ensureLazyPanel(m_codeEditor, "GlslSceneScriptEditor", m_layoutManager);
+}
+PuppetMeshPanel *MainWindow::puppetMeshPanel() const
+{
+    return ensureLazyPanel(m_puppetMeshPanel, "PuppetMeshPanel", m_layoutManager);
+}
+BoneRiggingPanel *MainWindow::boneRiggingPanel() const
+{
+    return ensureLazyPanel(m_boneRiggingPanel, "BoneRiggingPanel", m_layoutManager);
+}
+WeightPaintPanel *MainWindow::weightPaintPanel() const
+{
+    return ensureLazyPanel(m_weightPaintPanel, "WeightPaintPanel", m_layoutManager);
+}
+DopeSheetTimelineWidget *MainWindow::dopeSheetTimeline() const
+{
+    return ensureLazyPanel(m_dopeSheetTimeline, "DopeSheetTimelineWidget", m_layoutManager);
+}
 
 void MainWindow::setupPanels()
 {
@@ -959,24 +1154,34 @@ void MainWindow::setupPanels()
     const auto dlMgr = m_session ? m_session->downloadManager()
                                  : std::shared_ptr<DownloadManager>();
 
-    // Panel 2 (Left Dock Tab 1): Virtualized Wallpaper Grid
+    // Panel 2 (Left Dock Tab 1): Virtualized Wallpaper Grid (eager core panel)
     m_gridWidget = new VirtualizedGridWidget(this);
     m_layoutManager->registerPanel(QStringLiteral("Wallpapers"), m_gridWidget,
                                    QStringLiteral("Library"), Qt::LeftDockWidgetArea);
 
-    // Panel 2 (Left Dock Tab 2): Steam Workshop Browser
-    m_workshopBrowser = new WorkshopBrowserWidget(catalogMgr, dlMgr, this);
-    m_layoutManager->registerPanel(QStringLiteral("WorkshopBrowser"), m_workshopBrowser,
-                                   QStringLiteral("Workshop"), Qt::LeftDockWidgetArea);
+    m_layoutManager->registerLazyPanel(
+        QStringLiteral("WorkshopBrowser"), QStringLiteral("Workshop"),
+        [this, catalogMgr, dlMgr](QWidget *parent) -> QWidget * {
+            auto *ws = new WorkshopBrowserWidget(catalogMgr, dlMgr, parent);
+            m_workshopBrowser = ws;
+            wireWorkshopBrowserSignals(ws);
+            return ws;
+        },
+        Qt::LeftDockWidgetArea);
 
-    // Panel 2 (Left Dock Tab 3): Open Hub Browser
-    m_openHubBrowser = new OpenHubBrowserWidget(dlMgr, this);
-    m_layoutManager->registerPanel(QStringLiteral("OpenHubBrowser"), m_openHubBrowser,
-                                   QStringLiteral("Open Hub"), Qt::LeftDockWidgetArea);
+    m_layoutManager->registerLazyPanel(
+        QStringLiteral("OpenHubBrowser"), QStringLiteral("Open Hub"),
+        [this, dlMgr](QWidget *parent) -> QWidget * {
+            auto *hub = new OpenHubBrowserWidget(dlMgr, parent);
+            m_openHubBrowser = hub;
+            wireOpenHubBrowserSignals(hub);
+            return hub;
+        },
+        Qt::LeftDockWidgetArea);
 
-    // Panel 3 (Center Dock Top): GPU Preview Viewport
+    // Panel 3 (Center Dock Top): GPU Preview Viewport (eager core panel)
     // Always avoid parenting QOpenGLWidget directly under a dock in headless offscreen mode
-    // across every Qt 6 release, keeping previewViewport() non-null for tests (AUD-184).
+    // across every Qt 6 release, keeping previewViewport() non-null for tests.
     if (QGuiApplication::platformName() == QLatin1String("offscreen")) {
         m_previewViewport = new GpuPreviewViewport(nullptr);
         m_previewViewport->setCommandBus(commandBus());
@@ -991,13 +1196,18 @@ void MainWindow::setupPanels()
                                        QStringLiteral("Preview"), Qt::RightDockWidgetArea);
     }
 
-    // Panel 4 (Center Dock Bottom): Transition Cubic Bezier Editor
+    // Panel 4 (Center Dock Bottom): Transition Cubic Bezier Editor (eager core panel)
     m_bezierEditor = new CubicBezierEditorWidget(this);
     m_bezierEditor->setCommandBus(commandBus());
+    for (QPushButton *btn : m_bezierEditor->findChildren<QPushButton *>()) {
+        if (btn && btn->maximumHeight() > 0 && btn->maximumHeight() < 22) {
+            btn->setFixedHeight(22);
+        }
+    }
     m_layoutManager->registerPanel(QStringLiteral("CubicBezier"), m_bezierEditor,
                                    QStringLiteral("Transitions"), Qt::RightDockWidgetArea);
 
-    // Panel 5 (Right Dock Tab 1): Live Scene & Shader Inspector
+    // Panel 5 (Right Dock Tab 1): Live Scene & Shader Inspector (eager core panel)
     m_propertyInspector = new PropertyInspectorWidget(this);
     m_propertyInspector->setCommandBus(commandBus());
     m_propertyInspector->setIpcClient(ipcClient());
@@ -1005,46 +1215,97 @@ void MainWindow::setupPanels()
     m_layoutManager->registerPanel(QStringLiteral("PropertyInspectorWidget"), m_propertyInspector,
                                    QStringLiteral("Inspector"), Qt::RightDockWidgetArea);
 
-    // Panel 5 (Right Dock Tab 2): Material You Theme Studio
-    m_themeStudio = new ThemeStudioWidget(this);
-    m_layoutManager->registerPanel(QStringLiteral("ThemeStudioWidget"), m_themeStudio,
-                                   QStringLiteral("Theme"), Qt::RightDockWidgetArea);
+    m_layoutManager->registerLazyPanel(
+        QStringLiteral("ThemeStudioWidget"), QStringLiteral("Theme"),
+        [this](QWidget *parent) -> QWidget * {
+            auto *theme = new ThemeStudioWidget(parent);
+            m_themeStudio = theme;
+            wireThemeStudioSignals(theme);
+            if (!m_activeWallpaperPath.isEmpty()) {
+                if (m_previewViewport && !m_previewViewport->previewImage().isNull() &&
+                    !m_activeWallpaperPath.endsWith(QStringLiteral(".glsl"), Qt::CaseInsensitive)) {
+                    theme->setWallpaperImage(m_previewViewport->previewImage(),
+                                             m_activeWallpaperPath);
+                } else {
+                    theme->loadWallpaper(m_activeWallpaperPath);
+                }
+            }
+            return theme;
+        },
+        Qt::RightDockWidgetArea);
 
-    m_nodeGraphEditor = new NodeGraphEditorWidget(this);
-    m_nodeGraphEditor->setCommandBus(commandBus());
-    m_nodeGraphEditor->setIpcClient(ipcClient());
-    m_layoutManager->registerPanel(QStringLiteral("NodeGraphEditorWidget"), m_nodeGraphEditor,
-                                   QStringLiteral("Shader Graph"), Qt::RightDockWidgetArea);
+    m_layoutManager->registerLazyPanel(
+        QStringLiteral("NodeGraphEditorWidget"), QStringLiteral("Shader Graph"),
+        [this](QWidget *parent) -> QWidget * {
+            auto *graph = new NodeGraphEditorWidget(parent);
+            graph->setCommandBus(commandBus());
+            graph->setIpcClient(ipcClient());
+            graph->setTargetOutput(resolveSelectedOutputsCsv());
+            m_nodeGraphEditor = graph;
+            wireNodeGraphEditorSignals(graph);
+            return graph;
+        },
+        Qt::RightDockWidgetArea);
 
-    m_effectLibraryBrowser = new EffectLibraryBrowserWidget(this);
-    m_layoutManager->registerPanel(QStringLiteral("EffectLibraryBrowserWidget"),
-                                   m_effectLibraryBrowser, QStringLiteral("Effect Library"),
-                                   Qt::LeftDockWidgetArea);
+    m_layoutManager->registerLazyPanel(
+        QStringLiteral("EffectLibraryBrowserWidget"), QStringLiteral("Effect Library"),
+        [this](QWidget *parent) -> QWidget * {
+            auto *browser = new EffectLibraryBrowserWidget(parent);
+            m_effectLibraryBrowser = browser;
+            wireEffectLibrarySignals(browser);
+            return browser;
+        },
+        Qt::LeftDockWidgetArea);
 
-    m_cameraLightingInspector = new CameraLightingInspectorWidget(this);
-    m_cameraLightingInspector->setCommandBus(commandBus());
-    m_cameraLightingInspector->setIpcClient(ipcClient());
-    if (m_previewViewport) {
-        m_previewViewport->setGizmoCameraAndLights(m_cameraLightingInspector->camera(),
-                                                   m_cameraLightingInspector->lighting());
-    }
-    m_layoutManager->registerPanel(QStringLiteral("CameraLightingInspectorWidget"),
-                                   m_cameraLightingInspector, QStringLiteral("Camera & Lights"),
-                                   Qt::RightDockWidgetArea);
+    m_layoutManager->registerLazyPanel(
+        QStringLiteral("CameraLightingInspectorWidget"), QStringLiteral("Camera & Lights"),
+        [this](QWidget *parent) -> QWidget * {
+            auto *camLights = new CameraLightingInspectorWidget(parent);
+            camLights->setCommandBus(commandBus());
+            camLights->setIpcClient(ipcClient());
+            camLights->setTargetOutput(resolveSelectedOutputsCsv());
+            if (m_previewViewport) {
+                m_previewViewport->setGizmoCameraAndLights(camLights->camera(),
+                                                           camLights->lighting());
+            }
+            m_cameraLightingInspector = camLights;
+            wireCameraLightingSignals(camLights);
+            return camLights;
+        },
+        Qt::RightDockWidgetArea);
 
-    m_physicsSpringInspector = new PhysicsSpringInspectorWidget(this);
-    m_physicsSpringInspector->setCommandBus(commandBus());
-    m_physicsSpringInspector->setIpcClient(ipcClient());
-    m_layoutManager->registerPanel(QStringLiteral("PhysicsSpringInspectorWidget"),
-                                   m_physicsSpringInspector, QStringLiteral("Puppet Physics"),
-                                   Qt::RightDockWidgetArea);
+    m_layoutManager->registerLazyPanel(
+        QStringLiteral("PhysicsSpringInspectorWidget"), QStringLiteral("Puppet Physics"),
+        [this](QWidget *parent) -> QWidget * {
+            auto *phys = new PhysicsSpringInspectorWidget(parent);
+            phys->setCommandBus(commandBus());
+            phys->setIpcClient(ipcClient());
+            phys->setTargetOutput(resolveSelectedOutputsCsv());
+            m_physicsSpringInspector = phys;
+            wirePhysicsSpringSignals(phys);
+            if (m_hasCachedPuppetRig) {
+                const QScopedValueRollback<bool> guard(m_syncingBoneDriveMode, true);
+                std::vector<QString> names;
+                std::vector<int32_t> parents;
+                buildBoneNamesAndParents(m_cachedPuppetRig.bones, names, parents);
+                we_puppet_t physPuppet{};
+                std::vector<we_mdl_bone_t> physBones = m_cachedPuppetRig.bones;
+                physPuppet.bone_count = static_cast<uint32_t>(physBones.size());
+                physPuppet.bones = physBones.empty() ? nullptr : physBones.data();
+                phys->loadPuppetSkeleton(&physPuppet, m_cachedPuppetRig.objectId);
+                phys->setBoneList(names, parents, m_cachedPuppetRig.objectId);
+                phys->setBoneDriveModes(m_cachedPuppetRig.driveModes);
+            }
+            return phys;
+        },
+        Qt::RightDockWidgetArea);
 
     // Panel 6 (Bottom Footer): Audio FFT Spectrum, Power Governor & Telemetry HUD
     m_footerBar = new StudioFooterBar(this);
     m_layoutManager->registerPanel(QStringLiteral("StudioFooterBar"), m_footerBar,
                                    QStringLiteral("Telemetry"), Qt::BottomDockWidgetArea);
 
-    // Register authoring panels lazily so startup RssAnon stays within the 80 MB budget.
+    // Register secondary authoring panels lazily to bound initial footprint and startup time.
     m_layoutManager->registerLazyPanel(
         QStringLiteral("SceneLayerTree"), QStringLiteral("Scene Hierarchy"),
         [this](QWidget *parent) -> QWidget * {
@@ -1138,12 +1399,17 @@ void MainWindow::setupPanels()
                             }
                         }
                     });
+            connect(tree, &SceneLayerTreeWidget::layerMutated, this,
+                    [this](int32_t) { syncCachedSceneLayersToAudioWizard(); });
             connect(tree, &SceneLayerTreeWidget::statusMessage, this, [this](const QString &msg) {
                 if (m_statusLabel) {
                     m_statusLabel->setText(msg);
                 }
             });
             m_sceneLayerTree = tree;
+            if (!m_lastSceneTreeJson.isEmpty()) {
+                syncCachedSceneLayersToAudioWizard();
+            }
             return tree;
         },
         Qt::LeftDockWidgetArea);
@@ -1248,8 +1514,22 @@ void MainWindow::setupPanels()
             wiz->setCommandBus(commandBus());
             wiz->setIpcClient(ipcClient());
             wiz->setTargetOutput(resolveSelectedOutputsCsv());
+            if (m_sceneLayerTree) {
+                if (auto *model = m_sceneLayerTree->findChild<SceneLayerTreeModel *>()) {
+                    m_cachedSceneLayers = model->nodes();
+                }
+            } else if (m_cachedSceneLayers.empty() && !m_lastSceneTreeJson.isEmpty()) {
+                m_cachedSceneLayers = parseSceneLayerNodesJson(m_lastSceneTreeJson);
+            }
+            if (!m_cachedSceneLayers.empty()) {
+                wiz->setSceneLayers(m_cachedSceneLayers);
+            }
+            if (!m_cachedAudioBindings.empty()) {
+                wiz->setActiveBindings(m_cachedAudioBindings);
+            }
             connect(wiz, &AudioBindingWizard::bindingsUpdated, this,
                     [this](const std::vector<we_audio_binding_t> &bindings) {
+                        m_cachedAudioBindings = bindings;
                         if (!m_propertyInspector) {
                             return;
                         }
@@ -2067,14 +2347,14 @@ void MainWindow::setupToolBar()
 
     // Workspace Selector
     auto *perspLabel = new QLabel(QStringLiteral("Workspace"), this);
-    perspLabel->setStyleSheet(
-        QStringLiteral("color: #94a3b8; font-size: 11px; font-weight: 500; padding-left: 4px;"));
+    perspLabel->setObjectName(QStringLiteral("StudioToolbarLabel"));
+    wwal::studio::tokens::applySecondaryTextRole(perspLabel);
     toolbar->addWidget(perspLabel);
 
     m_perspectiveCombo = new QComboBox(this);
     m_perspectiveCombo->setObjectName(QStringLiteral("PerspectiveComboBox"));
     m_perspectiveCombo->setFixedWidth(148);
-    m_perspectiveCombo->setFixedHeight(28);
+    m_perspectiveCombo->setFixedHeight(wwal::studio::tokens::kTouchTargetMinPx);
     m_perspectiveCombo->addItems({QStringLiteral("Default"), QStringLiteral("Shader Coding"),
                                   QStringLiteral("Scene Composer"),
                                   QStringLiteral("Particle & Audio"),
@@ -2090,14 +2370,14 @@ void MainWindow::setupToolBar()
     toolbar->addSeparator();
 
     auto *toolLabel = new QLabel(QStringLiteral("Tool"), this);
-    toolLabel->setStyleSheet(
-        QStringLiteral("color: #94a3b8; font-size: 11px; font-weight: 500; padding-left: 4px;"));
+    toolLabel->setObjectName(QStringLiteral("StudioToolbarLabel"));
+    wwal::studio::tokens::applySecondaryTextRole(toolLabel);
     toolbar->addWidget(toolLabel);
 
     m_toolModeCombo = new QComboBox(this);
     m_toolModeCombo->setObjectName(QStringLiteral("ViewportToolModeCombo"));
     m_toolModeCombo->setFixedWidth(136);
-    m_toolModeCombo->setFixedHeight(28);
+    m_toolModeCombo->setFixedHeight(wwal::studio::tokens::kTouchTargetMinPx);
     m_toolModeCombo->addItems(
         {QStringLiteral("Navigate"), QStringLiteral("Select"), QStringLiteral("Translate"),
          QStringLiteral("Rotate"), QStringLiteral("Scale"), QStringLiteral("Brush: Mask"),
@@ -2116,14 +2396,14 @@ void MainWindow::setupToolBar()
     m_pauseBtn->setCheckable(true);
     m_pauseBtn->setChecked(false);
     m_pauseBtn->setToolTip(QStringLiteral("Pause or resume preview playback (Space)"));
-    m_pauseBtn->setFixedHeight(28);
+    m_pauseBtn->setFixedHeight(wwal::studio::tokens::kTouchTargetMinPx);
     connect(m_pauseBtn, &QPushButton::clicked, this, &MainWindow::handlePlayPauseToggle);
     toolbar->addWidget(m_pauseBtn);
 
     // Fullscreen Preview button
     auto *btnFullscreen = new QPushButton(QStringLiteral("Fullscreen"), this);
     btnFullscreen->setToolTip(QStringLiteral("Toggle fullscreen window (F11)"));
-    btnFullscreen->setFixedHeight(28);
+    btnFullscreen->setFixedHeight(wwal::studio::tokens::kTouchTargetMinPx);
     connect(btnFullscreen, &QPushButton::clicked, this, &MainWindow::handleFullscreenToggle);
     toolbar->addWidget(btnFullscreen);
 
@@ -2131,7 +2411,7 @@ void MainWindow::setupToolBar()
     auto *btnWizard = new QPushButton(QStringLiteral("Package..."), this);
     btnWizard->setToolTip(
         QStringLiteral("Create a signed .wwpkg wallpaper package (Ctrl+Shift+P)"));
-    btnWizard->setFixedHeight(28);
+    btnWizard->setFixedHeight(wwal::studio::tokens::kTouchTargetMinPx);
     connect(btnWizard, &QPushButton::clicked, this, &MainWindow::handleOpenPackagingWizard);
     toolbar->addWidget(btnWizard);
 
@@ -2143,8 +2423,7 @@ void MainWindow::setupToolBar()
     // Status label
     m_statusLabel = new QLabel(QStringLiteral("Ready"), this);
     m_statusLabel->setObjectName(QStringLiteral("studioStatusLabel"));
-    m_statusLabel->setStyleSheet(
-        QStringLiteral("color: #cbd5e1; font-size: 11px; padding-right: 8px;"));
+    wwal::studio::tokens::applySecondaryTextRole(m_statusLabel, QColor(0xcb, 0xd5, 0xe1));
     toolbar->addWidget(m_statusLabel);
 }
 
@@ -2157,183 +2436,276 @@ void MainWindow::setupShortcuts()
 
 void MainWindow::applyProStudioDarkTheme()
 {
-    // 1. Unified Dark Studio Palette
-    QPalette palette;
-    palette.setColor(QPalette::Window, QColor(0x12, 0x14, 0x1a));
-    palette.setColor(QPalette::WindowText, QColor(0xf1, 0xf5, 0xf9));
-    palette.setColor(QPalette::Base, QColor(0x18, 0x1b, 0x22));
-    palette.setColor(QPalette::AlternateBase, QColor(0x20, 0x24, 0x2e));
-    palette.setColor(QPalette::ToolTipBase, QColor(0x18, 0x1b, 0x22));
-    palette.setColor(QPalette::ToolTipText, QColor(0xf1, 0xf5, 0xf9));
-    palette.setColor(QPalette::Text, QColor(0xf1, 0xf5, 0xf9));
-    palette.setColor(QPalette::Button, QColor(0x20, 0x24, 0x2e));
-    palette.setColor(QPalette::ButtonText, QColor(0xf1, 0xf5, 0xf9));
-    palette.setColor(QPalette::BrightText, QColor(0xff, 0xff, 0xff));
-    palette.setColor(QPalette::Highlight, QColor(0x02, 0x84, 0xc7));
-    palette.setColor(QPalette::HighlightedText, QColor(0xff, 0xff, 0xff));
-    palette.setColor(QPalette::Disabled, QPalette::Text, QColor(0x94, 0xa3, 0xb8));
-    palette.setColor(QPalette::Disabled, QPalette::ButtonText, QColor(0x94, 0xa3, 0xb8));
-    QApplication::setPalette(palette);
+    QFont appFont = QApplication::font();
+    appFont.setPixelSize(wwal::studio::tokens::kFontSizeBasePx);
+    QApplication::setFont(appFont);
+    if (!dynamic_cast<const wwal::studio::tokens::StudioProxyStyle *>(QApplication::style())) {
+        QApplication::setStyle(new wwal::studio::tokens::StudioProxyStyle());
+    }
+    QApplication::setPalette(wwal::studio::tokens::buildProStudioPalette());
+}
 
-    // 2. Unified Studio Stylesheet
-    setStyleSheet(
-        QStringLiteral("QMainWindow {"
-                       "  background: #12141a;"
-                       "}"
-                       "QWidget {"
-                       "  color: #f1f5f9;"
-                       "  font-family: 'Inter', 'Cantarell', 'Segoe UI', sans-serif;"
-                       "  font-size: 11px;"
-                       "}"
-                       "QMenuBar {"
-                       "  background: #14171f;"
-                       "  border-bottom: 1px solid #262b36;"
-                       "  padding: 2px 6px;"
-                       "}"
-                       "QMenuBar::item {"
-                       "  padding: 5px 10px;"
-                       "  background: transparent;"
-                       "  border-radius: 4px;"
-                       "}"
-                       "QMenuBar::item:selected {"
-                       "  background: #20242e;"
-                       "  color: #ffffff;"
-                       "}"
-                       "QMenu {"
-                       "  background: #181b22;"
-                       "  border: 1px solid #2c3240;"
-                       "  padding: 4px 0px;"
-                       "}"
-                       "QMenu::item {"
-                       "  padding: 6px 24px 6px 20px;"
-                       "}"
-                       "QMenu::item:selected {"
-                       "  background: #0284c7;"
-                       "  color: #ffffff;"
-                       "}"
-                       "QMenu::separator {"
-                       "  height: 1px;"
-                       "  background: #262b36;"
-                       "  margin: 4px 0px;"
-                       "}"
-                       "QToolBar {"
-                       "  background: #14171f;"
-                       "  border-bottom: 1px solid #262b36;"
-                       "  spacing: 10px;"
-                       "  padding: 5px 12px;"
-                       "}"
-                       "QTabBar::tab {"
-                       "  background: #14171f;"
-                       "  color: #cbd5e1;"
-                       "  padding: 6px 14px;"
-                       "  border: none;"
-                       "  border-top-left-radius: 4px;"
-                       "  border-top-right-radius: 4px;"
-                       "  margin-right: 4px;"
-                       "}"
-                       "QTabBar::tab:selected {"
-                       "  background: #20242e;"
-                       "  color: #f8fafc;"
-                       "  border-bottom: 2px solid #38bdf8;"
-                       "  font-weight: 600;"
-                       "}"
-                       "QTabBar::tab:hover:!selected {"
-                       "  background: #1b1f29;"
-                       "  color: #e2e8f0;"
-                       "}"
-                       "QTabBar::tab:focus {"
-                       "  outline: 2px solid #38bdf8;"
-                       "}"
-                       "QDockWidget {"
-                       "  titlebar-close-icon: none;"
-                       "  titlebar-normal-icon: none;"
-                       "  border: 1px solid #262b36;"
-                       "}"
-                       "QSplitter::handle {"
-                       "  background: #12141a;"
-                       "}"
-                       "QSplitter::handle:hover {"
-                       "  background: #0284c7;"
-                       "}"
-                       "QPushButton, QToolButton {"
-                       "  background: #20242e;"
-                       "  border: 1px solid #2e3545;"
-                       "  border-radius: 5px;"
-                       "  padding: 4px 12px;"
-                       "  min-height: 20px;"
-                       "  color: #e2e8f0;"
-                       "  font-weight: 500;"
-                       "}"
-                       "QPushButton:hover, QToolButton:hover {"
-                       "  background: #2a303d;"
-                       "  border-color: #38bdf8;"
-                       "  color: #ffffff;"
-                       "}"
-                       "QPushButton:focus, QToolButton:focus {"
-                       "  border: 2px solid #38bdf8;"
-                       "  outline: none;"
-                       "}"
-                       "QPushButton:pressed, QToolButton:pressed {"
-                       "  background: #161920;"
-                       "}"
-                       "QPushButton:checked {"
-                       "  background: #0284c7;"
-                       "  color: #ffffff;"
-                       "  font-weight: 600;"
-                       "  border-color: #38bdf8;"
-                       "}"
-                       "QCheckBox:focus, QRadioButton:focus {"
-                       "  outline: 1px solid #38bdf8;"
-                       "}"
-                       "QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {"
-                       "  background: #14171f;"
-                       "  border: 1px solid #2e3545;"
-                       "  border-radius: 5px;"
-                       "  padding: 4px 8px;"
-                       "  color: #f1f5f9;"
-                       "}"
-                       "QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {"
-                       "  border: 2px solid #38bdf8;"
-                       "}"
-                       "QScrollBar:vertical {"
-                       "  background: transparent;"
-                       "  width: 8px;"
-                       "  margin: 0px;"
-                       "}"
-                       "QScrollBar::handle:vertical {"
-                       "  background: #2e3545;"
-                       "  min-height: 24px;"
-                       "  border-radius: 4px;"
-                       "}"
-                       "QScrollBar::handle:vertical:hover {"
-                       "  background: #475569;"
-                       "}"
-                       "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {"
-                       "  height: 0px;"
-                       "}"
-                       "QSlider:focus {"
-                       "  border: 1px solid #38bdf8;"
-                       "  border-radius: 4px;"
-                       "}"
-                       "QSlider::groove:horizontal {"
-                       "  height: 4px;"
-                       "  background: #262b36;"
-                       "  border-radius: 2px;"
-                       "}"
-                       "QSlider::sub-page:horizontal {"
-                       "  background: #0284c7;"
-                       "  border-radius: 2px;"
-                       "}"
-                       "QSlider::handle:horizontal {"
-                       "  width: 12px;"
-                       "  margin: -4px 0;"
-                       "  background: #f8fafc;"
-                       "  border: 1px solid #0284c7;"
-                       "  border-radius: 6px;"
-                       "}"
-                       "QSlider::handle:horizontal:hover {"
-                       "  background: #38bdf8;"
-                       "}"));
+void MainWindow::syncCachedSceneLayersToAudioWizard()
+{
+    if (m_sceneLayerTree) {
+        if (auto *model = m_sceneLayerTree->findChild<SceneLayerTreeModel *>()) {
+            m_cachedSceneLayers = model->nodes();
+        }
+    } else if (m_cachedSceneLayers.empty() && !m_lastSceneTreeJson.isEmpty()) {
+        m_cachedSceneLayers = parseSceneLayerNodesJson(m_lastSceneTreeJson);
+    }
+    if (m_audioBindingWizard) {
+        m_audioBindingWizard->setSceneLayers(m_cachedSceneLayers);
+    }
+}
+
+void MainWindow::wireThemeStudioSignals(ThemeStudioWidget *theme)
+{
+    if (!theme) {
+        return;
+    }
+    connect(theme, &ThemeStudioWidget::paletteChanged, this,
+            [this](const waywal_palette_t &palette) {
+                if (m_statusLabel) {
+                    const QString hex =
+                        QStringLiteral("#%1")
+                            .arg(palette.source_color & 0x00FFFFFFu, 6, 16, QLatin1Char('0'))
+                            .toUpper();
+                    m_statusLabel->setText(QStringLiteral("Theme Palette: source %1 (seed #%2)")
+                                               .arg(hex)
+                                               .arg(palette.source_color_index));
+                }
+            });
+    connect(theme, &ThemeStudioWidget::modeChanged, this, [this](waywal_theme_mode_t mode) {
+        syncThemeStateToIpcOrActiveWallpaper(true);
+        if (m_statusLabel) {
+            m_statusLabel->setText(QStringLiteral("Theme Mode: %1")
+                                       .arg(mode == WAYWAL_THEME_LIGHT ? QStringLiteral("Light")
+                                                                       : QStringLiteral("Dark")));
+        }
+    });
+    connect(theme, &ThemeStudioWidget::variantChanged, this,
+            [this](waywal_scheme_variant_t variant) {
+                syncThemeStateToIpcOrActiveWallpaper(false);
+                if (m_statusLabel) {
+                    m_statusLabel->setText(
+                        QStringLiteral("Theme Variant: %1").arg(static_cast<int>(variant)));
+                }
+            });
+    connect(theme, &ThemeStudioWidget::contrastChanged, this, [this](float contrast) {
+        syncThemeStateToIpcOrActiveWallpaper(false);
+        if (m_statusLabel) {
+            m_statusLabel->setText(QStringLiteral("Theme Contrast: %1").arg(contrast, 0, 'f', 2));
+        }
+    });
+    connect(theme, &ThemeStudioWidget::seedIndexChanged, this, [this](uint8_t index) {
+        syncThemeStateToIpcOrActiveWallpaper(true);
+        if (m_statusLabel) {
+            m_statusLabel->setText(QStringLiteral("Theme Seed Index: %1").arg(index));
+        }
+    });
+    connect(theme, &ThemeStudioWidget::statusMessageRequested, this, [this](const QString &msg) {
+        if (m_statusLabel && !msg.isEmpty()) {
+            m_statusLabel->setText(msg);
+        }
+    });
+}
+
+void MainWindow::wireWorkshopBrowserSignals(WorkshopBrowserWidget *workshop)
+{
+    if (!workshop) {
+        return;
+    }
+    connect(workshop, &WorkshopBrowserWidget::wallpaperSelected, this,
+            [this](uint64_t /*id*/, const QString &filePath) {
+                applyWallpaperPath(filePath, resolveSelectedOutputsCsv());
+            });
+    connect(workshop, &WorkshopBrowserWidget::wallpaperApplyRequested, this,
+            [this](uint64_t publishedFileId, const QString &targetOutput) {
+                QString path;
+                if (auto *idxMgr = catalogIndexManager()) {
+                    if (const auto rec = idxMgr->getItem(publishedFileId); rec.has_value()) {
+                        path = QString::fromStdString(rec->file_path);
+                    }
+                }
+                if (path.isEmpty()) {
+                    if (m_statusLabel) {
+                        m_statusLabel->setText(
+                            QStringLiteral("Workshop item %1 is not downloaded locally yet")
+                                .arg(publishedFileId));
+                    }
+                    return;
+                }
+                const QString targetSpec = targetOutput.trimmed().isEmpty()
+                                               ? resolveSelectedOutputsCsv()
+                                               : normalizeTargetOutputSpec(targetOutput);
+                applyWallpaperPath(path, targetSpec);
+            });
+}
+
+void MainWindow::wireOpenHubBrowserSignals(OpenHubBrowserWidget *openHub)
+{
+    if (!openHub) {
+        return;
+    }
+    connect(openHub, &OpenHubBrowserWidget::packageSelected, this,
+            [this](const QString & /*pkgId*/, const QString &cid) {
+                if (m_statusLabel) {
+                    m_statusLabel->setText(QStringLiteral("Selected Hub Package: %1").arg(cid));
+                }
+            });
+    connect(openHub, &OpenHubBrowserWidget::packageInstallRequested, this,
+            [this](const QString &packageId, const QString &targetOutput) {
+                installPackageToDaemon(packageId, targetOutput);
+            });
+}
+
+void MainWindow::wireEffectLibrarySignals(EffectLibraryBrowserWidget *browser)
+{
+    if (!browser) {
+        return;
+    }
+    connect(browser, &EffectLibraryBrowserWidget::effectInsertIntoGraphRequested, this,
+            [this](we_builtin_effect_id_t effectId) {
+                if (!m_nodeGraphEditor && m_layoutManager) {
+                    m_layoutManager->realizeLazyPanel(QStringLiteral("NodeGraphEditor"));
+                }
+                if (m_nodeGraphEditor) {
+                    m_nodeGraphEditor->addBuiltinEffectNode(effectId, QPointF(100.0, 100.0));
+                }
+            });
+    connect(browser, &EffectLibraryBrowserWidget::effectInsertRequested, this,
+            [this](uint32_t /*effectId*/) {
+                if (m_layoutManager) {
+                    m_layoutManager->setPanelVisible(QStringLiteral("NodeGraphEditor"), true);
+                }
+            });
+    connect(browser, &EffectLibraryBrowserWidget::effectApplyToActiveSceneRequested, this,
+            [this](we_builtin_effect_id_t effectId) {
+                if (!m_nodeGraphEditor && m_layoutManager) {
+                    m_layoutManager->realizeLazyPanel(QStringLiteral("NodeGraphEditor"));
+                }
+                if (m_nodeGraphEditor) {
+                    m_nodeGraphEditor->addBuiltinEffectNode(effectId, QPointF(140.0, 140.0));
+                    m_nodeGraphEditor->compileAndHotSwapDaemon();
+                }
+            });
+    connect(
+        browser, &EffectLibraryBrowserWidget::effectAppendToStackRequested, this,
+        [this](uint32_t effectId) {
+            if (m_statusLabel) {
+                m_statusLabel->setText(
+                    QStringLiteral("Applied built-in effect #%1 to active scene").arg(effectId));
+            }
+        });
+    connect(browser, &EffectLibraryBrowserWidget::effectActivated, this,
+            [this](we_builtin_effect_id_t /*effectId*/, const QString &slug) {
+                if (m_statusLabel && !slug.isEmpty()) {
+                    m_statusLabel->setText(QStringLiteral("Effect: %1").arg(slug));
+                }
+            });
+}
+
+void MainWindow::wireNodeGraphEditorSignals(NodeGraphEditorWidget *graph)
+{
+    if (!graph) {
+        return;
+    }
+    connect(graph, qOverload<const QString &, uint32_t>(&NodeGraphEditorWidget::graphCompiled),
+            this, [this](const QString &glslCode, uint32_t /*activePassMask*/) {
+                if (glslCode.isEmpty()) {
+                    return;
+                }
+                if (m_previewViewport) {
+                    m_previewViewport->setPreviewShader(glslCode);
+                }
+                if (m_nodeGraphEditor) {
+                    m_nodeGraphEditor->compileAndHotSwapDaemon();
+                }
+            });
+}
+
+void MainWindow::wireCameraLightingSignals(CameraLightingInspectorWidget *camLights)
+{
+    if (!camLights) {
+        return;
+    }
+    connect(camLights, &CameraLightingInspectorWidget::cameraOrLightsChanged, this,
+            [this](const QString & /*output*/, const we_camera3d_t &cam,
+                   const we_lighting_uniforms_t &lights) {
+                if (m_previewViewport) {
+                    QMatrix4x4 vpMat;
+                    std::memcpy(vpMat.data(), cam.view_proj_matrix, 16 * sizeof(float));
+                    m_previewViewport->setShaderUniform(QStringLiteral("g_ViewProjectionMatrix"),
+                                                        vpMat);
+                    m_previewViewport->setGizmoCameraAndLights(cam, lights);
+                }
+            });
+    connect(camLights, &CameraLightingInspectorWidget::camera3DChanged, this,
+            [this](const QString & /*output*/, const we_camera3d_t &cam) {
+                if (m_previewViewport && m_cameraLightingInspector) {
+                    QMatrix4x4 vpMat;
+                    std::memcpy(vpMat.data(), cam.view_proj_matrix, 16 * sizeof(float));
+                    m_previewViewport->setShaderUniform(QStringLiteral("g_ViewProjectionMatrix"),
+                                                        vpMat);
+                    m_previewViewport->setGizmoCameraAndLights(
+                        cam, m_cameraLightingInspector->lighting());
+                }
+            });
+    connect(camLights, &CameraLightingInspectorWidget::lightingChanged, this,
+            [this](const QString & /*output*/, const we_lighting_uniforms_t &lights) {
+                if (m_previewViewport && m_cameraLightingInspector) {
+                    m_previewViewport->setGizmoCameraAndLights(m_cameraLightingInspector->camera(),
+                                                               lights);
+                }
+            });
+}
+
+void MainWindow::wirePhysicsSpringSignals(PhysicsSpringInspectorWidget *phys)
+{
+    if (!phys) {
+        return;
+    }
+    connect(phys, &PhysicsSpringInspectorWidget::physicsParamsChanged, this,
+            [this](const QString & /*output*/, int32_t /*objectId*/, int32_t boneIndex,
+                   const we_bone_sim_config_t &cfg, const we_wind_field_t & /*wind*/,
+                   const we_cursor_force_t & /*cursor*/) {
+                if (m_previewViewport && boneIndex >= 0) {
+                    m_previewViewport->setSelectedPuppetBone(boneIndex);
+                }
+                if (m_statusLabel) {
+                    m_statusLabel->setText(QStringLiteral("Physics Bone %1 (%2): damping=%3")
+                                               .arg(boneIndex)
+                                               .arg((cfg.flags & WE_BONE_PHYS_ENABLED) != 0u
+                                                        ? QStringLiteral("XPBD")
+                                                        : QStringLiteral("Off"))
+                                               .arg(cfg.damping_ratio, 0, 'f', 2));
+                }
+            });
+    connect(phys, &PhysicsSpringInspectorWidget::boneDriveModeChanged, this,
+            [this](int32_t objectId, int32_t boneIndex, we_bone_drive_mode_t mode) {
+                if (m_syncingBoneDriveMode) {
+                    return;
+                }
+                const QScopedValueRollback<bool> guard(m_syncingBoneDriveMode, true);
+                if (m_hasCachedPuppetRig && m_cachedPuppetRig.objectId == objectId &&
+                    boneIndex >= 0 && boneIndex < static_cast<int32_t>(WE_MDL_MAX_BONES)) {
+                    m_cachedPuppetRig.driveModes[static_cast<size_t>(boneIndex)] = mode;
+                }
+                if (m_boneRiggingPanel) {
+                    m_boneRiggingPanel->setBoneDriveMode(objectId, boneIndex, mode);
+                } else if (objectId >= 0 && boneIndex >= 0 &&
+                           boneIndex < static_cast<int32_t>(WE_MDL_MAX_BONES)) {
+                    m_pendingDriveModes[objectId][boneIndex] = mode;
+                }
+                if (m_statusLabel) {
+                    m_statusLabel->setText(QStringLiteral("Bone %1 drive mode: %2")
+                                               .arg(boneIndex)
+                                               .arg(mode == WE_BONE_DRIVE_XPBD
+                                                        ? QStringLiteral("XPBD Active")
+                                                        : QStringLiteral("FK/Rigid")));
+                }
+            });
 }
 
 void MainWindow::wireInterPanelSignals()
@@ -2394,6 +2766,28 @@ void MainWindow::wireInterPanelSignals()
                     applyWallpaperPath(QString::fromStdString(item.path),
                                        resolveSelectedOutputsCsv());
                 });
+        connect(
+            m_gridWidget, &VirtualizedGridWidget::playlistSelectionChanged, this,
+            [this](const std::vector<uint32_t> &selectedIds) {
+                if (m_statusLabel && !selectedIds.empty()) {
+                    m_statusLabel->setText(
+                        QStringLiteral("Playlist selection: %1 item(s)").arg(selectedIds.size()));
+                }
+            });
+        connect(
+            m_gridWidget, &VirtualizedGridWidget::playlistAddRequested, this,
+            [this](const std::vector<uint32_t> &addedIds) {
+                if (m_gridWidget) {
+                    m_playlistQueue = m_gridWidget->playlistQueue();
+                } else {
+                    m_playlistQueue.insert(m_playlistQueue.end(), addedIds.begin(), addedIds.end());
+                }
+                if (m_statusLabel) {
+                    m_statusLabel->setText(QStringLiteral("Playlist updated: %1 queued (%2 added)")
+                                               .arg(m_playlistQueue.size())
+                                               .arg(addedIds.size()));
+                }
+            });
     }
 
     if (m_previewViewport) {
@@ -2575,217 +2969,12 @@ void MainWindow::wireInterPanelSignals()
                 });
     }
 
-    // 3. Connect Property Inspector & Theme Studio signals
+    // 3. Connect Property Inspector signals
     if (m_propertyInspector) {
         connect(m_propertyInspector, &PropertyInspectorWidget::statusMessage, this,
                 [this](const QString &msg) {
                     if (m_statusLabel) {
                         m_statusLabel->setText(msg);
-                    }
-                });
-    }
-    if (m_themeStudio) {
-        connect(m_themeStudio, &ThemeStudioWidget::paletteChanged, this,
-                [this](const waywal_palette_t &palette) {
-                    if (m_statusLabel) {
-                        const QString hex =
-                            QStringLiteral("#%1")
-                                .arg(palette.source_color & 0x00FFFFFFu, 6, 16, QLatin1Char('0'))
-                                .toUpper();
-                        m_statusLabel->setText(
-                            QStringLiteral("Theme Palette: source %1 (seed #%2)")
-                                .arg(hex)
-                                .arg(palette.source_color_index));
-                    }
-                });
-        connect(m_themeStudio, &ThemeStudioWidget::modeChanged, this,
-                [this](waywal_theme_mode_t mode) {
-                    syncThemeStateToIpcOrActiveWallpaper(true);
-                    if (m_statusLabel) {
-                        m_statusLabel->setText(
-                            QStringLiteral("Theme Mode: %1")
-                                .arg(mode == WAYWAL_THEME_LIGHT ? QStringLiteral("Light")
-                                                                : QStringLiteral("Dark")));
-                    }
-                });
-        connect(m_themeStudio, &ThemeStudioWidget::variantChanged, this,
-                [this](waywal_scheme_variant_t variant) {
-                    syncThemeStateToIpcOrActiveWallpaper(false);
-                    if (m_statusLabel) {
-                        m_statusLabel->setText(
-                            QStringLiteral("Theme Variant: %1").arg(static_cast<int>(variant)));
-                    }
-                });
-        connect(m_themeStudio, &ThemeStudioWidget::contrastChanged, this,
-                [this](float contrast) {
-                    syncThemeStateToIpcOrActiveWallpaper(false);
-                    if (m_statusLabel) {
-                        m_statusLabel->setText(
-                            QStringLiteral("Theme Contrast: %1").arg(contrast, 0, 'f', 2));
-                    }
-                });
-        connect(m_themeStudio, &ThemeStudioWidget::seedIndexChanged, this, [this](uint8_t index) {
-            syncThemeStateToIpcOrActiveWallpaper(true);
-            if (m_statusLabel) {
-                m_statusLabel->setText(QStringLiteral("Theme Seed Index: %1").arg(index));
-            }
-        });
-        connect(m_themeStudio, &ThemeStudioWidget::statusMessageRequested, this,
-                [this](const QString &msg) {
-                    if (m_statusLabel && !msg.isEmpty()) {
-                        m_statusLabel->setText(msg);
-                    }
-                });
-    }
-
-    // 4. Connect Steam Workshop, Open Hub, Effect Library & Inspectors
-    if (m_workshopBrowser) {
-        connect(m_workshopBrowser, &WorkshopBrowserWidget::wallpaperSelected, this,
-                [this](uint64_t /*id*/, const QString &filePath) {
-                    applyWallpaperPath(filePath, resolveSelectedOutputsCsv());
-                });
-        connect(m_workshopBrowser, &WorkshopBrowserWidget::wallpaperApplyRequested, this,
-                [this](uint64_t publishedFileId, const QString &targetOutput) {
-                    QString path;
-                    if (auto *idxMgr = catalogIndexManager()) {
-                        if (const auto rec = idxMgr->getItem(publishedFileId); rec.has_value()) {
-                            path = QString::fromStdString(rec->file_path);
-                        }
-                    }
-                    if (path.isEmpty()) {
-                        if (m_statusLabel) {
-                            m_statusLabel->setText(
-                                QStringLiteral("Workshop item %1 is not downloaded locally yet")
-                                    .arg(publishedFileId));
-                        }
-                        return;
-                    }
-                    const QString targetSpec =
-                        targetOutput.trimmed().isEmpty() ? resolveSelectedOutputsCsv()
-                                                         : normalizeTargetOutputSpec(targetOutput);
-                    applyWallpaperPath(path, targetSpec);
-                });
-    }
-    if (m_openHubBrowser) {
-        connect(m_openHubBrowser, &OpenHubBrowserWidget::packageSelected, this,
-                [this](const QString & /*pkgId*/, const QString &cid) {
-                    if (m_statusLabel) {
-                        m_statusLabel->setText(QStringLiteral("Selected Hub Package: %1").arg(cid));
-                    }
-                });
-        connect(m_openHubBrowser, &OpenHubBrowserWidget::packageInstallRequested, this,
-                [this](const QString &packageId, const QString &targetOutput) {
-                    installPackageToDaemon(packageId, targetOutput);
-                });
-    }
-
-    if (m_effectLibraryBrowser) {
-        connect(m_effectLibraryBrowser, &EffectLibraryBrowserWidget::effectInsertIntoGraphRequested,
-                this, [this](we_builtin_effect_id_t effectId) {
-                    if (!m_nodeGraphEditor && m_layoutManager) {
-                        m_layoutManager->realizeLazyPanel(QStringLiteral("NodeGraphEditor"));
-                    }
-                    if (m_nodeGraphEditor) {
-                        m_nodeGraphEditor->addBuiltinEffectNode(effectId, QPointF(100.0, 100.0));
-                    }
-                });
-        connect(m_effectLibraryBrowser, &EffectLibraryBrowserWidget::effectInsertRequested, this,
-                [this](uint32_t /*effectId*/) {
-                    if (m_layoutManager) {
-                        m_layoutManager->setPanelVisible(QStringLiteral("NodeGraphEditor"), true);
-                    }
-                });
-        connect(m_effectLibraryBrowser,
-                &EffectLibraryBrowserWidget::effectApplyToActiveSceneRequested, this,
-                [this](we_builtin_effect_id_t effectId) {
-                    if (!m_nodeGraphEditor && m_layoutManager) {
-                        m_layoutManager->realizeLazyPanel(QStringLiteral("NodeGraphEditor"));
-                    }
-                    if (m_nodeGraphEditor) {
-                        m_nodeGraphEditor->addBuiltinEffectNode(effectId, QPointF(140.0, 140.0));
-                        m_nodeGraphEditor->compileAndHotSwapDaemon();
-                    }
-                });
-        connect(m_effectLibraryBrowser, &EffectLibraryBrowserWidget::effectAppendToStackRequested,
-                this, [this](uint32_t effectId) {
-                    if (m_statusLabel) {
-                        m_statusLabel->setText(
-                            QStringLiteral("Applied built-in effect #%1 to active scene")
-                                .arg(effectId));
-                    }
-                });
-        connect(m_effectLibraryBrowser, &EffectLibraryBrowserWidget::effectActivated, this,
-                [this](we_builtin_effect_id_t /*effectId*/, const QString &slug) {
-                    if (m_statusLabel && !slug.isEmpty()) {
-                        m_statusLabel->setText(QStringLiteral("Effect: %1").arg(slug));
-                    }
-                });
-    }
-
-    if (m_nodeGraphEditor) {
-        connect(m_nodeGraphEditor,
-                qOverload<const QString &, uint32_t>(&NodeGraphEditorWidget::graphCompiled), this,
-                [this](const QString &glslCode, uint32_t /*activePassMask*/) {
-                    if (glslCode.isEmpty()) {
-                        return;
-                    }
-                    if (m_previewViewport) {
-                        m_previewViewport->setPreviewShader(glslCode);
-                    }
-                    if (m_nodeGraphEditor) {
-                        m_nodeGraphEditor->compileAndHotSwapDaemon();
-                    }
-                });
-    }
-
-    if (m_cameraLightingInspector) {
-        connect(m_cameraLightingInspector, &CameraLightingInspectorWidget::cameraOrLightsChanged,
-                this,
-                [this](const QString & /*output*/, const we_camera3d_t &cam,
-                       const we_lighting_uniforms_t &lights) {
-                    if (m_previewViewport) {
-                        QMatrix4x4 vpMat;
-                        std::memcpy(vpMat.data(), cam.view_proj_matrix, 16 * sizeof(float));
-                        m_previewViewport->setShaderUniform(
-                            QStringLiteral("g_ViewProjectionMatrix"), vpMat);
-                        m_previewViewport->setGizmoCameraAndLights(cam, lights);
-                    }
-                });
-        connect(m_cameraLightingInspector, &CameraLightingInspectorWidget::camera3DChanged, this,
-                [this](const QString & /*output*/, const we_camera3d_t &cam) {
-                    if (m_previewViewport && m_cameraLightingInspector) {
-                        QMatrix4x4 vpMat;
-                        std::memcpy(vpMat.data(), cam.view_proj_matrix, 16 * sizeof(float));
-                        m_previewViewport->setShaderUniform(
-                            QStringLiteral("g_ViewProjectionMatrix"), vpMat);
-                        m_previewViewport->setGizmoCameraAndLights(
-                            cam, m_cameraLightingInspector->lighting());
-                    }
-                });
-        connect(m_cameraLightingInspector, &CameraLightingInspectorWidget::lightingChanged, this,
-                [this](const QString & /*output*/, const we_lighting_uniforms_t &lights) {
-                    if (m_previewViewport && m_cameraLightingInspector) {
-                        m_previewViewport->setGizmoCameraAndLights(
-                            m_cameraLightingInspector->camera(), lights);
-                    }
-                });
-    }
-
-    if (m_physicsSpringInspector) {
-        connect(m_physicsSpringInspector, &PhysicsSpringInspectorWidget::physicsParamsChanged, this,
-                [this](const QString & /*output*/, int32_t /*objectId*/, int32_t boneIndex,
-                       const we_bone_sim_config_t &cfg, const we_wind_field_t & /*wind*/,
-                       const we_cursor_force_t & /*cursor*/) {
-                    if (m_previewViewport && boneIndex >= 0) {
-                        m_previewViewport->setSelectedPuppetBone(boneIndex);
-                    }
-                    if (m_statusLabel) {
-                        m_statusLabel->setText(
-                            QStringLiteral("Physics Bone %1 (%2): damping=%3")
-                                .arg(boneIndex)
-                                .arg((cfg.flags & WE_BONE_PHYS_ENABLED) != 0u ? QStringLiteral("XPBD")
-                                                                             : QStringLiteral("Off"))
-                                .arg(cfg.damping_ratio, 0, 'f', 2));
                     }
                 });
     }
@@ -2994,6 +3183,8 @@ void MainWindow::wireInterPanelSignals()
     if (m_propertyInspector) {
         connect(m_propertyInspector, &PropertyInspectorWidget::audioBindingRequested, this,
                 [this](const QString &uniformName, float baseline) {
+                    const uint32_t compIdx = resolveActivePropertyComponentIndex(
+                        m_propertyInspector->propertyRow(uniformName), baseline);
                     if (m_layoutManager) {
                         m_layoutManager->realizeLazyPanel(QStringLiteral("AudioBindingWizard"));
                         m_layoutManager->setPanelVisible(QStringLiteral("AudioBindingWizard"),
@@ -3001,7 +3192,7 @@ void MainWindow::wireInterPanelSignals()
                     }
                     if (m_audioBindingWizard) {
                         m_audioBindingWizard->preselectTargetUniform(
-                            m_propertyInspector->targetObjectId(), uniformName, 0, baseline);
+                            m_propertyInspector->targetObjectId(), uniformName, compIdx, baseline);
                     }
                 });
         connect(m_propertyInspector, &PropertyInspectorWidget::uniformDefaultEdited, this,
@@ -3043,9 +3234,11 @@ void MainWindow::wireInterPanelSignals()
                 [this](const waywal_ipc_resp_query_scene_tree_t &resp, const QString &treeJson) {
                     if (resp.status_code == 0 && !treeJson.isEmpty()) {
                         m_lastSceneTreeJson = treeJson;
+                        m_cachedSceneLayers = parseSceneLayerNodesJson(treeJson);
                         if (m_sceneLayerTree) {
                             m_sceneLayerTree->loadFromSceneJson(treeJson);
                         }
+                        syncCachedSceneLayersToAudioWizard();
                     }
                 });
         connect(ipc, &IpcClient::particleConfigUpdated, this,
@@ -3229,33 +3422,6 @@ void MainWindow::wireInterPanelSignals()
                                     .arg(destPath)
                                     .arg(resp.total_bytes));
                         }
-                    }
-                });
-    }
-
-    if (m_physicsSpringInspector) {
-        connect(m_physicsSpringInspector, &PhysicsSpringInspectorWidget::boneDriveModeChanged, this,
-                [this](int32_t objectId, int32_t boneIndex, we_bone_drive_mode_t mode) {
-                    if (m_syncingBoneDriveMode) {
-                        return;
-                    }
-                    const QScopedValueRollback<bool> guard(m_syncingBoneDriveMode, true);
-                    if (m_hasCachedPuppetRig && m_cachedPuppetRig.objectId == objectId &&
-                        boneIndex >= 0 && boneIndex < static_cast<int32_t>(WE_MDL_MAX_BONES)) {
-                        m_cachedPuppetRig.driveModes[static_cast<size_t>(boneIndex)] = mode;
-                    }
-                    if (m_boneRiggingPanel) {
-                        m_boneRiggingPanel->setBoneDriveMode(objectId, boneIndex, mode);
-                    } else if (objectId >= 0 && boneIndex >= 0 &&
-                               boneIndex < static_cast<int32_t>(WE_MDL_MAX_BONES)) {
-                        m_pendingDriveModes[objectId][boneIndex] = mode;
-                    }
-                    if (m_statusLabel) {
-                        m_statusLabel->setText(QStringLiteral("Bone %1 drive mode: %2")
-                                                   .arg(boneIndex)
-                                                   .arg(mode == WE_BONE_DRIVE_XPBD
-                                                            ? QStringLiteral("XPBD Active")
-                                                            : QStringLiteral("FK/Rigid")));
                     }
                 });
     }
@@ -4637,12 +4803,13 @@ void MainWindow::refreshOnionSkinFrames()
 
     std::vector<GizmoOnionGhostFrame> frames;
     frames.reserve(static_cast<size_t>(m_onionBeforeFrames + m_onionAfterFrames));
+    m_onionScratch.localMats.resize(boneCount);
     for (int delta = -m_onionBeforeFrames; delta <= m_onionAfterFrames; ++delta) {
         if (delta == 0) {
             continue;
         }
         const double sampleFrame = wrapSampleFrame(curFrame + static_cast<double>(delta));
-        std::vector<std::array<float, 16>> localMats(boneCount);
+        auto &localMats = m_onionScratch.localMats;
         for (size_t bIdx = 0; bIdx < boneCount; ++bIdx) {
             const auto &srcBone = m_cachedPuppetRig.bones[bIdx];
             float pos[3] = {srcBone.bind_pos[0], srcBone.bind_pos[1], srcBone.bind_pos[2]};
@@ -4674,21 +4841,23 @@ void MainWindow::refreshOnionSkinFrames()
             composeBoneLocalMat4(pos, angle, scale, localMats[bIdx].data());
         }
 
-        const auto worldMats = resolveBoneWorldMatrices(m_cachedPuppetRig.bones, localMats);
+        resolveBoneWorldMatricesInto(m_cachedPuppetRig.bones, localMats, m_onionScratch.worldMats,
+                                     m_onionScratch.visitState, m_onionScratch.dfsStack);
+        const auto &worldMats = m_onionScratch.worldMats;
         std::vector<std::pair<QVector3D, QVector3D>> segments(boneCount);
-        std::vector<bool> hasChild(boneCount, false);
+        m_onionScratch.hasChild.assign(boneCount, 0u);
         for (size_t i = 0; i < boneCount; ++i) {
             segments[i].first = QVector3D(worldMats[i][12], worldMats[i][13], worldMats[i][14]);
         }
         for (size_t i = 0; i < boneCount; ++i) {
             const uint32_t p = m_cachedPuppetRig.bones[i].parent;
             if (p != 0xFFFFFFFFu && p < boneCount) {
-                hasChild[p] = true;
+                m_onionScratch.hasChild[p] = 1u;
                 segments[p].second = segments[i].first;
             }
         }
         for (size_t i = 0; i < boneCount; ++i) {
-            if (!hasChild[i]) {
+            if (m_onionScratch.hasChild[i] == 0u) {
                 const QVector3D axisX(worldMats[i][0], worldMats[i][1], worldMats[i][2]);
                 const QVector3D dir = (axisX.lengthSquared() > 1e-5f) ? axisX.normalized()
                                                                       : QVector3D(1.0f, 0.0f, 0.0f);

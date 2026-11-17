@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "studio/app/dock_layout_manager.hpp"
+#include "studio/app/lazy_panel_host.hpp"
+#include "studio/app/studio_tokens.hpp"
 
 #include <QDir>
 #include <QFile>
@@ -22,6 +24,8 @@
 #include <QStatusBar>
 #include <QFontMetrics>
 #include <QGuiApplication>
+#include <QPaintEvent>
+#include <QPainter>
 #include <QScreen>
 #include <algorithm>
 #include <cmath>
@@ -46,73 +50,6 @@ class LayoutApplyGuard {
 
 } // namespace
 
-/**
- * @brief Lightweight host widget that defers constructing heavy authoring docks until shown.
- */
-class LazyPanelHost final : public QWidget {
-  public:
-    using RealizeFn = std::function<QWidget *(QWidget *parent)>;
-
-    LazyPanelHost(RealizeFn realizeFn, const DockLayoutManager *layoutManager,
-                  QWidget *parent = nullptr)
-        : QWidget(parent), m_realizeFn(std::move(realizeFn)), m_layoutManager(layoutManager)
-    {
-        auto *layout = new QVBoxLayout(this);
-        layout->setContentsMargins(0, 0, 0, 0);
-        layout->setSpacing(0);
-    }
-
-    bool isRealized() const { return m_realizedWidget != nullptr; }
-    QWidget *realizedWidget() const { return m_realizedWidget; }
-
-    QWidget *realizeNow()
-    {
-        if (m_realizedWidget || !m_realizeFn) {
-            return m_realizedWidget;
-        }
-        auto fn = std::exchange(m_realizeFn, {});
-        QWidget *w = fn(this);
-        if (w) {
-            m_realizedWidget = w;
-            if (auto *vbox = qobject_cast<QVBoxLayout *>(layout())) {
-                vbox->addWidget(w);
-            }
-            w->show();
-        }
-        return m_realizedWidget;
-    }
-
-    QSize sizeHint() const override
-    {
-        return m_realizedWidget ? m_realizedWidget->sizeHint() : QSize(240, 180);
-    }
-
-  protected:
-    void showEvent(QShowEvent *event) override
-    {
-        QWidget::showEvent(event);
-        if (m_realizedWidget) {
-            return;
-        }
-        // Defer during layout tree construction so background tabs in a TabGroup stay unrealized.
-        if (m_layoutManager && m_layoutManager->isApplyingLayout()) {
-            QTimer::singleShot(0, this, [this]() {
-                if (!m_realizedWidget && isVisible() &&
-                    !(m_layoutManager && m_layoutManager->isApplyingLayout())) {
-                    realizeNow();
-                }
-            });
-            return;
-        }
-        realizeNow();
-    }
-
-  private:
-    RealizeFn m_realizeFn;
-    QPointer<const DockLayoutManager> m_layoutManager;
-    QWidget *m_realizedWidget{nullptr};
-};
-
 /* ========================================================================= */
 /* StudioDockTitleBar Implementation                                         */
 /* ========================================================================= */
@@ -125,34 +62,30 @@ StudioDockTitleBar::StudioDockTitleBar(const QString &title, QDockWidget *parent
     setAccessibleName(title);
 
     const QFontMetrics fm(font());
-    const int btnHeight = std::max(24, fm.height() + 8);
-    const int barHeight = std::max(30, btnHeight + 6);
+    const int btnHeight = std::max(wwal::studio::tokens::kTouchTargetMinPx, fm.height() + 10);
+    const int barHeight = std::max(wwal::studio::tokens::kDockTitleBarMinPx, btnHeight + 6);
     setMinimumHeight(barHeight);
 
     auto *layout = new QHBoxLayout(this);
     layout->setContentsMargins(10, 2, 8, 2);
     layout->setSpacing(6);
 
-    // Title label
+    // Styled via StudioProxyStyle tokens to avoid per-dock QSS parsing overhead.
     m_titleLabel = new QLabel(title, this);
     m_titleLabel->setObjectName(QStringLiteral("DockTitleText"));
-    m_titleLabel->setStyleSheet(
-        QStringLiteral("color: #e2e8f0; font-size: 11px; font-weight: 600;"));
+    QFont titleFont = m_titleLabel->font();
+    titleFont.setPixelSize(wwal::studio::tokens::kFontSizeBasePx);
+    titleFont.setWeight(QFont::DemiBold);
+    m_titleLabel->setFont(titleFont);
     layout->addWidget(m_titleLabel, 1);
 
-    // Float / Detach button
     m_floatButton = new QToolButton(this);
     m_floatButton->setObjectName(QStringLiteral("DockFloatButton"));
     m_floatButton->setAccessibleName(QStringLiteral("Toggle floating panel"));
     m_floatButton->setToolTip(QStringLiteral("Detach into floating window"));
     m_floatButton->setText(QStringLiteral("Float"));
     m_floatButton->setFocusPolicy(Qt::StrongFocus);
-    m_floatButton->setMinimumSize(24, btnHeight);
-    m_floatButton->setStyleSheet(QStringLiteral(
-        "QToolButton { background: transparent; border: 1px solid transparent; color: #cbd5e1; "
-        "font-size: 11px; padding: 2px 8px; border-radius: 3px; }"
-        "QToolButton:hover { background: #262c3a; color: #f8fafc; }"
-        "QToolButton:focus { border: 1px solid #38bdf8; background: #1e293b; color: #f8fafc; }"));
+    m_floatButton->setMinimumSize(wwal::studio::tokens::kTouchTargetMinPx, btnHeight);
     connect(m_floatButton, &QToolButton::clicked, this, [this]() {
         if (m_parentDock) {
             m_parentDock->setFloating(!m_parentDock->isFloating());
@@ -161,19 +94,13 @@ StudioDockTitleBar::StudioDockTitleBar(const QString &title, QDockWidget *parent
     });
     layout->addWidget(m_floatButton);
 
-    // Close button
     m_closeButton = new QToolButton(this);
     m_closeButton->setObjectName(QStringLiteral("DockCloseButton"));
     m_closeButton->setAccessibleName(QStringLiteral("Hide panel"));
     m_closeButton->setToolTip(QStringLiteral("Hide panel"));
     m_closeButton->setText(QStringLiteral("Hide"));
     m_closeButton->setFocusPolicy(Qt::StrongFocus);
-    m_closeButton->setMinimumSize(24, btnHeight);
-    m_closeButton->setStyleSheet(QStringLiteral(
-        "QToolButton { background: transparent; border: 1px solid transparent; color: #cbd5e1; "
-        "font-size: 11px; padding: 2px 8px; border-radius: 3px; }"
-        "QToolButton:hover { background: #7f1d1d; color: #ffffff; }"
-        "QToolButton:focus { border: 1px solid #f87171; background: #450a0a; color: #ffffff; }"));
+    m_closeButton->setMinimumSize(wwal::studio::tokens::kTouchTargetMinPx, btnHeight);
     connect(m_closeButton, &QToolButton::clicked, this, [this]() {
         if (m_parentDock) {
             m_parentDock->close();
@@ -181,11 +108,6 @@ StudioDockTitleBar::StudioDockTitleBar(const QString &title, QDockWidget *parent
         emit closeRequested();
     });
     layout->addWidget(m_closeButton);
-
-    setStyleSheet(QStringLiteral("#StudioDockTitleBar {"
-                                 "  background: #181b22;"
-                                 "  border-bottom: 1px solid #262b36;"
-                                 "}"));
 }
 
 void StudioDockTitleBar::setTitle(const QString &title)
@@ -221,6 +143,17 @@ void StudioDockTitleBar::mouseDoubleClickEvent(QMouseEvent *event)
         return;
     }
     QWidget::mouseDoubleClickEvent(event);
+}
+
+void StudioDockTitleBar::paintEvent(QPaintEvent *event)
+{
+    Q_UNUSED(event);
+    QPainter p(this);
+    if (!p.isActive()) {
+        return;
+    }
+    p.fillRect(rect(), QColor(0x16, 0x19, 0x22));
+    p.fillRect(0, height() - 1, width(), 1, QColor(0x26, 0x2b, 0x36));
 }
 
 /* ========================================================================= */
@@ -486,9 +419,18 @@ void DockLayoutManager::attachDockChildFilters()
     const auto tabBars =
         m_mainWindow->findChildren<QTabBar *>(QString(), Qt::FindDirectChildrenOnly);
     for (QTabBar *tb : tabBars) {
-        if (tb) {
-            tb->removeEventFilter(this);
-            tb->installEventFilter(this);
+        if (!tb) {
+            continue;
+        }
+        tb->removeEventFilter(this);
+        tb->installEventFilter(this);
+        if (!tb->property("_wwal_lazy_tab_hooked").toBool()) {
+            tb->setProperty("_wwal_lazy_tab_hooked", true);
+            connect(tb, &QTabBar::currentChanged, this, [this](int) {
+                if (!m_applyingLayout && m_mainWindow && m_mainWindow->isVisible()) {
+                    QTimer::singleShot(0, this, [this]() { realizeVisibleLazyHosts(); });
+                }
+            });
         }
     }
     const auto splitters = m_mainWindow->findChildren<QSplitterHandle *>();
@@ -496,6 +438,18 @@ void DockLayoutManager::attachDockChildFilters()
         if (handle) {
             handle->removeEventFilter(this);
             handle->installEventFilter(this);
+        }
+    }
+}
+
+void DockLayoutManager::realizeVisibleLazyHosts()
+{
+    if (m_applyingLayout || !m_mainWindow || !m_mainWindow->isVisible()) {
+        return;
+    }
+    for (auto it = m_lazyHosts.begin(); it != m_lazyHosts.end(); ++it) {
+        if (LazyPanelHost *host = it.value()) {
+            host->realizeIfRevealed();
         }
     }
 }
@@ -756,7 +710,7 @@ void DockLayoutManager::registerLazyPanel(const QString &id, const QString &titl
             }
             return created;
         },
-        this);
+        [this]() { return m_applyingLayout; });
     host->setObjectName(id + QStringLiteral("LazyHost"));
     m_lazyHosts.insert(id, host);
 
@@ -1401,6 +1355,10 @@ void DockLayoutManager::applyPerspectiveTree(const QJsonObject &tree)
         // 7. Apply proportional split sizes now and schedule coalesced post-polish relayout
         applyCurrentSplitSizes();
         attachDockChildFilters();
+    }
+
+    if (m_mainWindow->isVisible()) {
+        realizeVisibleLazyHosts();
     }
 
     scheduleRelayout();

@@ -3,6 +3,8 @@
 #define WAYWAL_STUDIO_MAIN_WINDOW_HPP
 
 #include "studio/core/rigging_commands.hpp"
+#include "studio/scene/scene_layer_tree_widget.hpp"
+#include "waywal/ipc_proto_authoring.h"
 
 #include <QPointer>
 
@@ -13,8 +15,9 @@
 #include <QComboBox>
 #include <QImage>
 #include <QLabel>
-#include <QPointer>
 #include <QPushButton>
+#include <array>
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <thread>
@@ -81,6 +84,7 @@ struct StudioOptions {
     QStringList excludeDirs;
     bool benchmarkGrid{false};
     bool headlessCheck{false};
+    bool realizeAllPanels{false};
 };
 
 /**
@@ -202,6 +206,22 @@ class MainWindow : public QMainWindow {
     void syncSourceAlphaFromPreviewImage(const QImage &image);
     void hydrateDopeSheetTimeline(DopeSheetTimelineWidget *timeline);
     void refreshOnionSkinFrames();
+    void wireWorkshopBrowserSignals(WorkshopBrowserWidget *workshop);
+    void wireOpenHubBrowserSignals(OpenHubBrowserWidget *openHub);
+    void wireThemeStudioSignals(ThemeStudioWidget *theme);
+    void wireNodeGraphEditorSignals(NodeGraphEditorWidget *graph);
+    void wireEffectLibrarySignals(EffectLibraryBrowserWidget *browser);
+    void wireCameraLightingSignals(CameraLightingInspectorWidget *camLights);
+    void wirePhysicsSpringSignals(PhysicsSpringInspectorWidget *phys);
+    void syncCachedSceneLayersToAudioWizard();
+
+    struct OnionSkinScratch {
+        std::vector<std::array<float, 16>> localMats;
+        std::vector<std::array<float, 16>> worldMats;
+        std::vector<uint8_t> visitState;
+        std::vector<size_t> dfsStack;
+        std::vector<uint8_t> hasChild;
+    };
 
     StudioOptions m_options;
     DockLayoutManager *m_layoutManager{nullptr};
@@ -275,6 +295,10 @@ class MainWindow : public QMainWindow {
     int m_onionBeforeFrames{2};
     int m_onionAfterFrames{2};
     float m_onionOpacity{0.35f};
+    std::vector<SceneLayerNode> m_cachedSceneLayers;
+    std::vector<we_audio_binding_t> m_cachedAudioBindings;
+    std::vector<uint32_t> m_playlistQueue;
+    OnionSkinScratch m_onionScratch;
 };
 
 } // namespace waywal::studio
