@@ -14,9 +14,13 @@
 #if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
 #include <immintrin.h>
 #endif
+#include <limits.h>
 #include <math.h>
-#include <png.h>
+#ifdef HAVE_OPENMP
+#include <omp.h>
+#endif
 #include <pthread.h>
+#include <setjmp.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,13 +29,16 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
-#include <turbojpeg.h>
 #include <unistd.h>
 
 #undef image_load
 #undef image_load_fd
 #undef image_load_from_memory
 #undef image_free
+
+enum {
+    WWAL_IMG_MAX_DIM = 16384U,
+};
 
 #if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
 __attribute__((target("avx2"))) static void swizzle_rgba_to_bgra_avx2(uint8_t *pixels,
@@ -144,7 +151,7 @@ static void swizzle_rgba_to_bgra_inplace(uint8_t *pixels, size_t num_bytes)
 
 static uint8_t *alloc_aligned_rgba(size_t size)
 {
-    if (size == 0 || size > (size_t)16384 * 16384 * 4)
+    if (size == 0 || size > (size_t)WWAL_IMG_MAX_DIM * WWAL_IMG_MAX_DIM * 4U)
         return NULL;
     void *ptr = NULL;
     size_t aligned_sz = (size + 63U) & ~(size_t)63U;
@@ -153,7 +160,7 @@ static uint8_t *alloc_aligned_rgba(size_t size)
     return (uint8_t *)ptr;
 }
 
-static __attribute__((unused)) bool resolve_symbol(void *handle, const char *name, void *out_fn_ptr)
+static bool resolve_symbol(void *handle, const char *name, void *out_fn_ptr)
 {
     if (!handle || !name || !out_fn_ptr)
         return false;
@@ -162,6 +169,17 @@ static __attribute__((unused)) bool resolve_symbol(void *handle, const char *nam
         return false;
     memcpy(out_fn_ptr, &sym, sizeof(void *));
     return true;
+}
+
+static void *open_dl_sonames(const char *const *sonames, size_t count)
+{
+    const int flags = RTLD_LAZY | RTLD_LOCAL | RTLD_NODELETE;
+    for (size_t i = 0; i < count; ++i) {
+        void *h = dlopen(sonames[i], flags);
+        if (h)
+            return h;
+    }
+    return NULL;
 }
 
 static void fill_raw_image(raw_image_t *out_img, uint8_t *data, uint32_t w, uint32_t h)
@@ -187,135 +205,370 @@ void raw_image_free(raw_image_t *img)
     memset(img, 0, sizeof(*img));
 }
 
-static bool load_png(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h)
+/* ============================================================================
+ * Lazy libpng16 Loader & Encoder (Zero Direct DT_NEEDED)
+ * ============================================================================ */
+
+enum {
+    WWAL_PNG_COLOR_TYPE_GRAY = 0,
+    WWAL_PNG_COLOR_TYPE_RGB = 2,
+    WWAL_PNG_COLOR_TYPE_PALETTE = 3,
+    WWAL_PNG_COLOR_TYPE_GRAY_ALPHA = 4,
+    WWAL_PNG_COLOR_TYPE_RGBA = 6,
+    WWAL_PNG_COMPRESSION_TYPE_DEFAULT = 0,
+    WWAL_PNG_FILTER_TYPE_DEFAULT = 0,
+    WWAL_PNG_INTERLACE_NONE = 0,
+    WWAL_PNG_INFO_tRNS = 0x0010U,
+    WWAL_PNG_FILLER_AFTER = 1,
+    WWAL_PNG_FILTER_NONE = 0x08,
+    WWAL_PNG_FILTER_SUB = 0x10,
+};
+
+typedef void (*wwal_png_error_cb_fn)(void *, const char *);
+typedef void (*wwal_png_longjmp_fn)(jmp_buf, int);
+typedef void (*wwal_png_rw_cb_fn)(void *, uint8_t *, size_t);
+
+typedef uint32_t (*png_access_version_number_fn)(void);
+typedef void *(*png_create_struct_fn)(const char *, void *, wwal_png_error_cb_fn,
+                                      wwal_png_error_cb_fn);
+typedef void *(*png_create_info_struct_fn)(const void *);
+typedef void (*png_destroy_read_struct_fn)(void **, void **, void **);
+typedef void (*png_destroy_write_struct_fn)(void **, void **);
+typedef jmp_buf *(*png_set_longjmp_fn_t)(void *, wwal_png_longjmp_fn, size_t);
+typedef void (*png_init_io_fn)(void *, FILE *);
+typedef void (*png_set_read_fn_t)(void *, void *, wwal_png_rw_cb_fn);
+typedef void *(*png_get_io_ptr_fn)(const void *);
+typedef void (*png_error_fn)(const void *, const char *);
+typedef void (*png_read_info_fn)(void *, void *);
+typedef uint32_t (*png_get_IHDR_fn)(const void *, const void *, uint32_t *, uint32_t *, int *,
+                                    int *, int *, int *, int *);
+typedef void (*png_void_fn)(void *);
+typedef uint32_t (*png_get_valid_fn)(const void *, const void *, uint32_t);
+typedef void (*png_set_filler_fn)(void *, uint32_t, int);
+typedef int (*png_set_interlace_handling_fn)(void *);
+typedef void (*png_read_update_info_fn)(void *, void *);
+typedef size_t (*png_get_rowbytes_fn)(const void *, const void *);
+typedef void (*png_read_image_fn)(void *, uint8_t **);
+typedef void (*png_read_end_fn)(void *, void *);
+typedef void (*png_set_compression_level_fn)(void *, int);
+typedef void (*png_set_filter_fn)(void *, int, int);
+typedef void (*png_set_IHDR_fn)(const void *, void *, uint32_t, uint32_t, int, int, int, int, int);
+typedef void (*png_write_info_fn)(void *, void *);
+typedef void (*png_write_row_fn)(void *, const uint8_t *);
+typedef void (*png_write_end_fn)(void *, void *);
+
+static pthread_once_t g_png_once = PTHREAD_ONCE_INIT;
+static void *g_png_handle = NULL;
+static char g_png_ver_str[32] = "1.6.0";
+static bool g_png_read_ready = false;
+static bool g_png_write_ready = false;
+
+static png_access_version_number_fn g_fn_png_access_version_number = NULL;
+static png_create_struct_fn g_fn_png_create_read_struct = NULL;
+static png_create_struct_fn g_fn_png_create_write_struct = NULL;
+static png_create_info_struct_fn g_fn_png_create_info_struct = NULL;
+static png_destroy_read_struct_fn g_fn_png_destroy_read_struct = NULL;
+static png_destroy_write_struct_fn g_fn_png_destroy_write_struct = NULL;
+static png_set_longjmp_fn_t g_fn_png_set_longjmp_fn = NULL;
+static png_init_io_fn g_fn_png_init_io = NULL;
+static png_set_read_fn_t g_fn_png_set_read_fn = NULL;
+static png_get_io_ptr_fn g_fn_png_get_io_ptr = NULL;
+static png_error_fn g_fn_png_error = NULL;
+static png_read_info_fn g_fn_png_read_info = NULL;
+static png_get_IHDR_fn g_fn_png_get_IHDR = NULL;
+static png_void_fn g_fn_png_set_scale_16 = NULL;
+static png_void_fn g_fn_png_set_palette_to_rgb = NULL;
+static png_void_fn g_fn_png_set_expand_gray_1_2_4_to_8 = NULL;
+static png_get_valid_fn g_fn_png_get_valid = NULL;
+static png_void_fn g_fn_png_set_tRNS_to_alpha = NULL;
+static png_void_fn g_fn_png_set_gray_to_rgb = NULL;
+static png_set_filler_fn g_fn_png_set_filler = NULL;
+static png_void_fn g_fn_png_set_bgr = NULL;
+static png_set_interlace_handling_fn g_fn_png_set_interlace_handling = NULL;
+static png_read_update_info_fn g_fn_png_read_update_info = NULL;
+static png_get_rowbytes_fn g_fn_png_get_rowbytes = NULL;
+static png_read_image_fn g_fn_png_read_image = NULL;
+static png_read_end_fn g_fn_png_read_end = NULL;
+static png_set_compression_level_fn g_fn_png_set_compression_level = NULL;
+static png_set_filter_fn g_fn_png_set_filter = NULL;
+static png_set_IHDR_fn g_fn_png_set_IHDR = NULL;
+static png_write_info_fn g_fn_png_write_info = NULL;
+static png_write_row_fn g_fn_png_write_row = NULL;
+static png_write_end_fn g_fn_png_write_end = NULL;
+
+static void init_png_lib(void)
 {
-    png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    static const char *const png_sonames[] = {"libpng16.so.16", "libpng16.so", "libpng.so"};
+    g_png_handle = open_dl_sonames(png_sonames, sizeof(png_sonames) / sizeof(png_sonames[0]));
+    if (!g_png_handle)
+        return;
+
+    if (resolve_symbol(g_png_handle, "png_access_version_number",
+                       &g_fn_png_access_version_number) &&
+        g_fn_png_access_version_number) {
+        uint32_t v = g_fn_png_access_version_number();
+        if (v >= 10000U) {
+            snprintf(g_png_ver_str, sizeof(g_png_ver_str), "%u.%u.%u", v / 10000U,
+                     (v / 100U) % 100U, v % 100U);
+        }
+    }
+
+    bool core_ok =
+        resolve_symbol(g_png_handle, "png_create_info_struct", &g_fn_png_create_info_struct) &&
+        resolve_symbol(g_png_handle, "png_set_longjmp_fn", &g_fn_png_set_longjmp_fn) &&
+        resolve_symbol(g_png_handle, "png_set_bgr", &g_fn_png_set_bgr);
+    if (!core_ok)
+        return;
+
+    if (resolve_symbol(g_png_handle, "png_create_read_struct", &g_fn_png_create_read_struct) &&
+        resolve_symbol(g_png_handle, "png_destroy_read_struct", &g_fn_png_destroy_read_struct) &&
+        resolve_symbol(g_png_handle, "png_set_read_fn", &g_fn_png_set_read_fn) &&
+        resolve_symbol(g_png_handle, "png_get_io_ptr", &g_fn_png_get_io_ptr) &&
+        resolve_symbol(g_png_handle, "png_error", &g_fn_png_error) &&
+        resolve_symbol(g_png_handle, "png_read_info", &g_fn_png_read_info) &&
+        resolve_symbol(g_png_handle, "png_get_IHDR", &g_fn_png_get_IHDR) &&
+        resolve_symbol(g_png_handle, "png_set_scale_16", &g_fn_png_set_scale_16) &&
+        resolve_symbol(g_png_handle, "png_set_palette_to_rgb", &g_fn_png_set_palette_to_rgb) &&
+        resolve_symbol(g_png_handle, "png_set_expand_gray_1_2_4_to_8",
+                       &g_fn_png_set_expand_gray_1_2_4_to_8) &&
+        resolve_symbol(g_png_handle, "png_get_valid", &g_fn_png_get_valid) &&
+        resolve_symbol(g_png_handle, "png_set_tRNS_to_alpha", &g_fn_png_set_tRNS_to_alpha) &&
+        resolve_symbol(g_png_handle, "png_set_gray_to_rgb", &g_fn_png_set_gray_to_rgb) &&
+        resolve_symbol(g_png_handle, "png_set_filler", &g_fn_png_set_filler) &&
+        resolve_symbol(g_png_handle, "png_set_interlace_handling",
+                       &g_fn_png_set_interlace_handling) &&
+        resolve_symbol(g_png_handle, "png_read_update_info", &g_fn_png_read_update_info) &&
+        resolve_symbol(g_png_handle, "png_get_rowbytes", &g_fn_png_get_rowbytes) &&
+        resolve_symbol(g_png_handle, "png_read_image", &g_fn_png_read_image) &&
+        resolve_symbol(g_png_handle, "png_read_end", &g_fn_png_read_end)) {
+        g_png_read_ready = true;
+    }
+
+    if (resolve_symbol(g_png_handle, "png_create_write_struct", &g_fn_png_create_write_struct) &&
+        resolve_symbol(g_png_handle, "png_destroy_write_struct", &g_fn_png_destroy_write_struct) &&
+        resolve_symbol(g_png_handle, "png_init_io", &g_fn_png_init_io) &&
+        resolve_symbol(g_png_handle, "png_set_compression_level",
+                       &g_fn_png_set_compression_level) &&
+        resolve_symbol(g_png_handle, "png_set_filter", &g_fn_png_set_filter) &&
+        resolve_symbol(g_png_handle, "png_set_IHDR", &g_fn_png_set_IHDR) &&
+        resolve_symbol(g_png_handle, "png_write_info", &g_fn_png_write_info) &&
+        resolve_symbol(g_png_handle, "png_write_row", &g_fn_png_write_row) &&
+        resolve_symbol(g_png_handle, "png_write_end", &g_fn_png_write_end)) {
+        g_png_write_ready = true;
+    }
+}
+
+typedef struct {
+    const uint8_t *data;
+    size_t size;
+    size_t pos;
+} wwal_png_mem_reader_t;
+
+static void png_mem_read_cb(void *png_ptr, uint8_t *out_bytes, size_t byte_count)
+{
+    wwal_png_mem_reader_t *r = (wwal_png_mem_reader_t *)g_fn_png_get_io_ptr(png_ptr);
+    if (!r || byte_count > r->size - r->pos) {
+        g_fn_png_error(png_ptr, "unexpected EOF");
+        return;
+    }
+    memcpy(out_bytes, r->data + r->pos, byte_count);
+    r->pos += byte_count;
+}
+
+static bool load_png_from_memory(const uint8_t *buf, size_t size, bool want_rgba,
+                                 uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h)
+{
+    if (!buf || size < 8)
+        return false;
+
+    pthread_once(&g_png_once, init_png_lib);
+    if (!g_png_read_ready)
+        return false;
+
+    void *png = g_fn_png_create_read_struct(g_png_ver_str, NULL, NULL, NULL);
     if (!png)
         return false;
 
-    png_infop info = png_create_info_struct(png);
+    void *info = g_fn_png_create_info_struct(png);
     if (!info) {
-        png_destroy_read_struct(&png, NULL, NULL);
+        g_fn_png_destroy_read_struct(&png, NULL, NULL);
         return false;
     }
 
     uint8_t *volatile pixels = NULL;
-    png_bytep *volatile row_pointers = NULL;
+    uint8_t **volatile row_pointers = NULL;
+    wwal_png_mem_reader_t reader = {.data = buf, .size = size, .pos = 0};
 
-    if (setjmp(png_jmpbuf(png))) {
-        png_destroy_read_struct(&png, &info, NULL);
-        if (pixels)
-            free(pixels);
-        if (row_pointers)
-            free(row_pointers);
+    jmp_buf *jb = g_fn_png_set_longjmp_fn(png, longjmp, sizeof(jmp_buf));
+    if (!jb || setjmp(*jb) != 0) {
+        g_fn_png_destroy_read_struct(&png, &info, NULL);
+        free(pixels);
+        free((void *)row_pointers);
         return false;
     }
 
-    png_init_io(png, fp);
-    png_read_info(png, info);
+    g_fn_png_set_read_fn(png, &reader, png_mem_read_cb);
+    g_fn_png_read_info(png, info);
 
-    png_uint_32 width = 0;
-    png_uint_32 height = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
     int bit_depth = 0;
     int color_type = 0;
 
-    png_get_IHDR(png, info, &width, &height, &bit_depth, &color_type, NULL, NULL, NULL);
-    if (width == 0 || height == 0 || width > 16384 || height > 16384) {
-        png_destroy_read_struct(&png, &info, NULL);
+    if (g_fn_png_get_IHDR(png, info, &width, &height, &bit_depth, &color_type, NULL, NULL, NULL) ==
+            0 ||
+        width == 0 || height == 0 || width > WWAL_IMG_MAX_DIM || height > WWAL_IMG_MAX_DIM) {
+        g_fn_png_destroy_read_struct(&png, &info, NULL);
         return false;
     }
 
     if (bit_depth == 16) {
-        png_set_scale_16(png);
+        g_fn_png_set_scale_16(png);
     }
-    if (color_type == PNG_COLOR_TYPE_PALETTE) {
-        png_set_palette_to_rgb(png);
+    if (color_type == WWAL_PNG_COLOR_TYPE_PALETTE) {
+        g_fn_png_set_palette_to_rgb(png);
     }
-    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) {
-        png_set_expand_gray_1_2_4_to_8(png);
+    if (color_type == WWAL_PNG_COLOR_TYPE_GRAY && bit_depth < 8) {
+        g_fn_png_set_expand_gray_1_2_4_to_8(png);
     }
-    if (png_get_valid(png, info, PNG_INFO_tRNS)) {
-        png_set_tRNS_to_alpha(png);
+    bool has_trns = g_fn_png_get_valid(png, info, WWAL_PNG_INFO_tRNS) != 0;
+    if (has_trns &&
+        (color_type == WWAL_PNG_COLOR_TYPE_RGB || color_type == WWAL_PNG_COLOR_TYPE_GRAY ||
+         color_type == WWAL_PNG_COLOR_TYPE_PALETTE)) {
+        g_fn_png_set_tRNS_to_alpha(png);
     }
-    if (color_type == PNG_COLOR_TYPE_GRAY || color_type == PNG_COLOR_TYPE_GRAY_ALPHA) {
-        png_set_gray_to_rgb(png);
+    if (color_type == WWAL_PNG_COLOR_TYPE_GRAY || color_type == WWAL_PNG_COLOR_TYPE_GRAY_ALPHA) {
+        g_fn_png_set_gray_to_rgb(png);
     }
-    if (color_type == PNG_COLOR_TYPE_RGB || color_type == PNG_COLOR_TYPE_GRAY ||
-        color_type == PNG_COLOR_TYPE_PALETTE) {
-        png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
+    /* Only synthesize opaque alpha when tRNS did not already expand to an alpha channel */
+    if (!has_trns &&
+        (color_type == WWAL_PNG_COLOR_TYPE_RGB || color_type == WWAL_PNG_COLOR_TYPE_GRAY ||
+         color_type == WWAL_PNG_COLOR_TYPE_PALETTE)) {
+        g_fn_png_set_filler(png, 0xFFU, WWAL_PNG_FILLER_AFTER);
     }
-    png_set_bgr(png); /* Normalize to DRM_FORMAT_ARGB8888 little-endian byte order [B, G, R, A] */
+    if (!want_rgba) {
+        /* Normalize to DRM_FORMAT_ARGB8888 little-endian byte order [B, G, R, A] */
+        g_fn_png_set_bgr(png);
+    }
 
-    png_read_update_info(png, info);
+    (void)g_fn_png_set_interlace_handling(png);
+    g_fn_png_read_update_info(png, info);
 
-    size_t rowbytes = png_get_rowbytes(png, info);
-    size_t out_bytes = (size_t)width * (size_t)height * 4;
-    if (rowbytes == 0 || out_bytes == 0 || out_bytes > (size_t)16384 * 16384 * 4) {
-        png_destroy_read_struct(&png, &info, NULL);
+    size_t rowbytes = g_fn_png_get_rowbytes(png, info);
+    size_t expected_rowbytes = (size_t)width * 4U;
+    if (rowbytes != expected_rowbytes ||
+        (size_t)height > ((size_t)WWAL_IMG_MAX_DIM * WWAL_IMG_MAX_DIM * 4U) / expected_rowbytes) {
+        g_fn_png_destroy_read_struct(&png, &info, NULL);
         return false;
     }
+
+    size_t out_bytes = expected_rowbytes * (size_t)height;
     pixels = alloc_aligned_rgba(out_bytes);
     if (!pixels) {
-        png_destroy_read_struct(&png, &info, NULL);
+        g_fn_png_destroy_read_struct(&png, &info, NULL);
         return false;
     }
 
-    row_pointers = (png_bytep *)malloc(sizeof(png_bytep) * height);
+    row_pointers = (uint8_t **)malloc(sizeof(uint8_t *) * (size_t)height);
     if (!row_pointers) {
         free(pixels);
-        png_destroy_read_struct(&png, &info, NULL);
+        g_fn_png_destroy_read_struct(&png, &info, NULL);
         return false;
     }
 
-    for (png_uint_32 y = 0; y < height; ++y) {
-        row_pointers[y] = pixels + y * rowbytes;
+    for (uint32_t y = 0; y < height; ++y) {
+        row_pointers[y] = pixels + (size_t)y * rowbytes;
     }
-    png_read_image(png, row_pointers);
-    png_read_end(png, NULL);
+    g_fn_png_read_image(png, row_pointers);
+    g_fn_png_read_end(png, NULL);
 
-    free(row_pointers);
-    png_destroy_read_struct(&png, &info, NULL);
+    free((void *)row_pointers);
+    g_fn_png_destroy_read_struct(&png, &info, NULL);
 
     *out_pixels = pixels;
-    *out_w = (uint32_t)width;
-    *out_h = (uint32_t)height;
+    *out_w = width;
+    *out_h = height;
     return true;
 }
 
-static bool load_jpeg_from_memory(const uint8_t *jpeg_buf, size_t fsize, uint8_t **out_pixels,
-                                  uint32_t *out_w, uint32_t *out_h)
+/* ============================================================================
+ * Lazy libturbojpeg Loader (Zero Direct DT_NEEDED)
+ * ============================================================================ */
+
+enum {
+    WWAL_TJPF_RGBA = 7,
+    WWAL_TJPF_BGRA = 8,
+};
+
+typedef void *(*tj_init_decompress_fn)(void);
+typedef int (*tj_destroy_fn)(void *);
+typedef int (*tj_decompress_header3_fn)(void *, const unsigned char *, unsigned long, int *, int *,
+                                        int *, int *);
+typedef int (*tj_decompress2_fn)(void *, const unsigned char *, unsigned long, unsigned char *, int,
+                                 int, int, int, int);
+
+static pthread_once_t g_tj_once = PTHREAD_ONCE_INIT;
+static void *g_tj_handle = NULL;
+static tj_init_decompress_fn g_fn_tjInitDecompress = NULL;
+static tj_destroy_fn g_fn_tjDestroy = NULL;
+static tj_decompress_header3_fn g_fn_tjDecompressHeader3 = NULL;
+static tj_decompress2_fn g_fn_tjDecompress2 = NULL;
+static bool g_tj_ready = false;
+
+static void init_tj_lib(void)
 {
-    if (!jpeg_buf || fsize == 0)
+    static const char *const tj_sonames[] = {"libturbojpeg.so.0", "libturbojpeg.so"};
+    g_tj_handle = open_dl_sonames(tj_sonames, sizeof(tj_sonames) / sizeof(tj_sonames[0]));
+    if (!g_tj_handle)
+        return;
+
+    if (resolve_symbol(g_tj_handle, "tjInitDecompress", &g_fn_tjInitDecompress) &&
+        resolve_symbol(g_tj_handle, "tjDestroy", &g_fn_tjDestroy) &&
+        resolve_symbol(g_tj_handle, "tjDecompressHeader3", &g_fn_tjDecompressHeader3) &&
+        resolve_symbol(g_tj_handle, "tjDecompress2", &g_fn_tjDecompress2)) {
+        g_tj_ready = true;
+    }
+}
+
+static bool load_jpeg_from_memory(const uint8_t *jpeg_buf, size_t fsize, bool want_rgba,
+                                  uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h)
+{
+    if (!jpeg_buf || fsize == 0 || fsize > (size_t)ULONG_MAX)
         return false;
 
-    tjhandle tj = tjInitDecompress();
+    pthread_once(&g_tj_once, init_tj_lib);
+    if (!g_tj_ready)
+        return false;
+
+    void *tj = g_fn_tjInitDecompress();
     if (!tj)
         return false;
 
     int width = 0, height = 0, jpeg_subsamp = 0, jpeg_colorspace = 0;
-    if (tjDecompressHeader3(tj, jpeg_buf, (unsigned long)fsize, &width, &height, &jpeg_subsamp,
-                            &jpeg_colorspace) != 0 ||
-        width <= 0 || height <= 0 || width > 16384 || height > 16384) {
-        tjDestroy(tj);
+    if (g_fn_tjDecompressHeader3(tj, jpeg_buf, (unsigned long)fsize, &width, &height, &jpeg_subsamp,
+                                 &jpeg_colorspace) != 0 ||
+        width <= 0 || height <= 0 || width > (int)WWAL_IMG_MAX_DIM ||
+        height > (int)WWAL_IMG_MAX_DIM) {
+        g_fn_tjDestroy(tj);
         return false;
     }
 
-    size_t out_size = (size_t)width * (size_t)height * 4;
+    size_t out_size = (size_t)width * (size_t)height * 4U;
     uint8_t *pixels = alloc_aligned_rgba(out_size);
     if (!pixels) {
-        tjDestroy(tj);
+        g_fn_tjDestroy(tj);
         return false;
     }
 
-    /* TJPF_BGRA produces byte order [B, G, R, A] matching little-endian DRM_FORMAT_ARGB8888 */
-    if (tjDecompress2(tj, jpeg_buf, (unsigned long)fsize, pixels, width, 0, height, TJPF_BGRA, 0) !=
-        0) {
+    int pixfmt = want_rgba ? WWAL_TJPF_RGBA : WWAL_TJPF_BGRA;
+    if (g_fn_tjDecompress2(tj, jpeg_buf, (unsigned long)fsize, pixels, width, 0, height, pixfmt,
+                           0) != 0) {
         free(pixels);
-        tjDestroy(tj);
+        g_fn_tjDestroy(tj);
         return false;
     }
 
-    tjDestroy(tj);
+    g_fn_tjDestroy(tj);
 
     *out_pixels = pixels;
     *out_w = (uint32_t)width;
@@ -323,41 +576,9 @@ static bool load_jpeg_from_memory(const uint8_t *jpeg_buf, size_t fsize, uint8_t
     return true;
 }
 
-__attribute__((unused)) static bool load_jpeg(FILE *fp, uint8_t **out_pixels, uint32_t *out_w,
-                                              uint32_t *out_h)
-{
-    int fd = fileno(fp);
-    struct stat st;
-    if (fd >= 0 && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 &&
-        st.st_size <= 256L * 1024L * 1024L) {
-        size_t sz = (size_t)st.st_size;
-        void *mapped = mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (mapped != MAP_FAILED) {
-            bool ok = load_jpeg_from_memory((const uint8_t *)mapped, sz, out_pixels, out_w, out_h);
-            munmap(mapped, sz);
-            return ok;
-        }
-    }
-
-    fseek(fp, 0, SEEK_END);
-    long fsize = ftell(fp);
-    if (fsize <= 0)
-        return false;
-    fseek(fp, 0, SEEK_SET);
-
-    uint8_t *jpeg_buf = (uint8_t *)malloc((size_t)fsize);
-    if (!jpeg_buf)
-        return false;
-
-    if (fread(jpeg_buf, 1, (size_t)fsize, fp) != (size_t)fsize) {
-        free(jpeg_buf);
-        return false;
-    }
-
-    bool ok = load_jpeg_from_memory(jpeg_buf, (size_t)fsize, out_pixels, out_w, out_h);
-    free(jpeg_buf);
-    return ok;
-}
+/* ============================================================================
+ * Native BMP, PNM, GIF, and Single-Pass QOI Decoders
+ * ============================================================================ */
 
 static inline uint16_t read_u16_le(const uint8_t *p)
 {
@@ -369,9 +590,209 @@ static inline uint32_t read_u32_le(const uint8_t *p)
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+static inline uint32_t read_u32_be(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
 static inline int32_t read_i32_le(const uint8_t *p) { return (int32_t)read_u32_le(p); }
 
-static bool load_bmp(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h)
+static inline uint32_t alpha_slot_u32(uint8_t a)
+{
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    return (uint32_t)a;
+#else
+    return (uint32_t)a << 24;
+#endif
+}
+
+static inline uint32_t pack_px_rgb_ahi(uint8_t r, uint8_t g, uint8_t b, uint32_t a_slot,
+                                       bool want_rgba)
+{
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    return want_rgba ? (((uint32_t)r << 24) | ((uint32_t)g << 16) | ((uint32_t)b << 8) | a_slot)
+                     : (((uint32_t)b << 24) | ((uint32_t)g << 16) | ((uint32_t)r << 8) | a_slot);
+#else
+    return want_rgba ? (a_slot | ((uint32_t)b << 16) | ((uint32_t)g << 8) | (uint32_t)r)
+                     : (a_slot | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b);
+#endif
+}
+
+static inline uint32_t pack_px_native(uint8_t r, uint8_t g, uint8_t b, uint8_t a, bool want_rgba)
+{
+    return pack_px_rgb_ahi(r, g, b, alpha_slot_u32(a), want_rgba);
+}
+
+static inline void unpack_px_native(uint32_t px, uint8_t *r, uint8_t *g, uint8_t *b, uint8_t *a,
+                                    bool want_rgba)
+{
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    *r = want_rgba ? (uint8_t)(px >> 24) : (uint8_t)(px >> 8);
+    *g = (uint8_t)(px >> 16);
+    *b = want_rgba ? (uint8_t)(px >> 8) : (uint8_t)(px >> 24);
+    *a = (uint8_t)px;
+#else
+    *r = want_rgba ? (uint8_t)px : (uint8_t)(px >> 16);
+    *g = (uint8_t)(px >> 8);
+    *b = want_rgba ? (uint8_t)(px >> 16) : (uint8_t)px;
+    *a = (uint8_t)(px >> 24);
+#endif
+}
+
+static inline __attribute__((always_inline)) bool
+qoi_decode_chunk(const uint8_t **pp, const uint8_t *data_end, uint32_t *dst, size_t *ppx_idx,
+                 size_t total_pixels, uint32_t index[64], uint8_t *pr, uint8_t *pg, uint8_t *pb,
+                 uint8_t *pa, uint32_t *pa_slot, uint32_t *pa_hash, uint32_t *ppx_u32,
+                 bool want_rgba, bool checked)
+{
+    const uint8_t *p = *pp;
+    size_t px_idx = *ppx_idx;
+    uint8_t r = *pr, g = *pg, b = *pb, a = *pa;
+    uint32_t a_slot = *pa_slot;
+    uint32_t a_hash = *pa_hash;
+    uint32_t px_u32 = *ppx_u32;
+
+    while (checked ? (px_idx < total_pixels)
+                   : (px_idx + 62U <= total_pixels && p + 5 <= data_end)) {
+        if (checked && p >= data_end)
+            return false;
+        uint8_t b1 = *p++;
+        switch (b1 >> 6) {
+        case 0: {
+            px_u32 = index[b1];
+            uint8_t new_a = a;
+            unpack_px_native(px_u32, &r, &g, &b, &new_a, want_rgba);
+            if (new_a != a) {
+                a = new_a;
+                a_slot = alpha_slot_u32(a);
+                a_hash = (uint32_t)a * 11U;
+            }
+            dst[px_idx++] = px_u32;
+            continue;
+        }
+        case 1:
+            r = (uint8_t)(r + ((b1 >> 4) & 0x03U) - 2U);
+            g = (uint8_t)(g + ((b1 >> 2) & 0x03U) - 2U);
+            b = (uint8_t)(b + (b1 & 0x03U) - 2U);
+            break;
+        case 2: {
+            if (checked && p >= data_end)
+                return false;
+            uint8_t b2 = *p++;
+            int dg = (int)(b1 & 0x3FU) - 32;
+            r = (uint8_t)(r + dg + ((int)((b2 >> 4) & 0x0FU) - 8));
+            g = (uint8_t)(g + dg);
+            b = (uint8_t)(b + dg + ((int)(b2 & 0x0FU) - 8));
+            break;
+        }
+        default:
+            if (b1 < 0xFEU) {
+                uint32_t count = (uint32_t)(b1 & 0x3FU) + 1U;
+                if (checked && (size_t)count > total_pixels - px_idx)
+                    return false;
+                for (uint32_t k = 0; k < count; ++k) {
+                    dst[px_idx + k] = px_u32;
+                }
+                px_idx += count;
+                continue;
+            }
+            if (b1 == 0xFEU) {
+                if (checked && p + 4 > data_end)
+                    return false;
+                r = p[0];
+                g = p[1];
+                b = p[2];
+                a = p[3];
+                a_slot = alpha_slot_u32(a);
+                a_hash = (uint32_t)a * 11U;
+                p += 4;
+            } else {
+                if (checked && p + 3 > data_end)
+                    return false;
+                r = p[0];
+                g = p[1];
+                b = p[2];
+                p += 3;
+            }
+            break;
+        }
+        px_u32 = pack_px_rgb_ahi(r, g, b, a_slot, want_rgba);
+        index[((uint32_t)r * 3U + (uint32_t)g * 5U + (uint32_t)b * 7U + a_hash) & 63U] = px_u32;
+        dst[px_idx++] = px_u32;
+    }
+
+    *pp = p;
+    *ppx_idx = px_idx;
+    *pr = r;
+    *pg = g;
+    *pb = b;
+    *pa = a;
+    *pa_slot = a_slot;
+    *pa_hash = a_hash;
+    *ppx_u32 = px_u32;
+    return true;
+}
+
+static inline __attribute__((always_inline)) bool
+qoi_decode_pixels_impl(const uint8_t *p, const uint8_t *data_end, uint8_t *pixels,
+                       size_t total_pixels, bool want_rgba)
+{
+    /* QOI spec: index starts zeroed whereas the running pixel starts at opaque black (a = 255) */
+    uint32_t index[64] = {0};
+    uint8_t r = 0, g = 0, b = 0, a = 255;
+    uint32_t a_slot = alpha_slot_u32(a);
+    uint32_t a_hash = (uint32_t)a * 11U;
+    uint32_t px_u32 = pack_px_rgb_ahi(r, g, b, a_slot, want_rgba);
+    uint32_t *dst = (uint32_t *)pixels;
+    size_t px_idx = 0;
+
+    if (!qoi_decode_chunk(&p, data_end, dst, &px_idx, total_pixels, index, &r, &g, &b, &a, &a_slot,
+                          &a_hash, &px_u32, want_rgba, false)) {
+        return false;
+    }
+    return qoi_decode_chunk(&p, data_end, dst, &px_idx, total_pixels, index, &r, &g, &b, &a,
+                            &a_slot, &a_hash, &px_u32, want_rgba, true);
+}
+
+static bool load_qoi_from_memory(const uint8_t *buf, size_t size, raw_image_t *out_img,
+                                 bool want_rgba)
+{
+    static const uint8_t k_qoi_eof[8] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01};
+    if (!buf || size < 22U || memcmp(buf, "qoif", 4) != 0)
+        return false;
+
+    uint32_t w = read_u32_be(buf + 4);
+    uint32_t h = read_u32_be(buf + 8);
+    uint8_t channels = buf[12];
+    uint8_t colorspace = buf[13];
+
+    if (w == 0 || h == 0 || w > WWAL_IMG_MAX_DIM || h > WWAL_IMG_MAX_DIM ||
+        (channels != 3U && channels != 4U) || colorspace > 1U) {
+        return false;
+    }
+
+    size_t total_pixels = (size_t)w * (size_t)h;
+    uint8_t *pixels = alloc_aligned_rgba(total_pixels * 4U);
+    if (!pixels)
+        return false;
+
+    const uint8_t *p = buf + 14;
+    const uint8_t *data_end =
+        (memcmp(buf + size - 8, k_qoi_eof, 8) == 0) ? (buf + size - 8) : (buf + size);
+
+    bool ok = want_rgba ? qoi_decode_pixels_impl(p, data_end, pixels, total_pixels, true)
+                        : qoi_decode_pixels_impl(p, data_end, pixels, total_pixels, false);
+    if (!ok) {
+        free(pixels);
+        return false;
+    }
+
+    fill_raw_image(out_img, pixels, w, h);
+    return true;
+}
+
+static bool load_bmp(FILE *fp, bool want_rgba, uint8_t **out_pixels, uint32_t *out_w,
+                     uint32_t *out_h)
 {
     uint8_t header[54];
     if (fread(header, 1, 54, fp) != 54)
@@ -385,7 +806,8 @@ static bool load_bmp(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
     uint16_t bpp = read_u16_le(&header[28]);
     uint32_t compression = read_u32_le(&header[30]);
 
-    if (width <= 0 || height == 0 || width > 16384 || height > 16384 || height < -16384 ||
+    if (width <= 0 || height == 0 || width > (int32_t)WWAL_IMG_MAX_DIM ||
+        height > (int32_t)WWAL_IMG_MAX_DIM || height < -(int32_t)WWAL_IMG_MAX_DIM ||
         (bpp != 24 && bpp != 32) || compression != 0) {
         return false;
     }
@@ -394,12 +816,12 @@ static bool load_bmp(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
     uint32_t abs_h = (uint32_t)(height > 0 ? height : -height);
     uint32_t abs_w = (uint32_t)width;
 
-    size_t row_stride = ((size_t)abs_w * (bpp / 8) + 3) & ~3;
+    size_t row_stride = ((size_t)abs_w * (bpp / 8U) + 3U) & ~(size_t)3U;
     uint8_t *row_buf = (uint8_t *)malloc(row_stride);
     if (!row_buf)
         return false;
 
-    uint8_t *pixels = alloc_aligned_rgba((size_t)abs_w * abs_h * 4);
+    uint8_t *pixels = alloc_aligned_rgba((size_t)abs_w * abs_h * 4U);
     if (!pixels) {
         free(row_buf);
         return false;
@@ -412,25 +834,36 @@ static bool load_bmp(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
     }
 
     for (uint32_t i = 0; i < abs_h; ++i) {
-        uint32_t y = flip_y ? (abs_h - 1 - i) : i;
+        uint32_t y = flip_y ? (abs_h - 1U - i) : i;
         if (fread(row_buf, 1, row_stride, fp) != row_stride) {
             free(row_buf);
             free(pixels);
             return false;
         }
 
-        uint8_t *dst_row = pixels + (size_t)y * abs_w * 4;
-        for (uint32_t x = 0; x < abs_w; ++x) {
-            if (bpp == 24) {
-                dst_row[x * 4 + 0] = row_buf[x * 3 + 0]; /* B (native) */
-                dst_row[x * 4 + 1] = row_buf[x * 3 + 1]; /* G */
-                dst_row[x * 4 + 2] = row_buf[x * 3 + 2]; /* R (native) */
-                dst_row[x * 4 + 3] = 0xFF;               /* A */
-            } else {
-                dst_row[x * 4 + 0] = row_buf[x * 4 + 0]; /* B (native) */
-                dst_row[x * 4 + 1] = row_buf[x * 4 + 1]; /* G */
-                dst_row[x * 4 + 2] = row_buf[x * 4 + 2]; /* R (native) */
-                dst_row[x * 4 + 3] = row_buf[x * 4 + 3]; /* A */
+        uint8_t *dst_row = pixels + (size_t)y * abs_w * 4U;
+        if (bpp == 32 && !want_rgba) {
+            memcpy(dst_row, row_buf, (size_t)abs_w * 4U);
+        } else if (bpp == 32) {
+            for (uint32_t x = 0; x < abs_w; ++x) {
+                dst_row[x * 4 + 0] = row_buf[x * 4 + 2];
+                dst_row[x * 4 + 1] = row_buf[x * 4 + 1];
+                dst_row[x * 4 + 2] = row_buf[x * 4 + 0];
+                dst_row[x * 4 + 3] = row_buf[x * 4 + 3];
+            }
+        } else if (want_rgba) {
+            for (uint32_t x = 0; x < abs_w; ++x) {
+                dst_row[x * 4 + 0] = row_buf[x * 3 + 2];
+                dst_row[x * 4 + 1] = row_buf[x * 3 + 1];
+                dst_row[x * 4 + 2] = row_buf[x * 3 + 0];
+                dst_row[x * 4 + 3] = 0xFF;
+            }
+        } else {
+            for (uint32_t x = 0; x < abs_w; ++x) {
+                dst_row[x * 4 + 0] = row_buf[x * 3 + 0];
+                dst_row[x * 4 + 1] = row_buf[x * 3 + 1];
+                dst_row[x * 4 + 2] = row_buf[x * 3 + 2];
+                dst_row[x * 4 + 3] = 0xFF;
             }
         }
     }
@@ -471,7 +904,8 @@ static bool pnm_next_token(FILE *fp, char *tok, size_t cap)
     return i > 0;
 }
 
-static bool load_pnm(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h)
+static bool load_pnm(FILE *fp, bool want_rgba, uint8_t **out_pixels, uint32_t *out_w,
+                     uint32_t *out_h)
 {
     char tok[64];
     if (!pnm_next_token(fp, tok, sizeof(tok)) || tok[0] != 'P')
@@ -491,28 +925,34 @@ static bool load_pnm(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
         vals[i] = v;
     }
 
-    if (vals[0] > 16384 || vals[1] > 16384 || vals[2] > 255)
+    if (vals[0] > (long)WWAL_IMG_MAX_DIM || vals[1] > (long)WWAL_IMG_MAX_DIM || vals[2] > 255)
         return false;
 
     uint32_t w = (uint32_t)vals[0];
     uint32_t h = (uint32_t)vals[1];
     uint32_t maxval = (uint32_t)vals[2];
     size_t total_px = (size_t)w * (size_t)h;
-    uint8_t *pixels = alloc_aligned_rgba(total_px * 4);
+    uint8_t *pixels = alloc_aligned_rgba(total_px * 4U);
     if (!pixels)
         return false;
 
     if (fmt == '6') {
-        uint8_t *rgb = (uint8_t *)malloc(total_px * 3);
-        if (!rgb || fread(rgb, 1, total_px * 3, fp) != total_px * 3) {
+        uint8_t *rgb = (uint8_t *)malloc(total_px * 3U);
+        if (!rgb || fread(rgb, 1, total_px * 3U, fp) != total_px * 3U) {
             free(rgb);
             free(pixels);
             return false;
         }
         for (size_t i = 0; i < total_px; ++i) {
-            pixels[i * 4 + 0] = (uint8_t)((rgb[i * 3 + 2] * 255U) / maxval);
-            pixels[i * 4 + 1] = (uint8_t)((rgb[i * 3 + 1] * 255U) / maxval);
-            pixels[i * 4 + 2] = (uint8_t)((rgb[i * 3 + 0] * 255U) / maxval);
+            uint8_t r = (maxval == 255U) ? rgb[i * 3 + 0]
+                                         : (uint8_t)(((uint32_t)rgb[i * 3 + 0] * 255U) / maxval);
+            uint8_t g = (maxval == 255U) ? rgb[i * 3 + 1]
+                                         : (uint8_t)(((uint32_t)rgb[i * 3 + 1] * 255U) / maxval);
+            uint8_t b = (maxval == 255U) ? rgb[i * 3 + 2]
+                                         : (uint8_t)(((uint32_t)rgb[i * 3 + 2] * 255U) / maxval);
+            pixels[i * 4 + 0] = want_rgba ? r : b;
+            pixels[i * 4 + 1] = g;
+            pixels[i * 4 + 2] = want_rgba ? b : r;
             pixels[i * 4 + 3] = 0xFF;
         }
         free(rgb);
@@ -524,7 +964,7 @@ static bool load_pnm(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
             return false;
         }
         for (size_t i = 0; i < total_px; ++i) {
-            uint8_t g = (uint8_t)((gray[i] * 255U) / maxval);
+            uint8_t g = (maxval == 255U) ? gray[i] : (uint8_t)(((uint32_t)gray[i] * 255U) / maxval);
             pixels[i * 4 + 0] = g;
             pixels[i * 4 + 1] = g;
             pixels[i * 4 + 2] = g;
@@ -545,11 +985,11 @@ static bool load_pnm(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
                     free(pixels);
                     return false;
                 }
-                c[ch] = (uint8_t)(((uint32_t)v * 255U) / maxval);
+                c[ch] = (maxval == 255U) ? (uint8_t)v : (uint8_t)(((uint32_t)v * 255U) / maxval);
             }
-            pixels[i * 4 + 0] = c[2];
+            pixels[i * 4 + 0] = want_rgba ? c[0] : c[2];
             pixels[i * 4 + 1] = c[1];
-            pixels[i * 4 + 2] = c[0];
+            pixels[i * 4 + 2] = want_rgba ? c[2] : c[0];
             pixels[i * 4 + 3] = 0xFF;
         }
     }
@@ -588,13 +1028,14 @@ static int gif_read_bits(gif_bit_reader_t *br, int num_bits)
         br->bit_buf |= ((uint32_t)b << br->bit_count);
         br->bit_count += 8;
     }
-    int code = (int)(br->bit_buf & ((1U << num_bits) - 1));
+    int code = (int)(br->bit_buf & ((1U << num_bits) - 1U));
     br->bit_buf >>= num_bits;
     br->bit_count -= num_bits;
     return code;
 }
 
-static bool load_gif(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h)
+static bool load_gif(FILE *fp, bool want_rgba, uint8_t **out_pixels, uint32_t *out_w,
+                     uint32_t *out_h)
 {
     uint8_t header[13];
     if (fread(header, 1, 13, fp) != 13)
@@ -610,8 +1051,8 @@ static bool load_gif(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
     uint8_t lsd_packed = header[10];
     uint8_t bg_color_idx = header[11];
 
-    bool has_gct = (lsd_packed & 0x80) != 0;
-    int gct_entries = has_gct ? (1 << ((lsd_packed & 0x07) + 1)) : 0;
+    bool has_gct = (lsd_packed & 0x80U) != 0;
+    int gct_entries = has_gct ? (1 << ((lsd_packed & 0x07U) + 1U)) : 0;
     uint8_t gct[256][3];
     memset(gct, 0, sizeof(gct));
 
@@ -628,19 +1069,19 @@ static bool load_gif(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
         if (block_type == EOF || block_type == 0x3B)
             break;
 
-        if (block_type == 0x21) { /* Extension block */
+        if (block_type == 0x21) {
             int label = fgetc(fp);
             if (label == EOF)
                 break;
 
-            if (label == 0xF9) { /* Graphic Control Extension */
+            if (label == 0xF9) {
                 int ext_len = fgetc(fp);
                 if (ext_len != 4)
                     return false;
                 uint8_t gce[4];
                 if (fread(gce, 1, 4, fp) != 4)
                     return false;
-                has_trans = (gce[0] & 0x01) != 0;
+                has_trans = (gce[0] & 0x01U) != 0;
                 trans_idx = gce[3];
                 int term = fgetc(fp);
                 while (term > 0 && term != EOF) {
@@ -658,7 +1099,7 @@ static bool load_gif(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
             continue;
         }
 
-        if (block_type == 0x2C) { /* Image Descriptor */
+        if (block_type == 0x2C) {
             uint8_t desc[9];
             if (fread(desc, 1, 9, fp) != 9)
                 return false;
@@ -669,25 +1110,26 @@ static bool load_gif(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
             uint16_t img_h = read_u16_le(&desc[6]);
             uint8_t img_packed = desc[8];
 
-            if (img_w == 0 || img_h == 0 || img_w > 16384 || img_h > 16384)
+            if (img_w == 0 || img_h == 0 || img_w > WWAL_IMG_MAX_DIM || img_h > WWAL_IMG_MAX_DIM)
                 return false;
 
             uint32_t canvas_w = screen_w > 0 ? (uint32_t)screen_w : (uint32_t)img_w;
             uint32_t canvas_h = screen_h > 0 ? (uint32_t)screen_h : (uint32_t)img_h;
 
-            if (canvas_w == 0 || canvas_h == 0 || canvas_w > 16384 || canvas_h > 16384)
+            if (canvas_w == 0 || canvas_h == 0 || canvas_w > WWAL_IMG_MAX_DIM ||
+                canvas_h > WWAL_IMG_MAX_DIM)
                 return false;
 
             if ((uint32_t)img_left + img_w > canvas_w)
                 canvas_w = (uint32_t)img_left + img_w;
             if ((uint32_t)img_top + img_h > canvas_h)
                 canvas_h = (uint32_t)img_top + img_h;
-            if (canvas_w > 16384 || canvas_h > 16384)
+            if (canvas_w > WWAL_IMG_MAX_DIM || canvas_h > WWAL_IMG_MAX_DIM)
                 return false;
 
-            bool has_lct = (img_packed & 0x80) != 0;
-            bool interlace = (img_packed & 0x40) != 0;
-            int lct_entries = has_lct ? (1 << ((img_packed & 0x07) + 1)) : 0;
+            bool has_lct = (img_packed & 0x80U) != 0;
+            bool interlace = (img_packed & 0x40U) != 0;
+            int lct_entries = has_lct ? (1 << ((img_packed & 0x07U) + 1U)) : 0;
             uint8_t lct[256][3];
             memset(lct, 0, sizeof(lct));
 
@@ -698,23 +1140,20 @@ static bool load_gif(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
 
             uint8_t (*active_pal)[3] = has_lct ? lct : gct;
 
-            /* Pre-compute 32-bit ARGB8888 (native little-endian BGRA) palette */
             uint32_t u32_palette[256];
             for (int i = 0; i < 256; ++i) {
                 if (has_trans && i == (int)trans_idx) {
-                    u32_palette[i] = 0x00000000;
+                    u32_palette[i] = 0x00000000U;
                 } else {
-                    uint32_t r = active_pal[i][0];
-                    uint32_t g = active_pal[i][1];
-                    uint32_t b = active_pal[i][2];
-                    u32_palette[i] = (0xFFU << 24) | (r << 16) | (g << 8) | b;
+                    u32_palette[i] = pack_px_native(active_pal[i][0], active_pal[i][1],
+                                                    active_pal[i][2], 0xFF, want_rgba);
                 }
             }
 
-            uint8_t *canvas_bytes = alloc_aligned_rgba((size_t)canvas_w * canvas_h * 4);
+            uint8_t *canvas_bytes = alloc_aligned_rgba((size_t)canvas_w * canvas_h * 4U);
             if (!canvas_bytes)
                 return false;
-            memset(canvas_bytes, 0, (size_t)canvas_w * canvas_h * 4);
+            memset(canvas_bytes, 0, (size_t)canvas_w * canvas_h * 4U);
             uint32_t *canvas = (uint32_t *)canvas_bytes;
 
             if (!has_trans) {
@@ -726,7 +1165,7 @@ static bool load_gif(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
 
             uint32_t *row_map = (uint32_t *)malloc(sizeof(uint32_t) * img_h);
             if (!row_map) {
-                free(canvas);
+                free(canvas_bytes);
                 return false;
             }
 
@@ -748,7 +1187,7 @@ static bool load_gif(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
             int min_code_size = fgetc(fp);
             if (min_code_size < 2 || min_code_size > 11) {
                 free(row_map);
-                free(canvas);
+                free(canvas_bytes);
                 return false;
             }
 
@@ -762,6 +1201,8 @@ static bool load_gif(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
             uint16_t prefix[4096];
             uint8_t suffix[4096];
             uint8_t stack[4096];
+            memset(prefix, 0, sizeof(prefix));
+            memset(suffix, 0, sizeof(suffix));
             int stack_ptr = 0;
 
             for (int i = 0; i < clear_code; ++i) {
@@ -782,6 +1223,7 @@ static bool load_gif(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
             uint32_t px = 0;
             uint32_t py = 0;
             uint32_t *dst_row = canvas + ((size_t)img_top + row_map[0]) * canvas_w + img_left;
+            bool lzw_err = false;
 
             while (pixels_written < total_pixels) {
                 int code = gif_read_bits(&br, code_size);
@@ -797,8 +1239,11 @@ static bool load_gif(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
                 }
 
                 if (old_code == -1) {
-                    if (code >= 4096)
+                    /* First code after a clear must be a root literal (< clear_code) */
+                    if (code >= clear_code) {
+                        lzw_err = true;
                         break;
+                    }
                     old_code = code;
                     dst_row[px] = u32_palette[(uint8_t)code];
                     px++;
@@ -830,8 +1275,10 @@ static bool load_gif(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
                         stack[stack_ptr++] = suffix[cur];
                         cur = prefix[cur];
                     }
-                    if (chain_err)
+                    if (chain_err) {
+                        lzw_err = true;
                         break;
+                    }
                     first_char = cur;
                     stack[stack_ptr++] = (uint8_t)cur;
                     stack[kwkwk_slot] = (uint8_t)first_char;
@@ -846,11 +1293,14 @@ static bool load_gif(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
                         stack[stack_ptr++] = suffix[cur];
                         cur = prefix[cur];
                     }
-                    if (chain_err)
+                    if (chain_err) {
+                        lzw_err = true;
                         break;
+                    }
                     first_char = cur;
                     stack[stack_ptr++] = (uint8_t)cur;
                 } else {
+                    lzw_err = true;
                     break;
                 }
 
@@ -880,7 +1330,12 @@ static bool load_gif(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
                 }
             }
 
-            /* Drain remaining sub-blocks for this image record */
+            if (lzw_err || pixels_written == 0) {
+                free(row_map);
+                free(canvas_bytes);
+                return false;
+            }
+
             while (br.sub_len > 0) {
                 fgetc(fp);
                 br.sub_len--;
@@ -893,7 +1348,7 @@ static bool load_gif(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
 
             free(row_map);
 
-            *out_pixels = (uint8_t *)canvas;
+            *out_pixels = canvas_bytes;
             *out_w = canvas_w;
             *out_h = canvas_h;
             return true;
@@ -903,65 +1358,583 @@ static bool load_gif(FILE *fp, uint8_t **out_pixels, uint32_t *out_w, uint32_t *
     return false;
 }
 
-typedef int (*webp_get_info_fn)(const uint8_t *, size_t, int *, int *);
-typedef uint8_t *(*webp_decode_into_fn)(const uint8_t *, size_t, uint8_t *, size_t, int);
+/* ============================================================================
+ * Lazy libwebp + libwebpdemux Loader & Multi-Threaded YUV420->BGRA/RGBA
+ * ============================================================================ */
+
+enum {
+    WWAL_WEBP_DECODER_ABI_VERSION = 0x0210,
+    WWAL_WEBP_DEMUX_ABI_VERSION = 0x0107,
+    WWAL_WEBP_MODE_RGBA = 1,
+    WWAL_WEBP_MODE_BGRA = 3,
+    WWAL_WEBP_MODE_YUV = 11,
+    WWAL_WEBP_MODE_YUVA = 12,
+    WWAL_WEBP_FF_CANVAS_WIDTH = 1,
+    WWAL_WEBP_FF_CANVAS_HEIGHT = 2,
+};
+
+typedef struct {
+    int width;
+    int height;
+    int has_alpha;
+    int has_animation;
+    int format;
+    uint32_t pad[5];
+} wwal_webp_bitstream_features_t;
+
+typedef struct {
+    uint8_t *rgba;
+    int stride;
+    size_t size;
+} wwal_webp_rgba_buffer_t;
+
+typedef struct {
+    uint8_t *y, *u, *v, *a;
+    int y_stride;
+    int u_stride, v_stride;
+    int a_stride;
+    size_t y_size;
+    size_t u_size, v_size;
+    size_t a_size;
+} wwal_webp_yuva_buffer_t;
+
+typedef struct {
+    int colorspace;
+    int width, height;
+    int is_external_memory;
+    union {
+        wwal_webp_rgba_buffer_t RGBA;
+        wwal_webp_yuva_buffer_t YUVA;
+    } u;
+    uint32_t pad[4];
+    uint8_t *private_memory;
+} wwal_webp_dec_buffer_t;
+
+typedef struct {
+    int bypass_filtering;
+    int no_fancy_upsampling;
+    int use_cropping;
+    int crop_left, crop_top;
+    int crop_width, crop_height;
+    int use_scaling;
+    int scaled_width, scaled_height;
+    int use_threads;
+    int dithering_strength;
+    int flip;
+    int alpha_dithering_strength;
+    uint32_t pad[5];
+} wwal_webp_decoder_options_t;
+
+typedef struct {
+    wwal_webp_bitstream_features_t input;
+    wwal_webp_dec_buffer_t output;
+    wwal_webp_decoder_options_t options;
+} wwal_webp_decoder_config_t;
+
+typedef struct {
+    const uint8_t *bytes;
+    size_t size;
+} wwal_webp_data_t;
+
+typedef struct {
+    int frame_num;
+    int num_frames;
+    int x_offset, y_offset;
+    int width, height;
+    int duration;
+    int dispose_method;
+    int complete;
+    wwal_webp_data_t fragment;
+    int has_alpha;
+    int blend_method;
+    uint32_t pad[2];
+    void *private_;
+} wwal_webp_iterator_t;
+
+typedef int (*webp_init_dec_cfg_internal_fn)(wwal_webp_decoder_config_t *, int);
+typedef int (*webp_get_features_internal_fn)(const uint8_t *, size_t,
+                                             wwal_webp_bitstream_features_t *, int);
+typedef int (*webp_decode_fn)(const uint8_t *, size_t, wwal_webp_decoder_config_t *);
+typedef void (*webp_free_dec_buf_fn)(wwal_webp_dec_buffer_t *);
+
+typedef void *(*webp_demux_internal_fn)(const wwal_webp_data_t *, int, int *, int);
+typedef uint32_t (*webp_demux_get_i_fn)(const void *, int);
+typedef int (*webp_demux_get_frame_fn)(const void *, int, wwal_webp_iterator_t *);
+typedef void (*webp_demux_release_iter_fn)(wwal_webp_iterator_t *);
+typedef void (*webp_demux_delete_fn)(void *);
 
 static pthread_once_t g_webp_once = PTHREAD_ONCE_INIT;
 static void *g_webp_handle = NULL;
-static webp_get_info_fn g_fn_WebPGetInfo = NULL;
-static webp_decode_into_fn g_fn_WebPDecodeBGRAInto = NULL;
-static webp_decode_into_fn g_fn_WebPDecodeRGBAInto = NULL;
+static void *g_webpdemux_handle = NULL;
+static webp_init_dec_cfg_internal_fn g_fn_WebPInitDecoderConfigInternal = NULL;
+static webp_get_features_internal_fn g_fn_WebPGetFeaturesInternal = NULL;
+static webp_decode_fn g_fn_WebPDecode = NULL;
+static webp_free_dec_buf_fn g_fn_WebPFreeDecBuffer = NULL;
+static webp_demux_internal_fn g_fn_WebPDemuxInternal = NULL;
+static webp_demux_get_i_fn g_fn_WebPDemuxGetI = NULL;
+static webp_demux_get_frame_fn g_fn_WebPDemuxGetFrame = NULL;
+static webp_demux_release_iter_fn g_fn_WebPDemuxReleaseIterator = NULL;
+static webp_demux_delete_fn g_fn_WebPDemuxDelete = NULL;
+static bool g_webp_ready = false;
+static bool g_webpdemux_ready = false;
 
 static void init_webp_lib(void)
 {
 #ifndef WWAL_DISABLE_WEBP
-    g_webp_handle = dlopen("libwebp.so.7", RTLD_LAZY | RTLD_NODELETE);
-    if (!g_webp_handle)
-        g_webp_handle = dlopen("libwebp.so", RTLD_LAZY | RTLD_NODELETE);
+    static const char *const webp_sonames[] = {"libwebp.so.7", "libwebp.so"};
+    static const char *const demux_sonames[] = {"libwebpdemux.so.2", "libwebpdemux.so"};
+
+    g_webp_handle = open_dl_sonames(webp_sonames, sizeof(webp_sonames) / sizeof(webp_sonames[0]));
     if (!g_webp_handle)
         return;
-    (void)resolve_symbol(g_webp_handle, "WebPGetInfo", &g_fn_WebPGetInfo);
-    (void)resolve_symbol(g_webp_handle, "WebPDecodeBGRAInto", &g_fn_WebPDecodeBGRAInto);
-    (void)resolve_symbol(g_webp_handle, "WebPDecodeRGBAInto", &g_fn_WebPDecodeRGBAInto);
+
+    if (resolve_symbol(g_webp_handle, "WebPInitDecoderConfigInternal",
+                       &g_fn_WebPInitDecoderConfigInternal) &&
+        resolve_symbol(g_webp_handle, "WebPGetFeaturesInternal", &g_fn_WebPGetFeaturesInternal) &&
+        resolve_symbol(g_webp_handle, "WebPDecode", &g_fn_WebPDecode) &&
+        resolve_symbol(g_webp_handle, "WebPFreeDecBuffer", &g_fn_WebPFreeDecBuffer)) {
+        g_webp_ready = true;
+    }
+
+    g_webpdemux_handle =
+        open_dl_sonames(demux_sonames, sizeof(demux_sonames) / sizeof(demux_sonames[0]));
+    if (g_webpdemux_handle &&
+        resolve_symbol(g_webpdemux_handle, "WebPDemuxInternal", &g_fn_WebPDemuxInternal) &&
+        resolve_symbol(g_webpdemux_handle, "WebPDemuxGetI", &g_fn_WebPDemuxGetI) &&
+        resolve_symbol(g_webpdemux_handle, "WebPDemuxGetFrame", &g_fn_WebPDemuxGetFrame) &&
+        resolve_symbol(g_webpdemux_handle, "WebPDemuxReleaseIterator",
+                       &g_fn_WebPDemuxReleaseIterator) &&
+        resolve_symbol(g_webpdemux_handle, "WebPDemuxDelete", &g_fn_WebPDemuxDelete)) {
+        g_webpdemux_ready = true;
+    }
+#else
+    (void)g_webp_handle;
+    (void)g_webpdemux_handle;
 #endif
 }
 
-static bool load_webp_from_memory(const uint8_t *buf, size_t size, raw_image_t *out_img)
+static inline uint8_t clamp_u8_i32(int v) { return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v)); }
+
+static inline void yuv_pixel_to_packed(uint8_t y_val, uint8_t u_val, uint8_t v_val, uint8_t a_val,
+                                       bool want_rgba, uint8_t *dst)
 {
-    pthread_once(&g_webp_once, init_webp_lib);
-    if (!g_webp_handle || !g_fn_WebPGetInfo ||
-        (!g_fn_WebPDecodeBGRAInto && !g_fn_WebPDecodeRGBAInto)) {
-        return false;
-    }
-
-    int w = 0, h = 0;
-    if (!g_fn_WebPGetInfo(buf, size, &w, &h) || w <= 0 || h <= 0 || w > 16384 || h > 16384) {
-        return false;
-    }
-
-    int stride = w * 4;
-    size_t out_bytes = (size_t)w * (size_t)h * 4;
-    uint8_t *pixels = alloc_aligned_rgba(out_bytes);
-    if (!pixels) {
-        return false;
-    }
-
-    if (g_fn_WebPDecodeBGRAInto) {
-        if (!g_fn_WebPDecodeBGRAInto(buf, size, pixels, out_bytes, stride)) {
-            free(pixels);
-            return false;
-        }
+    /* Exact libwebp BT.601 fixed-point matrix matching src/dsp/yuv.h */
+    int yy = 19077 * ((int)y_val - 16);
+    int du = (int)u_val - 128;
+    int dv = (int)v_val - 128;
+    uint8_t r = clamp_u8_i32((yy + 26149 * dv + 8192) >> 14);
+    uint8_t g = clamp_u8_i32((yy - 6419 * du - 13320 * dv + 8192) >> 14);
+    uint8_t b = clamp_u8_i32((yy + 33050 * du + 8192) >> 14);
+    if (want_rgba) {
+        dst[0] = r;
+        dst[1] = g;
+        dst[2] = b;
     } else {
-        if (!g_fn_WebPDecodeRGBAInto(buf, size, pixels, out_bytes, stride)) {
-            free(pixels);
-            return false;
+        dst[0] = b;
+        dst[1] = g;
+        dst[2] = r;
+    }
+    dst[3] = a_val;
+}
+
+static void convert_yuv420_row_scalar(const uint8_t *y_row, const uint8_t *u_near,
+                                      const uint8_t *u_far, const uint8_t *v_near,
+                                      const uint8_t *v_far, const uint8_t *a_row, uint8_t *dst_row,
+                                      uint32_t x_start, uint32_t x_end, uint32_t cw, bool want_rgba)
+{
+    for (uint32_t x = x_start; x < x_end; ++x) {
+        uint32_t cx = x >> 1U;
+        uint32_t cx_far = cx;
+        if (x > 0 && cw > 1) {
+            if ((x & 1U) == 0) {
+                cx_far = cx - 1U;
+            } else if (cx + 1U < cw) {
+                cx_far = cx + 1U;
+            }
         }
-        swizzle_rgba_to_bgra_inplace(pixels, out_bytes);
+        uint32_t u_val =
+            (9U * u_near[cx] + 3U * u_near[cx_far] + 3U * u_far[cx] + u_far[cx_far] + 8U) >> 4U;
+        uint32_t v_val =
+            (9U * v_near[cx] + 3U * v_near[cx_far] + 3U * v_far[cx] + v_far[cx_far] + 8U) >> 4U;
+        uint8_t a_val = a_row ? a_row[x] : 0xFFU;
+        yuv_pixel_to_packed(y_row[x], (uint8_t)u_val, (uint8_t)v_val, a_val, want_rgba,
+                            dst_row + (size_t)x * 4U);
+    }
+}
+
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
+__attribute__((target("avx2"))) static void
+convert_yuv420_row_avx2(const uint8_t *y_row, const uint8_t *u_near, const uint8_t *u_far,
+                        const uint8_t *v_near, const uint8_t *v_far, const uint8_t *a_row,
+                        uint8_t *dst_row, uint32_t w, uint32_t cw, bool want_rgba)
+{
+    uint32_t x = 0;
+    if (cw > 18U) {
+        convert_yuv420_row_scalar(y_row, u_near, u_far, v_near, v_far, a_row, dst_row, 0, 2, cw,
+                                  want_rgba);
+        x = 2;
+
+        const __m256i c16 = _mm256_set1_epi16(16);
+        const __m256i c128 = _mm256_set1_epi16(128);
+        const __m256i c32 = _mm256_set1_epi16(32);
+        const __m256i kY = _mm256_set1_epi16(19077);
+        const __m256i kVToR = _mm256_set1_epi16(26149);
+        const __m256i kUToG = _mm256_set1_epi16(6419);
+        const __m256i kVToG = _mm256_set1_epi16(13320);
+        /* 33050 exceeds signed int16_t max (32767), so multiply by 16525 and double the result */
+        const __m256i kUToB_half = _mm256_set1_epi16(16525);
+        const __m256i alpha_ff = _mm256_set1_epi8((char)0xFF);
+
+        uint32_t cx = 1U;
+        uint32_t cx_limit = cw - 17U;
+        for (; cx <= cx_limit; cx += 16U, x += 32U) {
+            __m128i un_c = _mm_loadu_si128((const __m128i *)(u_near + cx));
+            __m128i un_l = _mm_loadu_si128((const __m128i *)(u_near + cx - 1U));
+            __m128i un_r = _mm_loadu_si128((const __m128i *)(u_near + cx + 1U));
+            __m128i uf_c = _mm_loadu_si128((const __m128i *)(u_far + cx));
+            __m128i uf_l = _mm_loadu_si128((const __m128i *)(u_far + cx - 1U));
+            __m128i uf_r = _mm_loadu_si128((const __m128i *)(u_far + cx + 1U));
+
+            __m128i uv_c = _mm_avg_epu8(un_c, _mm_avg_epu8(un_c, uf_c));
+            __m128i uv_l = _mm_avg_epu8(un_l, _mm_avg_epu8(un_l, uf_l));
+            __m128i uv_r = _mm_avg_epu8(un_r, _mm_avg_epu8(un_r, uf_r));
+            __m128i u_even = _mm_avg_epu8(uv_c, _mm_avg_epu8(uv_c, uv_l));
+            __m128i u_odd = _mm_avg_epu8(uv_c, _mm_avg_epu8(uv_c, uv_r));
+            __m128i u_px_lo = _mm_unpacklo_epi8(u_even, u_odd);
+            __m128i u_px_hi = _mm_unpackhi_epi8(u_even, u_odd);
+
+            __m128i vn_c = _mm_loadu_si128((const __m128i *)(v_near + cx));
+            __m128i vn_l = _mm_loadu_si128((const __m128i *)(v_near + cx - 1U));
+            __m128i vn_r = _mm_loadu_si128((const __m128i *)(v_near + cx + 1U));
+            __m128i vf_c = _mm_loadu_si128((const __m128i *)(v_far + cx));
+            __m128i vf_l = _mm_loadu_si128((const __m128i *)(v_far + cx - 1U));
+            __m128i vf_r = _mm_loadu_si128((const __m128i *)(v_far + cx + 1U));
+
+            __m128i vv_c = _mm_avg_epu8(vn_c, _mm_avg_epu8(vn_c, vf_c));
+            __m128i vv_l = _mm_avg_epu8(vn_l, _mm_avg_epu8(vn_l, vf_l));
+            __m128i vv_r = _mm_avg_epu8(vn_r, _mm_avg_epu8(vn_r, vf_r));
+            __m128i v_even = _mm_avg_epu8(vv_c, _mm_avg_epu8(vv_c, vv_l));
+            __m128i v_odd = _mm_avg_epu8(vv_c, _mm_avg_epu8(vv_c, vv_r));
+            __m128i v_px_lo = _mm_unpacklo_epi8(v_even, v_odd);
+            __m128i v_px_hi = _mm_unpackhi_epi8(v_even, v_odd);
+
+            __m128i y_px_lo = _mm_loadu_si128((const __m128i *)(y_row + x));
+            __m128i y_px_hi = _mm_loadu_si128((const __m128i *)(y_row + x + 16U));
+
+            __m256i yy_lo =
+                _mm256_slli_epi16(_mm256_sub_epi16(_mm256_cvtepu8_epi16(y_px_lo), c16), 7);
+            __m256i uu_lo =
+                _mm256_slli_epi16(_mm256_sub_epi16(_mm256_cvtepu8_epi16(u_px_lo), c128), 7);
+            __m256i vv_lo =
+                _mm256_slli_epi16(_mm256_sub_epi16(_mm256_cvtepu8_epi16(v_px_lo), c128), 7);
+
+            __m256i y64_lo = _mm256_mulhrs_epi16(yy_lo, kY);
+            __m256i rv_lo = _mm256_mulhrs_epi16(vv_lo, kVToR);
+            __m256i gu_lo = _mm256_mulhrs_epi16(uu_lo, kUToG);
+            __m256i gv_lo = _mm256_mulhrs_epi16(vv_lo, kVToG);
+            __m256i bu_lo_h = _mm256_mulhrs_epi16(uu_lo, kUToB_half);
+            __m256i bu_lo = _mm256_add_epi16(bu_lo_h, bu_lo_h);
+
+            __m256i r_lo =
+                _mm256_srai_epi16(_mm256_add_epi16(_mm256_add_epi16(y64_lo, rv_lo), c32), 6);
+            __m256i g_lo = _mm256_srai_epi16(
+                _mm256_add_epi16(_mm256_sub_epi16(_mm256_sub_epi16(y64_lo, gu_lo), gv_lo), c32), 6);
+            __m256i b_lo =
+                _mm256_srai_epi16(_mm256_add_epi16(_mm256_add_epi16(y64_lo, bu_lo), c32), 6);
+
+            __m256i yy_hi =
+                _mm256_slli_epi16(_mm256_sub_epi16(_mm256_cvtepu8_epi16(y_px_hi), c16), 7);
+            __m256i uu_hi =
+                _mm256_slli_epi16(_mm256_sub_epi16(_mm256_cvtepu8_epi16(u_px_hi), c128), 7);
+            __m256i vv_hi =
+                _mm256_slli_epi16(_mm256_sub_epi16(_mm256_cvtepu8_epi16(v_px_hi), c128), 7);
+
+            __m256i y64_hi = _mm256_mulhrs_epi16(yy_hi, kY);
+            __m256i rv_hi = _mm256_mulhrs_epi16(vv_hi, kVToR);
+            __m256i gu_hi = _mm256_mulhrs_epi16(uu_hi, kUToG);
+            __m256i gv_hi = _mm256_mulhrs_epi16(vv_hi, kVToG);
+            __m256i bu_hi_h = _mm256_mulhrs_epi16(uu_hi, kUToB_half);
+            __m256i bu_hi = _mm256_add_epi16(bu_hi_h, bu_hi_h);
+
+            __m256i r_hi =
+                _mm256_srai_epi16(_mm256_add_epi16(_mm256_add_epi16(y64_hi, rv_hi), c32), 6);
+            __m256i g_hi = _mm256_srai_epi16(
+                _mm256_add_epi16(_mm256_sub_epi16(_mm256_sub_epi16(y64_hi, gu_hi), gv_hi), c32), 6);
+            __m256i b_hi =
+                _mm256_srai_epi16(_mm256_add_epi16(_mm256_add_epi16(y64_hi, bu_hi), c32), 6);
+
+            __m256i r8 = _mm256_permute4x64_epi64(_mm256_packus_epi16(r_lo, r_hi), 0xD8);
+            __m256i g8 = _mm256_permute4x64_epi64(_mm256_packus_epi16(g_lo, g_hi), 0xD8);
+            __m256i b8 = _mm256_permute4x64_epi64(_mm256_packus_epi16(b_lo, b_hi), 0xD8);
+            __m256i a8 = a_row ? _mm256_loadu_si256((const __m256i *)(a_row + x)) : alpha_ff;
+
+            __m256i ch0 = want_rgba ? r8 : b8;
+            __m256i ch2 = want_rgba ? b8 : r8;
+
+            __m256i c01_lo = _mm256_unpacklo_epi8(ch0, g8);
+            __m256i c01_hi = _mm256_unpackhi_epi8(ch0, g8);
+            __m256i c23_lo = _mm256_unpacklo_epi8(ch2, a8);
+            __m256i c23_hi = _mm256_unpackhi_epi8(ch2, a8);
+
+            __m256i px0 = _mm256_unpacklo_epi16(c01_lo, c23_lo);
+            __m256i px1 = _mm256_unpackhi_epi16(c01_lo, c23_lo);
+            __m256i px2 = _mm256_unpacklo_epi16(c01_hi, c23_hi);
+            __m256i px3 = _mm256_unpackhi_epi16(c01_hi, c23_hi);
+
+            uint8_t *dst = dst_row + (size_t)x * 4U;
+            _mm256_storeu_si256((__m256i *)(dst + 0), _mm256_permute2x128_si256(px0, px1, 0x20));
+            _mm256_storeu_si256((__m256i *)(dst + 32), _mm256_permute2x128_si256(px2, px3, 0x20));
+            _mm256_storeu_si256((__m256i *)(dst + 64), _mm256_permute2x128_si256(px0, px1, 0x31));
+            _mm256_storeu_si256((__m256i *)(dst + 96), _mm256_permute2x128_si256(px2, px3, 0x31));
+        }
     }
 
-    fill_raw_image(out_img, pixels, (uint32_t)w, (uint32_t)h);
+    if (x < w) {
+        convert_yuv420_row_scalar(y_row, u_near, u_far, v_near, v_far, a_row, dst_row, x, w, cw,
+                                  want_rgba);
+    }
+}
+#endif
+
+static void convert_yuv420_to_packed(const wwal_webp_yuva_buffer_t *yuva, uint32_t w, uint32_t h,
+                                     bool has_alpha, bool want_rgba, uint8_t *dst_pixels)
+{
+    uint32_t cw = (w + 1U) / 2U;
+    uint32_t ch = (h + 1U) / 2U;
+
+    bool use_avx2 = false;
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
+    use_avx2 = __builtin_cpu_supports("avx2");
+#endif
+
+#ifdef HAVE_OPENMP
+#pragma omp parallel for schedule(static) if (h >= 256U)
+#endif
+    for (uint32_t y = 0; y < h; ++y) {
+        uint32_t cy = y >> 1U;
+        uint32_t cy_far = cy;
+        if (y > 0 && ch > 1U) {
+            if ((y & 1U) == 0) {
+                cy_far = cy - 1U;
+            } else if (cy + 1U < ch) {
+                cy_far = cy + 1U;
+            }
+        }
+        const uint8_t *y_row = yuva->y + (size_t)y * (size_t)yuva->y_stride;
+        const uint8_t *u_near = yuva->u + (size_t)cy * (size_t)yuva->u_stride;
+        const uint8_t *u_far = yuva->u + (size_t)cy_far * (size_t)yuva->u_stride;
+        const uint8_t *v_near = yuva->v + (size_t)cy * (size_t)yuva->v_stride;
+        const uint8_t *v_far = yuva->v + (size_t)cy_far * (size_t)yuva->v_stride;
+        const uint8_t *a_row =
+            (has_alpha && yuva->a) ? (yuva->a + (size_t)y * (size_t)yuva->a_stride) : NULL;
+        uint8_t *dst_row = dst_pixels + (size_t)y * (size_t)w * 4U;
+
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(WWAL_DISABLE_SIMD)
+        if (use_avx2) {
+            convert_yuv420_row_avx2(y_row, u_near, u_far, v_near, v_far, a_row, dst_row, w, cw,
+                                    want_rgba);
+            continue;
+        }
+#else
+        (void)use_avx2;
+#endif
+        convert_yuv420_row_scalar(y_row, u_near, u_far, v_near, v_far, a_row, dst_row, 0, w, cw,
+                                  want_rgba);
+    }
+}
+
+static bool decode_webp_frame_direct(const uint8_t *buf, size_t size, uint32_t w, uint32_t h,
+                                     int format, bool has_alpha, bool want_rgba,
+                                     uint8_t **out_pixels)
+{
+    wwal_webp_decoder_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    if (!g_fn_WebPInitDecoderConfigInternal(&cfg, WWAL_WEBP_DECODER_ABI_VERSION))
+        return false;
+
+    /* Use multi-threaded YUV decode + OpenMP AVX2 upsampling for large lossy frames to keep full
+     * deblocking and chroma quality while avoiding libwebp's single-threaded RGB pass */
+    bool use_fast_yuv = (format == 1 && w >= 512U && h >= 512U);
+    if (use_fast_yuv) {
+        cfg.output.colorspace = has_alpha ? WWAL_WEBP_MODE_YUVA : WWAL_WEBP_MODE_YUV;
+        cfg.output.is_external_memory = 0;
+        cfg.options.use_threads = 1;
+
+        if (g_fn_WebPDecode(buf, size, &cfg) != 0) {
+            g_fn_WebPFreeDecBuffer(&cfg.output);
+            return false;
+        }
+
+        const wwal_webp_yuva_buffer_t *yuva = &cfg.output.u.YUVA;
+        uint32_t cw = (w + 1U) / 2U;
+        uint32_t ch = (h + 1U) / 2U;
+        bool yuv_ok = yuva->y && yuva->u && yuva->v && yuva->y_stride >= (int)w &&
+                      yuva->u_stride >= (int)cw && yuva->v_stride >= (int)cw &&
+                      yuva->y_size >= (size_t)yuva->y_stride * (h - 1U) + w &&
+                      yuva->u_size >= (size_t)yuva->u_stride * (ch - 1U) + cw &&
+                      yuva->v_size >= (size_t)yuva->v_stride * (ch - 1U) + cw &&
+                      (!has_alpha || (yuva->a && yuva->a_stride >= (int)w &&
+                                      yuva->a_size >= (size_t)yuva->a_stride * (h - 1U) + w));
+        if (!yuv_ok) {
+            g_fn_WebPFreeDecBuffer(&cfg.output);
+            return false;
+        }
+
+        size_t out_bytes = (size_t)w * (size_t)h * 4U;
+        uint8_t *pixels = alloc_aligned_rgba(out_bytes);
+        if (!pixels) {
+            g_fn_WebPFreeDecBuffer(&cfg.output);
+            return false;
+        }
+
+        convert_yuv420_to_packed(yuva, w, h, has_alpha, want_rgba, pixels);
+        g_fn_WebPFreeDecBuffer(&cfg.output);
+        *out_pixels = pixels;
+        return true;
+    }
+
+    size_t out_bytes = (size_t)w * (size_t)h * 4U;
+    uint8_t *pixels = alloc_aligned_rgba(out_bytes);
+    if (!pixels)
+        return false;
+
+    cfg.output.colorspace = want_rgba ? WWAL_WEBP_MODE_RGBA : WWAL_WEBP_MODE_BGRA;
+    cfg.output.is_external_memory = 1;
+    cfg.output.u.RGBA.rgba = pixels;
+    cfg.output.u.RGBA.stride = (int)(w * 4U);
+    cfg.output.u.RGBA.size = out_bytes;
+    cfg.options.use_threads = ((size_t)w * (size_t)h >= 262144U) ? 1 : 0;
+
+    int st = g_fn_WebPDecode(buf, size, &cfg);
+    g_fn_WebPFreeDecBuffer(&cfg.output);
+    if (st != 0) {
+        free(pixels);
+        return false;
+    }
+
+    *out_pixels = pixels;
     return true;
 }
+
+static bool load_webp_from_memory(const uint8_t *buf, size_t size, raw_image_t *out_img,
+                                  bool want_rgba)
+{
+    pthread_once(&g_webp_once, init_webp_lib);
+    if (!g_webp_ready)
+        return false;
+
+    wwal_webp_bitstream_features_t features;
+    memset(&features, 0, sizeof(features));
+    if (g_fn_WebPGetFeaturesInternal(buf, size, &features, WWAL_WEBP_DECODER_ABI_VERSION) != 0) {
+        return false;
+    }
+
+    if (features.has_animation != 0) {
+        if (!g_webpdemux_ready)
+            return false;
+        wwal_webp_data_t wdata = {.bytes = buf, .size = size};
+        void *dmux = g_fn_WebPDemuxInternal(&wdata, 0, NULL, WWAL_WEBP_DEMUX_ABI_VERSION);
+        if (!dmux)
+            return false;
+
+        uint32_t cw = g_fn_WebPDemuxGetI(dmux, WWAL_WEBP_FF_CANVAS_WIDTH);
+        uint32_t ch = g_fn_WebPDemuxGetI(dmux, WWAL_WEBP_FF_CANVAS_HEIGHT);
+        if (cw == 0 || ch == 0 || cw > WWAL_IMG_MAX_DIM || ch > WWAL_IMG_MAX_DIM) {
+            g_fn_WebPDemuxDelete(dmux);
+            return false;
+        }
+
+        wwal_webp_iterator_t iter;
+        memset(&iter, 0, sizeof(iter));
+        if (!g_fn_WebPDemuxGetFrame(dmux, 1, &iter) || !iter.fragment.bytes ||
+            iter.fragment.size == 0 || iter.width <= 0 || iter.height <= 0 ||
+            iter.width > (int)WWAL_IMG_MAX_DIM || iter.height > (int)WWAL_IMG_MAX_DIM) {
+            g_fn_WebPDemuxDelete(dmux);
+            return false;
+        }
+
+        wwal_webp_bitstream_features_t ffeat;
+        memset(&ffeat, 0, sizeof(ffeat));
+        if (g_fn_WebPGetFeaturesInternal(iter.fragment.bytes, iter.fragment.size, &ffeat,
+                                         WWAL_WEBP_DECODER_ABI_VERSION) != 0 ||
+            ffeat.width <= 0 || ffeat.height <= 0) {
+            g_fn_WebPDemuxReleaseIterator(&iter);
+            g_fn_WebPDemuxDelete(dmux);
+            return false;
+        }
+
+        uint8_t *frame_px = NULL;
+        uint32_t fw = (uint32_t)ffeat.width;
+        uint32_t fh = (uint32_t)ffeat.height;
+        bool dec_ok =
+            decode_webp_frame_direct(iter.fragment.bytes, iter.fragment.size, fw, fh, ffeat.format,
+                                     ffeat.has_alpha != 0, want_rgba, &frame_px);
+        int x_off = iter.x_offset;
+        int y_off = iter.y_offset;
+        g_fn_WebPDemuxReleaseIterator(&iter);
+        g_fn_WebPDemuxDelete(dmux);
+
+        if (!dec_ok || !frame_px)
+            return false;
+
+        if (x_off == 0 && y_off == 0 && fw == cw && fh == ch) {
+            fill_raw_image(out_img, frame_px, cw, ch);
+            return true;
+        }
+
+        uint8_t *canvas = alloc_aligned_rgba((size_t)cw * (size_t)ch * 4U);
+        if (!canvas) {
+            free(frame_px);
+            return false;
+        }
+        memset(canvas, 0, (size_t)cw * (size_t)ch * 4U);
+
+        for (uint32_t fy = 0; fy < fh; ++fy) {
+            int64_t dy = (int64_t)y_off + (int64_t)fy;
+            if (dy < 0 || dy >= (int64_t)ch)
+                continue;
+            int64_t sx0 = (x_off < 0) ? -(int64_t)x_off : 0;
+            int64_t dx0 = (x_off < 0) ? 0 : (int64_t)x_off;
+            if (dx0 >= (int64_t)cw || sx0 >= (int64_t)fw)
+                continue;
+            int64_t copy_w = (int64_t)fw - sx0;
+            if (dx0 + copy_w > (int64_t)cw)
+                copy_w = (int64_t)cw - dx0;
+            if (copy_w > 0) {
+                memcpy(canvas + ((size_t)dy * cw + (size_t)dx0) * 4U,
+                       frame_px + ((size_t)fy * fw + (size_t)sx0) * 4U, (size_t)copy_w * 4U);
+            }
+        }
+        free(frame_px);
+        fill_raw_image(out_img, canvas, cw, ch);
+        return true;
+    }
+
+    if (features.width <= 0 || features.height <= 0 || features.width > (int)WWAL_IMG_MAX_DIM ||
+        features.height > (int)WWAL_IMG_MAX_DIM) {
+        return false;
+    }
+
+    uint32_t w = (uint32_t)features.width;
+    uint32_t h = (uint32_t)features.height;
+    uint8_t *pixels = NULL;
+    if (!decode_webp_frame_direct(buf, size, w, h, features.format, features.has_alpha != 0,
+                                  want_rgba, &pixels)) {
+        return false;
+    }
+
+    fill_raw_image(out_img, pixels, w, h);
+    return true;
+}
+
+/* ============================================================================
+ * Lazy libavif Loader
+ * ============================================================================ */
+
+enum {
+    WWAL_AVIF_RGB_FORMAT_RGBA = 1,
+    WWAL_AVIF_RGB_FORMAT_BGRA = 4,
+};
 
 typedef struct {
     uint32_t width;
@@ -1028,13 +2001,9 @@ static void init_avif_lib(void)
 {
 #ifndef WWAL_DISABLE_AVIF
     static const char *const avif_sonames[] = {
-        "libavif.so.16", "libavif.so.15", "libavif.so.14", "libavif.so.17", "libavif.so",
+        "libavif.so.16", "libavif.so.15", "libavif.so.17", "libavif.so.14", "libavif.so",
     };
-    for (size_t i = 0; i < sizeof(avif_sonames) / sizeof(avif_sonames[0]); ++i) {
-        g_avif_handle = dlopen(avif_sonames[i], RTLD_LAZY | RTLD_NODELETE);
-        if (g_avif_handle)
-            break;
-    }
+    g_avif_handle = open_dl_sonames(avif_sonames, sizeof(avif_sonames) / sizeof(avif_sonames[0]));
     if (!g_avif_handle)
         return;
 
@@ -1053,7 +2022,8 @@ static void init_avif_lib(void)
 #endif
 }
 
-static bool load_avif_from_memory(const uint8_t *buf, size_t size, raw_image_t *out_img)
+static bool load_avif_from_memory(const uint8_t *buf, size_t size, raw_image_t *out_img,
+                                  bool want_rgba)
 {
     pthread_once(&g_avif_once, init_avif_lib);
     if (!g_avif_ready)
@@ -1091,12 +2061,12 @@ static bool load_avif_from_memory(const uint8_t *buf, size_t size, raw_image_t *
 
     uint32_t w = decoder->image->width;
     uint32_t h = decoder->image->height;
-    if (w == 0 || h == 0 || w > 16384 || h > 16384) {
+    if (w == 0 || h == 0 || w > WWAL_IMG_MAX_DIM || h > WWAL_IMG_MAX_DIM) {
         g_fn_avifDecoderDestroy(decoder);
         return false;
     }
 
-    size_t out_bytes = (size_t)w * (size_t)h * 4;
+    size_t out_bytes = (size_t)w * (size_t)h * 4U;
     uint8_t *pixels = alloc_aligned_rgba(out_bytes);
     if (!pixels) {
         g_fn_avifDecoderDestroy(decoder);
@@ -1107,9 +2077,9 @@ static bool load_avif_from_memory(const uint8_t *buf, size_t size, raw_image_t *
     memset(&rgb, 0, sizeof(rgb));
     g_fn_avifRGBImageSetDefaults(&rgb, decoder->image);
     rgb.depth = 8;
-    rgb.format = 3; /* AVIF_RGB_FORMAT_BGRA */
+    rgb.format = want_rgba ? WWAL_AVIF_RGB_FORMAT_RGBA : WWAL_AVIF_RGB_FORMAT_BGRA;
     rgb.pixels = pixels;
-    rgb.rowBytes = w * 4;
+    rgb.rowBytes = w * 4U;
 
     if (g_fn_avifImageYUVToRGB(decoder->image, &rgb) != 0) {
         free(pixels);
@@ -1121,6 +2091,10 @@ static bool load_avif_from_memory(const uint8_t *buf, size_t size, raw_image_t *
     fill_raw_image(out_img, pixels, w, h);
     return true;
 }
+
+/* ============================================================================
+ * Lazy libjxl + libjxl_threads Loader
+ * ============================================================================ */
 
 typedef struct {
     int have_container;
@@ -1162,35 +2136,47 @@ typedef struct {
 typedef void *(*jxl_decoder_create_fn)(const void *);
 typedef void (*jxl_decoder_destroy_fn)(void *);
 typedef int (*jxl_decoder_subscribe_events_fn)(void *, int);
+typedef int (*jxl_decoder_set_parallel_runner_fn)(void *, void *, void *);
 typedef int (*jxl_decoder_set_input_fn)(void *, const uint8_t *, size_t);
 typedef int (*jxl_decoder_process_input_fn)(void *);
 typedef int (*jxl_decoder_get_basic_info_fn)(const void *, wwal_jxl_basic_info_t *);
 typedef int (*jxl_decoder_set_image_out_buffer_fn)(void *, const wwal_jxl_pixel_format_t *, void *,
                                                    size_t);
+typedef void *(*jxl_thread_runner_create_fn)(const void *, size_t);
+typedef void (*jxl_thread_runner_destroy_fn)(void *);
+typedef size_t (*jxl_thread_runner_default_threads_fn)(void);
 
 static pthread_once_t g_jxl_once = PTHREAD_ONCE_INIT;
 static void *g_jxl_handle = NULL;
+static void *g_jxl_threads_handle = NULL;
 static jxl_decoder_create_fn g_fn_JxlDecoderCreate = NULL;
 static jxl_decoder_destroy_fn g_fn_JxlDecoderDestroy = NULL;
 static jxl_decoder_subscribe_events_fn g_fn_JxlDecoderSubscribeEvents = NULL;
+static jxl_decoder_set_parallel_runner_fn g_fn_JxlDecoderSetParallelRunner = NULL;
 static jxl_decoder_set_input_fn g_fn_JxlDecoderSetInput = NULL;
 static jxl_decoder_process_input_fn g_fn_JxlDecoderProcessInput = NULL;
 static jxl_decoder_get_basic_info_fn g_fn_JxlDecoderGetBasicInfo = NULL;
 static jxl_decoder_set_image_out_buffer_fn g_fn_JxlDecoderSetImageOutBuffer = NULL;
+static void *g_sym_JxlThreadParallelRunner = NULL;
+static jxl_thread_runner_create_fn g_fn_JxlThreadParallelRunnerCreate = NULL;
+static jxl_thread_runner_destroy_fn g_fn_JxlThreadParallelRunnerDestroy = NULL;
+static jxl_thread_runner_default_threads_fn g_fn_JxlThreadParallelRunnerDefaultNumWorkerThreads =
+    NULL;
 static bool g_jxl_ready = false;
+static bool g_jxl_threads_ready = false;
 
 static void init_jxl_lib(void)
 {
 #ifndef WWAL_DISABLE_JXL
     static const char *const jxl_sonames[] = {
-        "libjxl.so.0.11", "libjxl.so.0.12", "libjxl.so.0.10", "libjxl.so.0.9", "libjxl.so",
+        "libjxl.so.0.12", "libjxl.so.0.11", "libjxl.so.0.10", "libjxl.so.0.9", "libjxl.so",
+    };
+    static const char *const jxl_threads_sonames[] = {
+        "libjxl_threads.so.0.12", "libjxl_threads.so.0.11", "libjxl_threads.so.0.10",
+        "libjxl_threads.so.0.9",  "libjxl_threads.so",
     };
 
-    for (size_t i = 0; i < sizeof(jxl_sonames) / sizeof(jxl_sonames[0]); ++i) {
-        g_jxl_handle = dlopen(jxl_sonames[i], RTLD_LAZY | RTLD_NODELETE);
-        if (g_jxl_handle)
-            break;
-    }
+    g_jxl_handle = open_dl_sonames(jxl_sonames, sizeof(jxl_sonames) / sizeof(jxl_sonames[0]));
     if (!g_jxl_handle)
         return;
 
@@ -1203,19 +2189,36 @@ static void init_jxl_lib(void)
         resolve_symbol(g_jxl_handle, "JxlDecoderGetBasicInfo", &g_fn_JxlDecoderGetBasicInfo) &&
         resolve_symbol(g_jxl_handle, "JxlDecoderSetImageOutBuffer",
                        &g_fn_JxlDecoderSetImageOutBuffer)) {
+        (void)resolve_symbol(g_jxl_handle, "JxlDecoderSetParallelRunner",
+                             &g_fn_JxlDecoderSetParallelRunner);
         g_jxl_ready = true;
+    }
+
+    g_jxl_threads_handle = open_dl_sonames(jxl_threads_sonames, sizeof(jxl_threads_sonames) /
+                                                                    sizeof(jxl_threads_sonames[0]));
+    if (g_jxl_threads_handle && g_fn_JxlDecoderSetParallelRunner) {
+        g_sym_JxlThreadParallelRunner = dlsym(g_jxl_threads_handle, "JxlThreadParallelRunner");
+        if (g_sym_JxlThreadParallelRunner &&
+            resolve_symbol(g_jxl_threads_handle, "JxlThreadParallelRunnerCreate",
+                           &g_fn_JxlThreadParallelRunnerCreate) &&
+            resolve_symbol(g_jxl_threads_handle, "JxlThreadParallelRunnerDestroy",
+                           &g_fn_JxlThreadParallelRunnerDestroy) &&
+            resolve_symbol(g_jxl_threads_handle, "JxlThreadParallelRunnerDefaultNumWorkerThreads",
+                           &g_fn_JxlThreadParallelRunnerDefaultNumWorkerThreads)) {
+            g_jxl_threads_ready = true;
+        }
     }
 #else
     (void)g_jxl_handle;
+    (void)g_jxl_threads_handle;
 #endif
 }
 
-static bool load_jxl_from_memory(const uint8_t *buf, size_t size, raw_image_t *out_img)
+static bool load_jxl_from_memory(const uint8_t *buf, size_t size, raw_image_t *out_img,
+                                 bool want_rgba)
 {
     enum {
         JXL_DEC_SUCCESS = 0,
-        JXL_DEC_ERROR = 1,
-        JXL_DEC_NEED_MORE_INPUT = 2,
         JXL_DEC_NEED_IMAGE_OUT_BUFFER = 5,
         JXL_DEC_BASIC_INFO = 0x40,
         JXL_DEC_FULL_IMAGE = 0x1000,
@@ -1231,10 +2234,27 @@ static bool load_jxl_from_memory(const uint8_t *buf, size_t size, raw_image_t *o
     if (!dec)
         return false;
 
+    void *runner = NULL;
+    if (g_jxl_threads_ready) {
+        size_t nthreads = g_fn_JxlThreadParallelRunnerDefaultNumWorkerThreads();
+        if (nthreads < 1U)
+            nthreads = 1U;
+        if (nthreads > 8U)
+            nthreads = 8U;
+        runner = g_fn_JxlThreadParallelRunnerCreate(NULL, nthreads);
+        if (runner && g_fn_JxlDecoderSetParallelRunner(dec, g_sym_JxlThreadParallelRunner,
+                                                       runner) != JXL_DEC_SUCCESS) {
+            g_fn_JxlThreadParallelRunnerDestroy(runner);
+            runner = NULL;
+        }
+    }
+
     if (g_fn_JxlDecoderSubscribeEvents(dec, JXL_DEC_BASIC_INFO | JXL_DEC_FULL_IMAGE) !=
             JXL_DEC_SUCCESS ||
         g_fn_JxlDecoderSetInput(dec, buf, size) != JXL_DEC_SUCCESS) {
         g_fn_JxlDecoderDestroy(dec);
+        if (runner)
+            g_fn_JxlThreadParallelRunnerDestroy(runner);
         return false;
     }
 
@@ -1256,12 +2276,12 @@ static bool load_jxl_from_memory(const uint8_t *buf, size_t size, raw_image_t *o
             wwal_jxl_basic_info_t info;
             memset(&info, 0, sizeof(info));
             if (g_fn_JxlDecoderGetBasicInfo(dec, &info) != JXL_DEC_SUCCESS || info.xsize == 0 ||
-                info.ysize == 0 || info.xsize > 16384 || info.ysize > 16384) {
+                info.ysize == 0 || info.xsize > WWAL_IMG_MAX_DIM || info.ysize > WWAL_IMG_MAX_DIM) {
                 break;
             }
             w = info.xsize;
             h = info.ysize;
-            out_bytes = (size_t)w * (size_t)h * 4;
+            out_bytes = (size_t)w * (size_t)h * 4U;
             pixels = alloc_aligned_rgba(out_bytes);
             if (!pixels)
                 break;
@@ -1272,11 +2292,9 @@ static bool load_jxl_from_memory(const uint8_t *buf, size_t size, raw_image_t *o
             }
         } else if (status == JXL_DEC_FULL_IMAGE) {
             decoded = (pixels != NULL);
-            if (decoded) {
+            if (decoded && !want_rgba) {
                 swizzle_rgba_to_bgra_inplace(pixels, out_bytes);
             }
-            break;
-        } else if (status == JXL_DEC_SUCCESS) {
             break;
         } else {
             break;
@@ -1284,6 +2302,8 @@ static bool load_jxl_from_memory(const uint8_t *buf, size_t size, raw_image_t *o
     }
 
     g_fn_JxlDecoderDestroy(dec);
+    if (runner)
+        g_fn_JxlThreadParallelRunnerDestroy(runner);
 
     if (!decoded || !pixels) {
         free(pixels);
@@ -1293,6 +2313,10 @@ static bool load_jxl_from_memory(const uint8_t *buf, size_t size, raw_image_t *o
     fill_raw_image(out_img, pixels, w, h);
     return true;
 }
+
+/* ============================================================================
+ * Lazy librsvg + libcairo + libgobject Loader & Hardened SVG Fallback
+ * ============================================================================ */
 
 static bool svg_extract_attr(const char *tag_start, const char *tag_end, const char *attr_name,
                              char *out_val, size_t out_cap)
@@ -1380,31 +2404,31 @@ static void svg_parse_dimensions(const char *svg_text, uint32_t *out_w, uint32_t
             if (svg_extract_attr(svg_tag, tag_end, "width", val, sizeof(val))) {
                 if (strchr(val, '%') == NULL) {
                     float wf = strtof(val, NULL);
-                    if (isfinite(wf) && wf > 0.0f && wf <= 16384.0f)
+                    if (isfinite(wf) && wf > 0.0f && wf <= (float)WWAL_IMG_MAX_DIM)
                         w = (uint32_t)lroundf(wf);
                 }
             }
             if (svg_extract_attr(svg_tag, tag_end, "height", val, sizeof(val))) {
                 if (strchr(val, '%') == NULL) {
                     float hf = strtof(val, NULL);
-                    if (isfinite(hf) && hf > 0.0f && hf <= 16384.0f)
+                    if (isfinite(hf) && hf > 0.0f && hf <= (float)WWAL_IMG_MAX_DIM)
                         h = (uint32_t)lroundf(hf);
                 }
             }
         }
     }
 
-    if (w == 0 && vw > 0.0f && vw <= 16384.0f)
+    if (w == 0 && isfinite(vw) && vw > 0.0f && vw <= (float)WWAL_IMG_MAX_DIM)
         w = (uint32_t)lroundf(vw);
-    if (h == 0 && vh > 0.0f && vh <= 16384.0f)
+    if (h == 0 && isfinite(vh) && vh > 0.0f && vh <= (float)WWAL_IMG_MAX_DIM)
         h = (uint32_t)lroundf(vh);
     if (w == 0)
         w = 256;
     if (h == 0)
         h = 256;
-    if (vw <= 0.0f)
+    if (!isfinite(vw) || vw <= 0.0f)
         vw = (float)w;
-    if (vh <= 0.0f)
+    if (!isfinite(vh) || vh <= 0.0f)
         vh = (float)h;
 
     *out_w = w;
@@ -1457,9 +2481,14 @@ static bool g_rsvg_ready = false;
 static void init_rsvg_lib(void)
 {
 #ifndef WWAL_DISABLE_SVG
-    g_rsvg_handle = dlopen("librsvg-2.so.2", RTLD_LAZY | RTLD_NODELETE);
-    g_cairo_handle = dlopen("libcairo.so.2", RTLD_LAZY | RTLD_NODELETE);
-    g_gobj_handle = dlopen("libgobject-2.0.so.0", RTLD_LAZY | RTLD_NODELETE);
+    static const char *const rsvg_sonames[] = {"librsvg-2.so.2", "librsvg-2.so"};
+    static const char *const cairo_sonames[] = {"libcairo.so.2", "libcairo.so"};
+    static const char *const gobj_sonames[] = {"libgobject-2.0.so.0", "libgobject-2.0.so"};
+
+    g_rsvg_handle = open_dl_sonames(rsvg_sonames, sizeof(rsvg_sonames) / sizeof(rsvg_sonames[0]));
+    g_cairo_handle =
+        open_dl_sonames(cairo_sonames, sizeof(cairo_sonames) / sizeof(cairo_sonames[0]));
+    g_gobj_handle = open_dl_sonames(gobj_sonames, sizeof(gobj_sonames) / sizeof(gobj_sonames[0]));
     if (!g_rsvg_handle || !g_cairo_handle)
         return;
 
@@ -1529,7 +2558,7 @@ static uint8_t *sanitize_svg_xml(const uint8_t *buf, size_t size, size_t *out_le
     return clean;
 }
 
-static bool load_svg_librsvg(const uint8_t *buf, size_t size, raw_image_t *out_img)
+static bool load_svg_librsvg(const uint8_t *buf, size_t size, raw_image_t *out_img, bool want_rgba)
 {
     if (!buf || size == 0 || size > 64U * 1024U * 1024U)
         return false;
@@ -1558,13 +2587,14 @@ static bool load_svg_librsvg(const uint8_t *buf, size_t size, raw_image_t *out_i
 
     double dw = 0.0, dh = 0.0;
     uint32_t w = parsed_w, h = parsed_h;
-    if (g_fn_rsvg_handle_get_intrinsic_size_in_pixels(handle, &dw, &dh) && dw > 0.0 && dh > 0.0 &&
-        dw <= 16384.0 && dh <= 16384.0) {
+    if (g_fn_rsvg_handle_get_intrinsic_size_in_pixels(handle, &dw, &dh) && isfinite(dw) &&
+        isfinite(dh) && dw > 0.0 && dh > 0.0 && dw <= (double)WWAL_IMG_MAX_DIM &&
+        dh <= (double)WWAL_IMG_MAX_DIM) {
         w = (uint32_t)ceil(dw);
         h = (uint32_t)ceil(dh);
     }
 
-    void *surface = g_fn_cairo_image_surface_create(0 /* CAIRO_FORMAT_ARGB32 */, (int)w, (int)h);
+    void *surface = g_fn_cairo_image_surface_create(0, (int)w, (int)h);
     if (!surface || g_fn_cairo_surface_status(surface) != 0) {
         if (surface)
             g_fn_cairo_surface_destroy(surface);
@@ -1574,6 +2604,13 @@ static bool load_svg_librsvg(const uint8_t *buf, size_t size, raw_image_t *out_i
     }
 
     void *cr = g_fn_cairo_create(surface);
+    if (!cr) {
+        g_fn_cairo_surface_destroy(surface);
+        if (g_fn_g_object_unref)
+            g_fn_g_object_unref(handle);
+        return false;
+    }
+
     rsvg_rect_t viewport = {.x = 0.0, .y = 0.0, .width = (double)w, .height = (double)h};
     int render_ok = g_fn_rsvg_handle_render_document(handle, cr, &viewport, NULL);
     g_fn_cairo_surface_flush(surface);
@@ -1582,12 +2619,12 @@ static bool load_svg_librsvg(const uint8_t *buf, size_t size, raw_image_t *out_i
     int src_stride = g_fn_cairo_image_surface_get_stride(surface);
 
     uint8_t *pixels = NULL;
-    if (render_ok && src_data && src_stride >= (int)(w * 4)) {
-        pixels = alloc_aligned_rgba((size_t)w * (size_t)h * 4);
+    if (render_ok && src_data && src_stride >= (int)(w * 4U)) {
+        pixels = alloc_aligned_rgba((size_t)w * (size_t)h * 4U);
         if (pixels) {
             for (uint32_t y = 0; y < h; ++y) {
                 const uint8_t *srow = src_data + (size_t)y * (size_t)src_stride;
-                uint8_t *drow = pixels + (size_t)y * (size_t)w * 4;
+                uint8_t *drow = pixels + (size_t)y * (size_t)w * 4U;
                 for (uint32_t x = 0; x < w; ++x) {
                     uint8_t b = srow[x * 4 + 0];
                     uint8_t g = srow[x * 4 + 1];
@@ -1601,9 +2638,9 @@ static bool load_svg_librsvg(const uint8_t *buf, size_t size, raw_image_t *out_i
                         g = (uint8_t)(gu > 255U ? 255U : gu);
                         b = (uint8_t)(bu > 255U ? 255U : bu);
                     }
-                    drow[x * 4 + 0] = b;
+                    drow[x * 4 + 0] = want_rgba ? r : b;
                     drow[x * 4 + 1] = g;
-                    drow[x * 4 + 2] = r;
+                    drow[x * 4 + 2] = want_rgba ? b : r;
                     drow[x * 4 + 3] = a;
                 }
             }
@@ -1708,8 +2745,9 @@ static svg_rgba_t svg_sample_grad(const svg_linear_grad_t *grad, float u, float 
     float dx = grad->x2 - grad->x1;
     float dy = grad->y2 - grad->y1;
     float len2 = dx * dx + dy * dy;
-    float t = (len2 > 1e-6f) ? (((u - grad->x1) * dx + (v - grad->y1) * dy) / len2) : u;
-    if (t <= grad->stops[0].offset)
+    float t =
+        (isfinite(len2) && len2 > 1e-6f) ? (((u - grad->x1) * dx + (v - grad->y1) * dy) / len2) : u;
+    if (!isfinite(t) || t <= grad->stops[0].offset)
         return grad->stops[0].color;
     if (t >= grad->stops[grad->stop_count - 1].offset)
         return grad->stops[grad->stop_count - 1].color;
@@ -1719,6 +2757,10 @@ static svg_rgba_t svg_sample_grad(const svg_linear_grad_t *grad, float u, float 
         float t1 = grad->stops[i + 1].offset;
         if (t >= t0 && t <= t1) {
             float frac = (t1 > t0) ? ((t - t0) / (t1 - t0)) : 0.0f;
+            if (!isfinite(frac) || frac < 0.0f)
+                frac = 0.0f;
+            else if (frac > 1.0f)
+                frac = 1.0f;
             svg_rgba_t c0 = grad->stops[i].color;
             svg_rgba_t c1 = grad->stops[i + 1].color;
             return (svg_rgba_t){
@@ -1732,24 +2774,26 @@ static svg_rgba_t svg_sample_grad(const svg_linear_grad_t *grad, float u, float 
     return grad->stops[grad->stop_count - 1].color;
 }
 
-static void svg_blend_pixel(uint8_t *dst_bgra, svg_rgba_t src)
+static void svg_blend_pixel(uint8_t *dst_px, svg_rgba_t src, bool want_rgba)
 {
     if (src.a == 0)
         return;
+    uint8_t c0 = want_rgba ? src.r : src.b;
+    uint8_t c2 = want_rgba ? src.b : src.r;
     if (src.a == 255) {
-        dst_bgra[0] = src.b;
-        dst_bgra[1] = src.g;
-        dst_bgra[2] = src.r;
-        dst_bgra[3] = 255;
+        dst_px[0] = c0;
+        dst_px[1] = src.g;
+        dst_px[2] = c2;
+        dst_px[3] = 255;
         return;
     }
     uint32_t sa = src.a;
     uint32_t inv_sa = 255U - sa;
-    dst_bgra[0] = (uint8_t)((src.b * sa + dst_bgra[0] * inv_sa + 127U) / 255U);
-    dst_bgra[1] = (uint8_t)((src.g * sa + dst_bgra[1] * inv_sa + 127U) / 255U);
-    dst_bgra[2] = (uint8_t)((src.r * sa + dst_bgra[2] * inv_sa + 127U) / 255U);
-    uint32_t out_a = sa + (dst_bgra[3] * inv_sa + 127U) / 255U;
-    dst_bgra[3] = (uint8_t)(out_a > 255U ? 255U : out_a);
+    dst_px[0] = (uint8_t)((c0 * sa + dst_px[0] * inv_sa + 127U) / 255U);
+    dst_px[1] = (uint8_t)((src.g * sa + dst_px[1] * inv_sa + 127U) / 255U);
+    dst_px[2] = (uint8_t)((c2 * sa + dst_px[2] * inv_sa + 127U) / 255U);
+    uint32_t out_a = sa + (dst_px[3] * inv_sa + 127U) / 255U;
+    dst_px[3] = (uint8_t)(out_a > 255U ? 255U : out_a);
 }
 
 static const svg_linear_grad_t *svg_find_grad(const svg_linear_grad_t *grads, size_t grad_count,
@@ -1776,7 +2820,19 @@ static const svg_linear_grad_t *svg_find_grad(const svg_linear_grad_t *grads, si
     return NULL;
 }
 
-static bool load_svg_builtin_fallback(const uint8_t *buf, size_t size, raw_image_t *out_img)
+static float svg_parse_finite_float(const char *val, float fallback, bool allow_pct,
+                                    float pct_scale)
+{
+    if (!val)
+        return fallback;
+    float v = strtof(val, NULL);
+    if (allow_pct && strchr(val, '%') != NULL)
+        v *= pct_scale;
+    return isfinite(v) ? v : fallback;
+}
+
+static bool load_svg_builtin_fallback(const uint8_t *buf, size_t size, raw_image_t *out_img,
+                                      bool want_rgba)
 {
     if (!buf || size == 0 || size > 64U * 1024U * 1024U)
         return false;
@@ -1790,17 +2846,17 @@ static bool load_svg_builtin_fallback(const uint8_t *buf, size_t size, raw_image
     uint32_t w = 256, h = 256;
     float vx = 0.0f, vy = 0.0f, vw = 256.0f, vh = 256.0f;
     svg_parse_dimensions(svg_text, &w, &h, &vx, &vy, &vw, &vh);
-    if (w == 0 || h == 0 || w > 16384 || h > 16384) {
+    if (w == 0 || h == 0 || w > WWAL_IMG_MAX_DIM || h > WWAL_IMG_MAX_DIM) {
         free(svg_text);
         return false;
     }
 
-    uint8_t *pixels = alloc_aligned_rgba((size_t)w * (size_t)h * 4);
+    uint8_t *pixels = alloc_aligned_rgba((size_t)w * (size_t)h * 4U);
     if (!pixels) {
         free(svg_text);
         return false;
     }
-    memset(pixels, 0, (size_t)w * (size_t)h * 4);
+    memset(pixels, 0, (size_t)w * (size_t)h * 4U);
 
     svg_linear_grad_t grads[16];
     size_t grad_count = 0;
@@ -1820,26 +2876,14 @@ static bool load_svg_builtin_fallback(const uint8_t *buf, size_t size, raw_image
 
         svg_extract_attr(cursor, tag_end, "id", g->id, sizeof(g->id));
         char val[64];
-        if (svg_extract_attr(cursor, tag_end, "x1", val, sizeof(val))) {
-            g->x1 = strtof(val, NULL);
-            if (strchr(val, '%'))
-                g->x1 *= 0.01f;
-        }
-        if (svg_extract_attr(cursor, tag_end, "y1", val, sizeof(val))) {
-            g->y1 = strtof(val, NULL);
-            if (strchr(val, '%'))
-                g->y1 *= 0.01f;
-        }
-        if (svg_extract_attr(cursor, tag_end, "x2", val, sizeof(val))) {
-            g->x2 = strtof(val, NULL);
-            if (strchr(val, '%'))
-                g->x2 *= 0.01f;
-        }
-        if (svg_extract_attr(cursor, tag_end, "y2", val, sizeof(val))) {
-            g->y2 = strtof(val, NULL);
-            if (strchr(val, '%'))
-                g->y2 *= 0.01f;
-        }
+        if (svg_extract_attr(cursor, tag_end, "x1", val, sizeof(val)))
+            g->x1 = svg_parse_finite_float(val, 0.0f, true, 0.01f);
+        if (svg_extract_attr(cursor, tag_end, "y1", val, sizeof(val)))
+            g->y1 = svg_parse_finite_float(val, 0.0f, true, 0.01f);
+        if (svg_extract_attr(cursor, tag_end, "x2", val, sizeof(val)))
+            g->x2 = svg_parse_finite_float(val, 1.0f, true, 0.01f);
+        if (svg_extract_attr(cursor, tag_end, "y2", val, sizeof(val)))
+            g->y2 = svg_parse_finite_float(val, 0.0f, true, 0.01f);
 
         const char *stop_p = tag_end + 1;
         while (g->stop_count < 8 && (stop_p = strcasestr(stop_p, "<stop")) != NULL &&
@@ -1849,9 +2893,11 @@ static bool load_svg_builtin_fallback(const uint8_t *buf, size_t size, raw_image
                 break;
             float offset = 0.0f;
             if (svg_extract_attr(stop_p, stop_end, "offset", val, sizeof(val))) {
-                offset = strtof(val, NULL);
-                if (strchr(val, '%'))
-                    offset *= 0.01f;
+                offset = svg_parse_finite_float(val, 0.0f, true, 0.01f);
+                if (offset < 0.0f)
+                    offset = 0.0f;
+                if (offset > 1.0f)
+                    offset = 1.0f;
             }
             svg_rgba_t sc = {0, 0, 0, 255};
             if (svg_extract_attr(stop_p, stop_end, "stop-color", val, sizeof(val))) {
@@ -1859,9 +2905,9 @@ static bool load_svg_builtin_fallback(const uint8_t *buf, size_t size, raw_image
             }
             if (svg_extract_attr(stop_p, stop_end, "stop-opacity", val, sizeof(val))) {
                 float op = strtof(val, NULL);
-                if (op < 0.0f)
+                if (!isfinite(op) || op < 0.0f)
                     op = 0.0f;
-                if (op > 1.0f)
+                else if (op > 1.0f)
                     op = 1.0f;
                 sc.a = (uint8_t)lroundf(op * 255.0f);
             }
@@ -1886,7 +2932,7 @@ static bool load_svg_builtin_fallback(const uint8_t *buf, size_t size, raw_image
              svg_extract_attr(svg_tag, svg_end, "fill", bg_str, sizeof(bg_str))) &&
             svg_parse_color(bg_str, &bg_col)) {
             for (size_t i = 0; i < (size_t)w * (size_t)h; ++i) {
-                svg_blend_pixel(pixels + i * 4, bg_col);
+                svg_blend_pixel(pixels + i * 4, bg_col, want_rgba);
             }
         }
     }
@@ -1942,30 +2988,28 @@ static bool load_svg_builtin_fallback(const uint8_t *buf, size_t size, raw_image
 
             if (has_fill && isfinite(rx) && isfinite(ry) && isfinite(rw) && isfinite(rh) &&
                 rw > 0.0f && rh > 0.0f) {
-                int x0 = (int)floorf((rx - vx) * scale_x);
-                int y0 = (int)floorf((ry - vy) * scale_y);
-                int x1 = (int)ceilf((rx + rw - vx) * scale_x);
-                int y1 = (int)ceilf((ry + rh - vy) * scale_y);
-                if (x0 < 0)
-                    x0 = 0;
-                if (y0 < 0)
-                    y0 = 0;
-                if (x1 > (int)w)
-                    x1 = (int)w;
-                if (y1 > (int)h)
-                    y1 = (int)h;
+                float fx0 = floorf((rx - vx) * scale_x);
+                float fy0 = floorf((ry - vy) * scale_y);
+                float fx1 = ceilf((rx + rw - vx) * scale_x);
+                float fy1 = ceilf((ry + rh - vy) * scale_y);
+                if (isfinite(fx0) && isfinite(fy0) && isfinite(fx1) && isfinite(fy1)) {
+                    int x0 = (fx0 < 0.0f) ? 0 : (fx0 > (float)w ? (int)w : (int)fx0);
+                    int y0 = (fy0 < 0.0f) ? 0 : (fy0 > (float)h ? (int)h : (int)fy0);
+                    int x1 = (fx1 < 0.0f) ? 0 : (fx1 > (float)w ? (int)w : (int)fx1);
+                    int y1 = (fy1 < 0.0f) ? 0 : (fy1 > (float)h ? (int)h : (int)fy1);
 
-                for (int py = y0; py < y1; ++py) {
-                    float v = (y1 > y0) ? ((float)(py - y0) / (float)(y1 - y0)) : 0.0f;
-                    uint8_t *row = pixels + (size_t)py * (size_t)w * 4;
-                    for (int px = x0; px < x1; ++px) {
-                        svg_rgba_t c = fill_col;
-                        if (grad) {
-                            float u = (x1 > x0) ? ((float)(px - x0) / (float)(x1 - x0)) : 0.0f;
-                            c = svg_sample_grad(grad, u, v);
+                    for (int py = y0; py < y1; ++py) {
+                        float v = (y1 > y0) ? ((float)(py - y0) / (float)(y1 - y0)) : 0.0f;
+                        uint8_t *row = pixels + (size_t)py * (size_t)w * 4U;
+                        for (int px = x0; px < x1; ++px) {
+                            svg_rgba_t c = fill_col;
+                            if (grad) {
+                                float u = (x1 > x0) ? ((float)(px - x0) / (float)(x1 - x0)) : 0.0f;
+                                c = svg_sample_grad(grad, u, v);
+                            }
+                            c.a = (uint8_t)lroundf((float)c.a * opacity);
+                            svg_blend_pixel(row + (size_t)px * 4U, c, want_rgba);
                         }
-                        c.a = (uint8_t)lroundf((float)c.a * opacity);
-                        svg_blend_pixel(row + (size_t)px * 4, c);
                     }
                 }
             }
@@ -2011,31 +3055,31 @@ static bool load_svg_builtin_fallback(const uint8_t *buf, size_t size, raw_image
                 float pcy = (cy - vy) * scale_y;
                 float prx = r * scale_x;
                 float pry = r * scale_y;
-                int x0 = (int)floorf(pcx - prx);
-                int y0 = (int)floorf(pcy - pry);
-                int x1 = (int)ceilf(pcx + prx);
-                int y1 = (int)ceilf(pcy + pry);
-                if (x0 < 0)
-                    x0 = 0;
-                if (y0 < 0)
-                    y0 = 0;
-                if (x1 > (int)w)
-                    x1 = (int)w;
-                if (y1 > (int)h)
-                    y1 = (int)h;
+                float fx0 = floorf(pcx - prx);
+                float fy0 = floorf(pcy - pry);
+                float fx1 = ceilf(pcx + prx);
+                float fy1 = ceilf(pcy + pry);
+                if (isfinite(pcx) && isfinite(pcy) && isfinite(prx) && isfinite(pry) &&
+                    isfinite(fx0) && isfinite(fy0) && isfinite(fx1) && isfinite(fy1)) {
+                    int x0 = (fx0 < 0.0f) ? 0 : (fx0 > (float)w ? (int)w : (int)fx0);
+                    int y0 = (fy0 < 0.0f) ? 0 : (fy0 > (float)h ? (int)h : (int)fy0);
+                    int x1 = (fx1 < 0.0f) ? 0 : (fx1 > (float)w ? (int)w : (int)fx1);
+                    int y1 = (fy1 < 0.0f) ? 0 : (fy1 > (float)h ? (int)h : (int)fy1);
 
-                for (int py = y0; py < y1; ++py) {
-                    float dy = ((float)py + 0.5f - pcy) / (pry > 1e-5f ? pry : 1.0f);
-                    uint8_t *row = pixels + (size_t)py * (size_t)w * 4;
-                    for (int px = x0; px < x1; ++px) {
-                        float dx = ((float)px + 0.5f - pcx) / (prx > 1e-5f ? prx : 1.0f);
-                        if (dx * dx + dy * dy <= 1.0f) {
-                            svg_rgba_t c = fill_col;
-                            if (grad) {
-                                c = svg_sample_grad(grad, 0.5f * (dx + 1.0f), 0.5f * (dy + 1.0f));
+                    for (int py = y0; py < y1; ++py) {
+                        float dy = ((float)py + 0.5f - pcy) / (pry > 1e-5f ? pry : 1.0f);
+                        uint8_t *row = pixels + (size_t)py * (size_t)w * 4U;
+                        for (int px = x0; px < x1; ++px) {
+                            float dx = ((float)px + 0.5f - pcx) / (prx > 1e-5f ? prx : 1.0f);
+                            if (dx * dx + dy * dy <= 1.0f) {
+                                svg_rgba_t c = fill_col;
+                                if (grad) {
+                                    c = svg_sample_grad(grad, 0.5f * (dx + 1.0f),
+                                                        0.5f * (dy + 1.0f));
+                                }
+                                c.a = (uint8_t)lroundf((float)c.a * opacity);
+                                svg_blend_pixel(row + (size_t)px * 4U, c, want_rgba);
                             }
-                            c.a = (uint8_t)lroundf((float)c.a * opacity);
-                            svg_blend_pixel(row + (size_t)px * 4, c);
                         }
                     }
                 }
@@ -2052,12 +3096,17 @@ static bool load_svg_builtin_fallback(const uint8_t *buf, size_t size, raw_image
     return true;
 }
 
-static bool load_svg_from_memory(const uint8_t *buf, size_t size, raw_image_t *out_img)
+static bool load_svg_from_memory(const uint8_t *buf, size_t size, raw_image_t *out_img,
+                                 bool want_rgba)
 {
-    if (load_svg_librsvg(buf, size, out_img))
+    if (load_svg_librsvg(buf, size, out_img, want_rgba))
         return true;
-    return load_svg_builtin_fallback(buf, size, out_img);
+    return load_svg_builtin_fallback(buf, size, out_img, want_rgba);
 }
+
+/* ============================================================================
+ * Magic Detection & Unified Format-Direct Public API
+ * ============================================================================ */
 
 static bool is_avif_or_heic_magic(const uint8_t *buf, size_t size)
 {
@@ -2107,23 +3156,27 @@ static bool is_svg_magic(const uint8_t *buf, size_t size)
     return false;
 }
 
-bool image_load_from_memory(const uint8_t *buf, size_t size, raw_image_t *out_img)
+static bool load_from_memory_fmt(const uint8_t *buf, size_t size, raw_image_t *out_img,
+                                 bool want_rgba)
 {
     if (!buf || size < 4 || !out_img)
         return false;
     memset(out_img, 0, sizeof(*out_img));
 
     if (size >= 12 && memcmp(buf, "RIFF", 4) == 0 && memcmp(buf + 8, "WEBP", 4) == 0) {
-        return load_webp_from_memory(buf, size, out_img);
+        return load_webp_from_memory(buf, size, out_img, want_rgba);
+    }
+    if (size >= 22 && memcmp(buf, "qoif", 4) == 0) {
+        return load_qoi_from_memory(buf, size, out_img, want_rgba);
     }
     if (is_avif_or_heic_magic(buf, size)) {
-        return load_avif_from_memory(buf, size, out_img);
+        return load_avif_from_memory(buf, size, out_img, want_rgba);
     }
     if (is_jxl_magic(buf, size)) {
-        return load_jxl_from_memory(buf, size, out_img);
+        return load_jxl_from_memory(buf, size, out_img, want_rgba);
     }
     if (is_svg_magic(buf, size)) {
-        return load_svg_from_memory(buf, size, out_img);
+        return load_svg_from_memory(buf, size, out_img, want_rgba);
     }
 
     uint8_t *pixels = NULL;
@@ -2131,22 +3184,27 @@ bool image_load_from_memory(const uint8_t *buf, size_t size, raw_image_t *out_im
     bool ok = false;
 
     if (buf[0] == 0xFF && buf[1] == 0xD8) {
-        ok = load_jpeg_from_memory(buf, size, &pixels, &w, &h);
+        ok = load_jpeg_from_memory(buf, size, want_rgba, &pixels, &w, &h);
+    } else if (size >= 8 && buf[0] == 0x89 && buf[1] == 'P' && buf[2] == 'N' && buf[3] == 'G') {
+        ok = load_png_from_memory(buf, size, want_rgba, &pixels, &w, &h);
     } else {
-        FILE *fp = fmemopen((void *)buf, size, "rb");
-        if (!fp)
-            return false;
-        if (buf[0] == 0x89 && buf[1] == 'P' && buf[2] == 'N' && buf[3] == 'G') {
-            ok = load_png(fp, &pixels, &w, &h);
-        } else if (buf[0] == 'B' && buf[1] == 'M') {
-            ok = load_bmp(fp, &pixels, &w, &h);
-        } else if (buf[0] == 'G' && buf[1] == 'I' && buf[2] == 'F' && buf[3] == '8') {
-            ok = load_gif(fp, &pixels, &w, &h);
-        } else if (buf[0] == 'P' && (buf[1] == '3' || buf[1] == '5' || buf[1] == '6') &&
-                   isspace((unsigned char)buf[2])) {
-            ok = load_pnm(fp, &pixels, &w, &h);
+        bool is_bmp = (buf[0] == 'B' && buf[1] == 'M');
+        bool is_gif = (buf[0] == 'G' && buf[1] == 'I' && buf[2] == 'F' && buf[3] == '8');
+        bool is_pnm = (buf[0] == 'P' && (buf[1] == '3' || buf[1] == '5' || buf[1] == '6') &&
+                       isspace((unsigned char)buf[2]));
+        if (is_bmp || is_gif || is_pnm) {
+            FILE *fp = fmemopen((void *)buf, size, "rb");
+            if (!fp)
+                return false;
+            if (is_bmp) {
+                ok = load_bmp(fp, want_rgba, &pixels, &w, &h);
+            } else if (is_gif) {
+                ok = load_gif(fp, want_rgba, &pixels, &w, &h);
+            } else {
+                ok = load_pnm(fp, want_rgba, &pixels, &w, &h);
+            }
+            fclose(fp);
         }
-        fclose(fp);
     }
 
     if (!ok || !pixels)
@@ -2156,23 +3214,7 @@ bool image_load_from_memory(const uint8_t *buf, size_t size, raw_image_t *out_im
     return true;
 }
 
-bool image_load_from_memory_rgba(const uint8_t *buf, size_t size, uint8_t **out_pixels,
-                                 uint32_t *out_w, uint32_t *out_h)
-{
-    if (!out_pixels || !out_w || !out_h)
-        return false;
-    raw_image_t img;
-    if (!image_load_from_memory(buf, size, &img))
-        return false;
-    size_t num_bytes = (size_t)img.width * (size_t)img.height * 4U;
-    swizzle_rgba_to_bgra_inplace(img.data, num_bytes);
-    *out_pixels = img.data;
-    *out_w = img.width;
-    *out_h = img.height;
-    return true;
-}
-
-bool image_load_fd(int fd, raw_image_t *out_img)
+static bool load_fd_fmt(int fd, raw_image_t *out_img, bool want_rgba)
 {
     if (fd < 0 || !out_img)
         return false;
@@ -2183,7 +3225,7 @@ bool image_load_fd(int fd, raw_image_t *out_img)
         size_t sz = (size_t)st.st_size;
         void *mapped = mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0);
         if (mapped != MAP_FAILED) {
-            bool ok = image_load_from_memory((const uint8_t *)mapped, sz, out_img);
+            bool ok = load_from_memory_fmt((const uint8_t *)mapped, sz, out_img, want_rgba);
             munmap(mapped, sz);
             return ok;
         }
@@ -2201,7 +3243,7 @@ bool image_load_fd(int fd, raw_image_t *out_img)
                 free(buf);
                 return false;
             }
-            size_t next_cap = cap * 2;
+            size_t next_cap = cap * 2U;
             uint8_t *next_buf = (uint8_t *)realloc(buf, next_cap);
             if (!next_buf) {
                 free(buf);
@@ -2222,39 +3264,18 @@ bool image_load_fd(int fd, raw_image_t *out_img)
         len += (size_t)n;
     }
 
-    bool ok = image_load_from_memory(buf, len, out_img);
+    bool ok = load_from_memory_fmt(buf, len, out_img, want_rgba);
     free(buf);
     return ok;
 }
 
-bool image_load_fd_rgba(int fd, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h)
+static bool load_path_fmt(const char *filepath, raw_image_t *out_img, bool want_rgba)
 {
-    if (!out_pixels || !out_w || !out_h)
-        return false;
-    raw_image_t img;
-    if (!image_load_fd(fd, &img))
-        return false;
-    size_t num_bytes = (size_t)img.width * (size_t)img.height * 4U;
-    swizzle_rgba_to_bgra_inplace(img.data, num_bytes);
-    *out_pixels = img.data;
-    *out_w = img.width;
-    *out_h = img.height;
-    return true;
-}
-
-bool image_load(const char *filepath, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h)
-{
-    if (!filepath || !out_pixels || !out_w || !out_h)
+    if (!filepath || !out_img)
         return false;
 
     if (strcmp(filepath, "-") == 0) {
-        raw_image_t img;
-        if (!image_load_fd(STDIN_FILENO, &img))
-            return false;
-        *out_pixels = img.data;
-        *out_w = img.width;
-        *out_h = img.height;
-        return true;
+        return load_fd_fmt(STDIN_FILENO, out_img, want_rgba);
     }
 
     int fd = open(filepath, O_RDONLY | O_CLOEXEC);
@@ -2272,28 +3293,67 @@ bool image_load(const char *filepath, uint8_t **out_pixels, uint32_t *out_w, uin
         size_t sz = (size_t)st.st_size;
         void *mapped = mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0);
         if (mapped != MAP_FAILED) {
-            raw_image_t img;
-            bool ok = image_load_from_memory((const uint8_t *)mapped, sz, &img);
+            bool ok = load_from_memory_fmt((const uint8_t *)mapped, sz, out_img, want_rgba);
             munmap(mapped, sz);
             close(fd);
             if (!ok) {
                 WAYWAL_LOG_ERR("Unsupported or invalid image file: %s", filepath);
                 return false;
             }
-            *out_pixels = img.data;
-            *out_w = img.width;
-            *out_h = img.height;
             return true;
         }
     }
 
-    raw_image_t img;
-    bool ok = image_load_fd(fd, &img);
+    bool ok = load_fd_fmt(fd, out_img, want_rgba);
     close(fd);
     if (!ok) {
         WAYWAL_LOG_ERR("Unsupported image format: %s", filepath);
         return false;
     }
+    return true;
+}
+
+bool image_load_from_memory(const uint8_t *buf, size_t size, raw_image_t *out_img)
+{
+    return load_from_memory_fmt(buf, size, out_img, false);
+}
+
+bool image_load_from_memory_rgba(const uint8_t *buf, size_t size, uint8_t **out_pixels,
+                                 uint32_t *out_w, uint32_t *out_h)
+{
+    if (!out_pixels || !out_w || !out_h)
+        return false;
+    raw_image_t img;
+    if (!load_from_memory_fmt(buf, size, &img, true))
+        return false;
+    *out_pixels = img.data;
+    *out_w = img.width;
+    *out_h = img.height;
+    return true;
+}
+
+bool image_load_fd(int fd, raw_image_t *out_img) { return load_fd_fmt(fd, out_img, false); }
+
+bool image_load_fd_rgba(int fd, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h)
+{
+    if (!out_pixels || !out_w || !out_h)
+        return false;
+    raw_image_t img;
+    if (!load_fd_fmt(fd, &img, true))
+        return false;
+    *out_pixels = img.data;
+    *out_w = img.width;
+    *out_h = img.height;
+    return true;
+}
+
+bool image_load(const char *filepath, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h)
+{
+    if (!out_pixels || !out_w || !out_h)
+        return false;
+    raw_image_t img;
+    if (!load_path_fmt(filepath, &img, false))
+        return false;
     *out_pixels = img.data;
     *out_w = img.width;
     *out_h = img.height;
@@ -2302,23 +3362,20 @@ bool image_load(const char *filepath, uint8_t **out_pixels, uint32_t *out_w, uin
 
 bool image_load_rgba(const char *filepath, uint8_t **out_pixels, uint32_t *out_w, uint32_t *out_h)
 {
-    if (!image_load(filepath, out_pixels, out_w, out_h))
+    if (!out_pixels || !out_w || !out_h)
         return false;
-    size_t num_bytes = (size_t)(*out_w) * (size_t)(*out_h) * 4U;
-    swizzle_rgba_to_bgra_inplace(*out_pixels, num_bytes);
+    raw_image_t img;
+    if (!load_path_fmt(filepath, &img, true))
+        return false;
+    *out_pixels = img.data;
+    *out_w = img.width;
+    *out_h = img.height;
     return true;
 }
 
 bool image_load_raw(const char *filepath, raw_image_t *out_img)
 {
-    if (!filepath || !out_img)
-        return false;
-    uint8_t *pixels = NULL;
-    uint32_t w = 0, h = 0;
-    if (!image_load(filepath, &pixels, &w, &h))
-        return false;
-    fill_raw_image(out_img, pixels, w, h);
-    return true;
+    return load_path_fmt(filepath, out_img, false);
 }
 
 static void ensure_parent_dirs_for_file(const char *filepath)
@@ -2346,10 +3403,14 @@ static void ensure_parent_dirs_for_file(const char *filepath)
 static bool save_png_internal(const char *filepath, const uint8_t *pixels, uint32_t width,
                               uint32_t height, bool is_bgra)
 {
-    if (!filepath || filepath[0] == '\0' || !pixels || width == 0 || height == 0 || width > 16384 ||
-        height > 16384) {
+    if (!filepath || filepath[0] == '\0' || !pixels || width == 0 || height == 0 ||
+        width > WWAL_IMG_MAX_DIM || height > WWAL_IMG_MAX_DIM) {
         return false;
     }
+
+    pthread_once(&g_png_once, init_png_lib);
+    if (!g_png_write_ready)
+        return false;
 
     uint32_t dst_w = width;
     uint32_t dst_h = height;
@@ -2389,16 +3450,16 @@ static bool save_png_internal(const char *filepath, const uint8_t *pixels, uint3
         return false;
     }
 
-    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    void *png = g_fn_png_create_write_struct(g_png_ver_str, NULL, NULL, NULL);
     if (!png) {
         fclose(fp);
         unlink(tmp_path);
         return false;
     }
 
-    png_infop info = png_create_info_struct(png);
+    void *info = g_fn_png_create_info_struct(png);
     if (!info) {
-        png_destroy_write_struct(&png, NULL);
+        g_fn_png_destroy_write_struct(&png, NULL);
         fclose(fp);
         unlink(tmp_path);
         return false;
@@ -2406,29 +3467,30 @@ static bool save_png_internal(const char *filepath, const uint8_t *pixels, uint3
 
     uint8_t *volatile row_buf = (uint8_t *)malloc((size_t)dst_w * 4U);
     if (!row_buf) {
-        png_destroy_write_struct(&png, &info);
+        g_fn_png_destroy_write_struct(&png, &info);
         fclose(fp);
         unlink(tmp_path);
         return false;
     }
 
-    if (setjmp(png_jmpbuf(png))) {
+    jmp_buf *jb = g_fn_png_set_longjmp_fn(png, longjmp, sizeof(jmp_buf));
+    if (!jb || setjmp(*jb) != 0) {
         free((void *)row_buf);
-        png_destroy_write_struct(&png, &info);
+        g_fn_png_destroy_write_struct(&png, &info);
         fclose(fp);
         unlink(tmp_path);
         return false;
     }
 
-    png_init_io(png, fp);
-    png_set_compression_level(png, 1);
-    png_set_filter(png, 0, PNG_FILTER_SUB | PNG_FILTER_NONE);
-    png_set_IHDR(png, info, dst_w, dst_h, 8, PNG_COLOR_TYPE_RGBA, PNG_INTERLACE_NONE,
-                 PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    g_fn_png_init_io(png, fp);
+    g_fn_png_set_compression_level(png, 1);
+    g_fn_png_set_filter(png, 0, WWAL_PNG_FILTER_SUB | WWAL_PNG_FILTER_NONE);
+    g_fn_png_set_IHDR(png, info, dst_w, dst_h, 8, WWAL_PNG_COLOR_TYPE_RGBA, WWAL_PNG_INTERLACE_NONE,
+                      WWAL_PNG_COMPRESSION_TYPE_DEFAULT, WWAL_PNG_FILTER_TYPE_DEFAULT);
     if (is_bgra) {
-        png_set_bgr(png);
+        g_fn_png_set_bgr(png);
     }
-    png_write_info(png, info);
+    g_fn_png_write_info(png, info);
 
     bool downscale = (dst_w != width || dst_h != height);
     for (uint32_t y = 0; y < dst_h; ++y) {
@@ -2475,12 +3537,12 @@ static bool save_png_internal(const char *filepath, const uint8_t *pixels, uint3
                 row_buf[x * 4U + 3U] = 255;
             }
         }
-        png_write_row(png, (png_const_bytep)row_buf);
+        g_fn_png_write_row(png, (const uint8_t *)row_buf);
     }
 
-    png_write_end(png, NULL);
+    g_fn_png_write_end(png, NULL);
     free((void *)row_buf);
-    png_destroy_write_struct(&png, &info);
+    g_fn_png_destroy_write_struct(&png, &info);
 
     bool io_ok = (fflush(fp) == 0 && !ferror(fp) && fsync(fileno(fp)) == 0);
     if (fclose(fp) != 0 || !io_ok) {
