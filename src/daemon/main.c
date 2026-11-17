@@ -142,7 +142,24 @@ static void daemon_copy_cstr(char *dst, size_t cap, const char *src)
     dst[i] = '\0';
 }
 
-waywal_state_store_t g_saved_state;
+static waywal_state_store_t *g_saved_state_ptr = NULL;
+
+waywal_state_store_t *daemon_saved_state(void)
+{
+    if (!g_saved_state_ptr) {
+        g_saved_state_ptr = (waywal_state_store_t *)calloc(1u, sizeof(*g_saved_state_ptr));
+        if (g_saved_state_ptr) {
+            waywal_state_store_init(g_saved_state_ptr);
+        }
+    }
+    return g_saved_state_ptr;
+}
+
+void daemon_saved_state_free(void)
+{
+    free(g_saved_state_ptr);
+    g_saved_state_ptr = NULL;
+}
 
 static uint64_t now_ns(void)
 {
@@ -231,7 +248,7 @@ void register_fd_in_loops(daemon_state_t *state, int fd, uring_event_type_t ev_t
 {
     if (!state || fd < 0)
         return;
-    if (state->epoll_fd >= 0) {
+    if (state->epoll_initialized && state->epoll_fd >= 0) {
         struct epoll_event ev = {.events = EPOLLIN, .data.fd = fd};
         if (epoll_ctl(state->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0 && errno == EEXIST) {
             (void)epoll_ctl(state->epoll_fd, EPOLL_CTL_MOD, fd, &ev);
@@ -246,7 +263,7 @@ void unregister_fd_from_loops(daemon_state_t *state, int fd)
 {
     if (!state || fd < 0)
         return;
-    if (state->epoll_fd >= 0) {
+    if (state->epoll_initialized && state->epoll_fd >= 0) {
         (void)epoll_ctl(state->epoll_fd, EPOLL_CTL_DEL, fd, NULL);
     }
     if (state->use_uring && state->uring_loop) {
@@ -529,6 +546,10 @@ static void release_output_transition_bos(daemon_state_t *state, output_node_t *
 {
     if (!state || !out)
         return;
+    if (free_old || free_new) {
+        /* Cancel any active GPU transition fence before dropping transition source BOs. */
+        layer_shell_cancel_pending_gpu_fence(state, out);
+    }
     if (free_old && out->has_source_old_bo) {
         layer_shell_release_output_bo_refs(state, out, &out->source_old_bo);
         dmabuf_bo_free(&out->source_old_bo);
@@ -4751,10 +4772,11 @@ static void daemon_on_output_configured(daemon_state_t *state, output_node_t *ou
     }
 
     /* 2. Check persisted state_store for this output or wildcard "*" */
+    waywal_state_store_t *saved_store = daemon_saved_state();
     const waywal_output_saved_state_t *saved =
-        waywal_state_store_find_output(&g_saved_state, out->name);
-    if (!saved) {
-        saved = waywal_state_store_find_output(&g_saved_state, "*");
+        saved_store ? waywal_state_store_find_output(saved_store, out->name) : NULL;
+    if (!saved && saved_store) {
+        saved = waywal_state_store_find_output(saved_store, "*");
     }
     if (saved) {
         (void)daemon_restore_output_entry(state, saved, out->name);
@@ -5470,6 +5492,10 @@ static void daemon_uring_event_callback(uring_event_type_t type, int fd, uint32_
                 unregister_fd_from_loops(st, fd);
             }
         }
+        break;
+    case URING_EV_GPU_FENCE:
+        daemon_pump_wayland_events(st);
+        (void)transition_engine_handle_gpu_fence(st, fd);
         break;
     case URING_EV_SOLAR_TIMER:
         if ((res & POLLIN) == 0)
@@ -9471,49 +9497,227 @@ static uint8_t *authoring_readback_try_vram(we_scene_t *target_sc, const we_tex_
                                             size_t *out_len, we_tex_format_t *out_fmt,
                                             uint32_t *out_w, uint32_t *out_h)
 {
-#if WAYWAL_HAVE_GPU_BRUSH
-    if (!g_authoring_brush_ctx || tex->gl_tex == 0u) {
+    if (!tex || tex->gl_tex == 0u || !out_len || !out_fmt || !out_w || !out_h) {
         return NULL;
     }
-    we_brush_stats_t bstats;
-    memset(&bstats, 0, sizeof(bstats));
-    we_gpu_brush_get_stats(g_authoring_brush_ctx, &bstats);
-    if (bstats.target_gl_tex != tex->gl_tex) {
-        return NULL;
-    }
+
     authoring_ensure_scene_egl(target_sc);
-    uint8_t *vram_px = NULL;
-    size_t vram_len = 0u;
-    if (!we_gpu_brush_readback_texels(g_authoring_brush_ctx, (uint32_t)tex->format, &vram_px,
-                                      &vram_len) ||
-        !vram_px || vram_len == 0u) {
+    if (eglGetCurrentContext() == EGL_NO_CONTEXT) {
         return NULL;
     }
-    uint32_t cw = bstats.canvas_width ? bstats.canvas_width : *out_w;
-    uint32_t ch = bstats.canvas_height ? bstats.canvas_height : *out_h;
-    size_t npix = (size_t)cw * (size_t)ch;
-    if (npix > 0u) {
-        if (vram_len == npix) {
-            *out_fmt = WE_TEX_FMT_R8;
-        } else if (vram_len == npix * 2u) {
-            *out_fmt = WE_TEX_FMT_RG88;
-        } else if (vram_len == npix * 4u) {
-            *out_fmt = WE_TEX_FMT_RGBA8888;
+
+#if WAYWAL_HAVE_GPU_BRUSH
+    if (g_authoring_brush_ctx) {
+        we_brush_stats_t bstats;
+        memset(&bstats, 0, sizeof(bstats));
+        we_gpu_brush_get_stats(g_authoring_brush_ctx, &bstats);
+        if (bstats.target_gl_tex == tex->gl_tex) {
+            uint8_t *vram_px = NULL;
+            size_t vram_len = 0u;
+            if (we_gpu_brush_readback_texels(g_authoring_brush_ctx, (uint32_t)tex->format, &vram_px,
+                                             &vram_len) &&
+                vram_px && vram_len > 0u) {
+                uint32_t cw = bstats.canvas_width ? bstats.canvas_width : *out_w;
+                uint32_t ch = bstats.canvas_height ? bstats.canvas_height : *out_h;
+                size_t npix = (size_t)cw * (size_t)ch;
+                if (npix > 0u) {
+                    if (vram_len == npix) {
+                        *out_fmt = WE_TEX_FMT_R8;
+                    } else if (vram_len == npix * 2u) {
+                        *out_fmt = WE_TEX_FMT_RG88;
+                    } else if (vram_len == npix * 4u) {
+                        *out_fmt = WE_TEX_FMT_RGBA8888;
+                    }
+                }
+                *out_len = vram_len;
+                *out_w = cw;
+                *out_h = ch;
+                return vram_px;
+            }
         }
     }
-    *out_len = vram_len;
-    *out_w = cw;
-    *out_h = ch;
-    return vram_px;
-#else
-    (void)target_sc;
-    (void)tex;
-    (void)out_len;
-    (void)out_fmt;
-    (void)out_w;
-    (void)out_h;
-    return NULL;
 #endif
+
+    const we_tex_mip_t *m0 = (tex->images && tex->image_count > 0u &&
+                              tex->images[0].mip_count > 0u && tex->images[0].mips != NULL)
+                                 ? &tex->images[0].mips[0]
+                                 : NULL;
+    uint32_t w = (m0 && m0->width > 0u) ? m0->width
+                                        : (tex->texture_width > 0u ? tex->texture_width : *out_w);
+    uint32_t h = (m0 && m0->height > 0u)
+                     ? m0->height
+                     : (tex->texture_height > 0u ? tex->texture_height : *out_h);
+    if (w == 0u || h == 0u || w > (uint32_t)INT32_MAX || h > (uint32_t)INT32_MAX ||
+        (size_t)w > WAYWAL_IPC_MAX_READBACK_BYTES / 4u / (size_t)h) {
+        return NULL;
+    }
+
+    size_t px_bytes = (size_t)w * (size_t)h * 4u;
+    uint8_t *px = (uint8_t *)malloc(px_bytes);
+    if (!px) {
+        return NULL;
+    }
+
+    GLint prev_draw_fbo = 0;
+    GLint prev_read_fbo = 0;
+    GLint prev_prog = 0;
+    GLint prev_active_tex = GL_TEXTURE0;
+    GLint prev_tex2d = 0;
+    GLint prev_vao = 0;
+    GLint prev_pack_align = 4;
+    GLint prev_pack_row = 0;
+    GLint prev_pack_skip_x = 0;
+    GLint prev_pack_skip_y = 0;
+    GLint prev_pack_buf = 0;
+    GLint prev_vp[4] = {0, 0, 0, 0};
+    GLboolean prev_mask[4] = {GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE};
+
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw_fbo);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read_fbo);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &prev_prog);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active_tex);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex2d);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prev_vao);
+    glGetIntegerv(GL_PACK_ALIGNMENT, &prev_pack_align);
+    glGetIntegerv(GL_PACK_ROW_LENGTH, &prev_pack_row);
+    glGetIntegerv(GL_PACK_SKIP_PIXELS, &prev_pack_skip_x);
+    glGetIntegerv(GL_PACK_SKIP_ROWS, &prev_pack_skip_y);
+    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prev_pack_buf);
+    glGetIntegerv(GL_VIEWPORT, prev_vp);
+    glGetBooleanv(GL_COLOR_WRITEMASK, prev_mask);
+    GLboolean was_blend = glIsEnabled(GL_BLEND);
+    GLboolean was_depth = glIsEnabled(GL_DEPTH_TEST);
+    GLboolean was_scissor = glIsEnabled(GL_SCISSOR_TEST);
+    GLboolean was_cull = glIsEnabled(GL_CULL_FACE);
+
+    while (glGetError() != GL_NO_ERROR) {
+    }
+
+    static const char *k_vs = "#version 300 es\n"
+                              "void main() {\n"
+                              "    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
+                              "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+                              "}\n";
+    static const char *k_fs = "#version 300 es\n"
+                              "precision highp float;\n"
+                              "uniform sampler2D u_tex;\n"
+                              "out vec4 fragColor;\n"
+                              "void main() {\n"
+                              "    fragColor = texelFetch(u_tex, ivec2(gl_FragCoord.xy), 0);\n"
+                              "}\n";
+
+    GLuint fbo_tex = 0u;
+    GLuint fbo = 0u;
+    GLuint vao = 0u;
+    GLuint prog = 0u;
+    bool ok = false;
+
+    glGenTextures(1, &fbo_tex);
+    glGenFramebuffers(1, &fbo);
+    glGenVertexArrays(1, &vao);
+    if (fbo_tex != 0u && fbo != 0u && vao != 0u) {
+        glBindTexture(GL_TEXTURE_2D, fbo_tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, NULL);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fbo_tex, 0);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+            prog = wwal_gl_compile_graphics_program_cached(k_vs, k_fs, "wwal_authoring_readback",
+                                                           NULL);
+            if (prog != 0u) {
+                glDisable(GL_BLEND);
+                glDisable(GL_DEPTH_TEST);
+                glDisable(GL_SCISSOR_TEST);
+                glDisable(GL_CULL_FACE);
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                glViewport(0, 0, (GLsizei)w, (GLsizei)h);
+
+                glBindVertexArray(vao);
+                glUseProgram(prog);
+                GLint loc = glGetUniformLocation(prog, "u_tex");
+                if (loc >= 0) {
+                    glUniform1i(loc, 0);
+                }
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, (GLuint)tex->gl_tex);
+                glDrawArrays(GL_TRIANGLES, 0, 3);
+                glFinish();
+
+                glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+                glPixelStorei(GL_PACK_ALIGNMENT, 1);
+                glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+                glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+                glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+                glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                ok = (glGetError() == GL_NO_ERROR);
+            }
+        }
+    }
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex2d);
+    glActiveTexture((GLenum)prev_active_tex);
+    glUseProgram((GLuint)prev_prog);
+    glBindVertexArray((GLuint)prev_vao);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prev_draw_fbo);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read_fbo);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prev_pack_buf);
+    glPixelStorei(GL_PACK_ALIGNMENT, prev_pack_align);
+    glPixelStorei(GL_PACK_ROW_LENGTH, prev_pack_row);
+    glPixelStorei(GL_PACK_SKIP_PIXELS, prev_pack_skip_x);
+    glPixelStorei(GL_PACK_SKIP_ROWS, prev_pack_skip_y);
+    glViewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
+    glColorMask(prev_mask[0], prev_mask[1], prev_mask[2], prev_mask[3]);
+    if (was_blend) {
+        glEnable(GL_BLEND);
+    } else {
+        glDisable(GL_BLEND);
+    }
+    if (was_depth) {
+        glEnable(GL_DEPTH_TEST);
+    } else {
+        glDisable(GL_DEPTH_TEST);
+    }
+    if (was_scissor) {
+        glEnable(GL_SCISSOR_TEST);
+    } else {
+        glDisable(GL_SCISSOR_TEST);
+    }
+    if (was_cull) {
+        glEnable(GL_CULL_FACE);
+    } else {
+        glDisable(GL_CULL_FACE);
+    }
+
+    if (prog != 0u) {
+        glDeleteProgram(prog);
+    }
+    if (vao != 0u) {
+        glDeleteVertexArrays(1, &vao);
+    }
+    if (fbo != 0u) {
+        glDeleteFramebuffers(1, &fbo);
+    }
+    if (fbo_tex != 0u) {
+        glDeleteTextures(1, &fbo_tex);
+    }
+
+    if (!ok) {
+        free(px);
+        return NULL;
+    }
+
+    *out_fmt = WE_TEX_FMT_RGBA8888;
+    *out_len = px_bytes;
+    *out_w = w;
+    *out_h = h;
+    return px;
 }
 
 static uint8_t *authoring_readback_raw(we_tex_t *tex, const we_tex_mip_t *m0, uint8_t **raw_px,
@@ -10157,8 +10361,6 @@ static bool authoring_ipc_handle_readback(daemon_state_t *state, int client_fd,
     return sent;
 }
 
-#define RIG_MAX_PUPPET_SLOTS 128u
-
 typedef struct {
     bool in_use;
     const we_scene_t *scene;
@@ -10172,6 +10374,8 @@ typedef struct {
 } rig_puppet_slot_t;
 
 static rig_puppet_slot_t *g_rig_slots = NULL;
+static size_t g_rig_slots_count = 0u;
+static size_t g_rig_slots_cap = 0u;
 static uint64_t g_rig_lru_seq = 0u;
 
 static void rig_reset_slot_state(rig_puppet_slot_t *slot, uint32_t object_id)
@@ -10194,7 +10398,7 @@ static void rig_invalidate_scene_slots(const we_scene_t *sc)
     if (!sc || !g_rig_slots) {
         return;
     }
-    for (size_t i = 0u; i < RIG_MAX_PUPPET_SLOTS; ++i) {
+    for (size_t i = 0u; i < g_rig_slots_count; ++i) {
         if (g_rig_slots[i].in_use && g_rig_slots[i].scene == sc) {
             memset(&g_rig_slots[i], 0, sizeof(g_rig_slots[i]));
         }
@@ -10205,31 +10409,20 @@ static void rig_clear_all_slots(void)
 {
     free(g_rig_slots);
     g_rig_slots = NULL;
+    g_rig_slots_count = 0u;
+    g_rig_slots_cap = 0u;
     g_rig_lru_seq = 0u;
 }
 
 static rig_puppet_slot_t *rig_get_puppet_slot(const we_scene_t *scene, uint32_t object_id,
                                               bool create_if_missing)
 {
-    if (!g_rig_slots) {
-        if (!create_if_missing) {
-            return NULL;
-        }
-        g_rig_slots = (rig_puppet_slot_t *)calloc(RIG_MAX_PUPPET_SLOTS, sizeof(*g_rig_slots));
-        if (!g_rig_slots) {
-            return NULL;
-        }
-    }
     rig_puppet_slot_t *free_slot = NULL;
-    rig_puppet_slot_t *lru_slot = &g_rig_slots[0];
-    for (size_t i = 0u; i < RIG_MAX_PUPPET_SLOTS; ++i) {
+    for (size_t i = 0u; i < g_rig_slots_count; ++i) {
         if (g_rig_slots[i].in_use) {
             if (g_rig_slots[i].scene == scene && g_rig_slots[i].object_id == object_id) {
                 g_rig_slots[i].last_used_seq = ++g_rig_lru_seq;
                 return &g_rig_slots[i];
-            }
-            if (!lru_slot->in_use || g_rig_slots[i].last_used_seq < lru_slot->last_used_seq) {
-                lru_slot = &g_rig_slots[i];
             }
         } else if (!free_slot) {
             free_slot = &g_rig_slots[i];
@@ -10239,7 +10432,21 @@ static rig_puppet_slot_t *rig_get_puppet_slot(const we_scene_t *scene, uint32_t 
         return NULL;
     }
     if (!free_slot) {
-        free_slot = lru_slot;
+        if (g_rig_slots_count >= g_rig_slots_cap) {
+            size_t new_cap = (g_rig_slots_cap == 0u) ? 16u : (g_rig_slots_cap * 2u);
+            if (new_cap < g_rig_slots_cap || new_cap > SIZE_MAX / sizeof(*g_rig_slots)) {
+                return NULL;
+            }
+            rig_puppet_slot_t *grown =
+                (rig_puppet_slot_t *)realloc(g_rig_slots, new_cap * sizeof(*g_rig_slots));
+            if (!grown) {
+                return NULL;
+            }
+            memset(grown + g_rig_slots_cap, 0, (new_cap - g_rig_slots_cap) * sizeof(*g_rig_slots));
+            g_rig_slots = grown;
+            g_rig_slots_cap = new_cap;
+        }
+        free_slot = &g_rig_slots[g_rig_slots_count++];
     }
     memset(free_slot, 0, sizeof(*free_slot));
     free_slot->in_use = true;
@@ -10851,10 +11058,9 @@ fail:
 }
 
 static bool daemon_dispatch_puppet_solve_weights_impl(
-    daemon_state_t *state, const waywal_ipc_puppet_solve_weights_t *req,
-    const uint64_t *locked_bs, const waywal_ipc_puppet_solve_weights_ext_t *ext,
-    waywal_ipc_puppet_weights_resp_t *resp, waywal_ipc_vertex_weight_t **out_entries,
-    uint32_t *out_entry_count)
+    daemon_state_t *state, const waywal_ipc_puppet_solve_weights_t *req, const uint64_t *locked_bs,
+    const waywal_ipc_puppet_solve_weights_ext_t *ext, waywal_ipc_puppet_weights_resp_t *resp,
+    waywal_ipc_vertex_weight_t **out_entries, uint32_t *out_entry_count)
 {
     if (!resp) {
         return false;
@@ -11436,11 +11642,13 @@ static void rig_build_aim_constraint(const waywal_ipc_puppet_preview_ik_t *req,
     out_aim->blend_weight = daemon_clampf_or(ext->aim_blend_weight, 0.0f, 1.0f, 0.0f);
 }
 
-static bool daemon_dispatch_puppet_preview_ik_impl(
-    daemon_state_t *state, const waywal_ipc_puppet_preview_ik_t *req,
-    const waywal_ipc_bone_trs_t *overrides, const waywal_ipc_puppet_preview_ik_ext_t *ext,
-    waywal_ipc_puppet_ik_pose_resp_t *resp, waywal_ipc_bone_trs_t **out_bones,
-    uint32_t *out_bone_count)
+static bool daemon_dispatch_puppet_preview_ik_impl(daemon_state_t *state,
+                                                   const waywal_ipc_puppet_preview_ik_t *req,
+                                                   const waywal_ipc_bone_trs_t *overrides,
+                                                   const waywal_ipc_puppet_preview_ik_ext_t *ext,
+                                                   waywal_ipc_puppet_ik_pose_resp_t *resp,
+                                                   waywal_ipc_bone_trs_t **out_bones,
+                                                   uint32_t *out_bone_count)
 {
     if (!resp) {
         return false;
@@ -12077,7 +12285,33 @@ bool daemon_dispatch_ipc_req_export_puppet_mdl(daemon_state_t *state,
         return false;
     }
 
-    we_puppet_t *puppet = targets.objects[0]->puppet;
+    size_t best_idx = 0u;
+    uint64_t best_slot_seq = 0u;
+    uint32_t best_scene_rev = 0u;
+    bool best_nonempty = false;
+    for (size_t t = 0u; t < targets.count; ++t) {
+        const we_puppet_t *cand = targets.objects[t] ? targets.objects[t]->puppet : NULL;
+        if (!cand) {
+            continue;
+        }
+        bool nonempty = (cand->bone_count > 0u || cand->vertex_count > 0u);
+        const rig_puppet_slot_t *rslot =
+            rig_get_puppet_slot(targets.scenes[t], req->object_id, false);
+        uint64_t slot_seq = rslot ? rslot->last_used_seq : 0u;
+        const authoring_scene_slot_t *aslot = authoring_get_scene_slot(targets.scenes[t], false);
+        uint32_t scene_rev = aslot ? aslot->revision : 0u;
+        if ((nonempty && !best_nonempty) ||
+            (nonempty == best_nonempty &&
+             (slot_seq > best_slot_seq ||
+              (slot_seq == best_slot_seq && scene_rev > best_scene_rev)))) {
+            best_idx = t;
+            best_nonempty = nonempty;
+            best_slot_seq = slot_seq;
+            best_scene_rev = scene_rev;
+        }
+    }
+
+    we_puppet_t *puppet = targets.objects[best_idx]->puppet;
     we_mdl_write_opts_t opts;
     we_mdl_write_opts_default(&opts);
 
@@ -12100,16 +12334,10 @@ bool daemon_dispatch_ipc_req_export_puppet_mdl(daemon_state_t *state,
         }
     }
 
-    if ((req->flags & 0x1u) != 0u && out_mdl_blob && out_mdl_size) {
-        uint8_t *copy = (uint8_t *)malloc(mdl_size);
-        if (!copy) {
-            we_mdl_write_free(mdl_bytes);
-            resp->status = (int32_t)WAYWAL_STATUS_ERR_SYNTAX;
-            return false;
-        }
-        memcpy(copy, mdl_bytes, mdl_size);
-        *out_mdl_blob = copy;
+    if (wants_inline && out_mdl_blob && out_mdl_size) {
+        *out_mdl_blob = mdl_bytes;
         *out_mdl_size = (uint32_t)mdl_size;
+        mdl_bytes = NULL;
     }
 
     we_mdl_write_free(mdl_bytes);
@@ -12549,9 +12777,10 @@ static void daemon_cleanup_early_init(daemon_state_t *st, int *ready_write_fd, b
     if (!st) {
         return;
     }
-    if (st->epoll_fd >= 0) {
+    if (st->epoll_initialized && st->epoll_fd >= 0) {
         close(st->epoll_fd);
         st->epoll_fd = -1;
+        st->epoll_initialized = false;
     }
     if (st->server_socket_fd >= 0) {
         close(st->server_socket_fd);
@@ -12807,8 +13036,10 @@ int main(int argc, char *argv[])
     }
     state.mpris = waywal_mpris_create(daemon_mpris_on_change, &state);
     waywal_state_store_set_namespace(state.namespace_str);
-    waywal_state_store_init(&g_saved_state);
-    (void)waywal_state_store_load(&g_saved_state, NULL);
+    waywal_state_store_t *saved_store = daemon_saved_state();
+    if (saved_store) {
+        (void)waywal_state_store_load(saved_store, NULL);
+    }
 
     if (!arena_init(&state.frame_arena, WAYWAL_FRAME_ARENA_CAPACITY)) {
         fprintf(stderr, "Fatal: failed to initialize frame memory arena\n");
@@ -12869,6 +13100,7 @@ int main(int argc, char *argv[])
         daemon_cleanup_early_init(&state, &ready_pipe[1], true);
         return 1;
     }
+    state.epoll_initialized = true;
 
     int wl_fd = wl_display_get_fd(state.display);
 
@@ -13119,6 +13351,8 @@ int main(int argc, char *argv[])
                     daemon_tick_solar_and_schedule(&state, false);
                 } else if (daemon_dispatch_per_output_fd(&state, ev_fd)) {
                     /* Dispatched per-output engine FD */
+                } else if (transition_engine_handle_gpu_fence(&state, ev_fd)) {
+                    /* Dispatched async GPU transition fence */
                 } else if (state.shader_eng &&
                            ev_fd == waywal_shader_engine_get_inotify_fd(state.shader_eng)) {
                     if (waywal_shader_engine_poll_hot_reload(state.shader_eng) &&
@@ -13252,10 +13486,15 @@ int main(int argc, char *argv[])
     }
 
     close(state.server_socket_fd);
-    close(state.epoll_fd);
+    if (state.epoll_initialized && state.epoll_fd >= 0) {
+        close(state.epoll_fd);
+        state.epoll_fd = -1;
+        state.epoll_initialized = false;
+    }
     close(state.signal_fd);
     daemon_wayland_destroy(&state);
     arena_destroy(&state.frame_arena);
+    daemon_saved_state_free();
 
     WAYWAL_LOG_INFO("Clean shutdown complete.");
 #if WWAL_SANITIZER_BUILD

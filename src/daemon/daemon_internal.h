@@ -36,7 +36,8 @@
 #include <time.h>
 #include <unistd.h>
 
-extern waywal_state_store_t g_saved_state;
+waywal_state_store_t *daemon_saved_state(void);
+void daemon_saved_state_free(void);
 
 __attribute__((format(printf, 4, 5))) static inline bool
 buf_appendf(char *buf, size_t cap, size_t *off, const char *fmt, ...)

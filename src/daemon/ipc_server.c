@@ -100,7 +100,8 @@ static uint64_t bo_plane0_bytes(const dmabuf_bo_t *bo, const output_node_t *out)
     if (!bo || !out) {
         return 0;
     }
-    uint64_t b_w = bo->width > 0 ? (uint64_t)bo->width : (uint64_t)(out->width > 0 ? out->width : 0);
+    uint64_t b_w =
+        bo->width > 0 ? (uint64_t)bo->width : (uint64_t)(out->width > 0 ? out->width : 0);
     uint64_t b_h =
         bo->height > 0 ? (uint64_t)bo->height : (uint64_t)(out->height > 0 ? out->height : 0);
     uint64_t stride = bo->stride[0] > 0 ? (uint64_t)bo->stride[0] : (b_w * 4ULL);
@@ -467,10 +468,11 @@ static bool daemon_build_status_json_into(daemon_state_t *state, const char *eve
         } else if (!out->displaying_color && out->active_media_path[0] != '\0') {
             mpath = out->active_media_path;
         } else {
+            waywal_state_store_t *saved_store = daemon_saved_state();
             const waywal_output_saved_state_t *sv =
-                waywal_state_store_find_output(&g_saved_state, out->name);
-            if (!sv) {
-                sv = waywal_state_store_find_output(&g_saved_state, "*");
+                saved_store ? waywal_state_store_find_output(saved_store, out->name) : NULL;
+            if (!sv && saved_store) {
+                sv = waywal_state_store_find_output(saved_store, "*");
             }
             if (sv && sv->kind != WAYWAL_CONTENT_SOLID_COLOR) {
                 mpath = sv->media_path;
@@ -505,13 +507,12 @@ static bool daemon_build_status_json_into(daemon_state_t *state, const char *eve
             "\"asset\":\"%s\",\"media_path\":\"%s\",\"fps\":%u,\"scaling\":\"%s\","
             "\"bo_states\":[%u,%u,%u,%u],"
             "\"bo_slots\":[\"%s\",\"%s\",\"%s\",\"%s\"]}",
-            first_out ? "" : ",", esc_oname, esc_odesc, out->width, out->height,
-            out->logical_width, out->logical_height, scale_val, fscale,
-            (long long)out->pres_sync.pll.period_est_ns, (double)scanout_fps, render_dur,
-            (unsigned long long)out_vram, (pmask != 0) ? "true" : "false", pmask, eng_kind,
-            esc_mpath, esc_mpath, fps, scaling_mode_to_str(out->scaling_mode),
-            (unsigned)bo_states[0], (unsigned)bo_states[1], (unsigned)bo_states[2],
-            (unsigned)bo_states[3], bo_slot_state_to_str(bo_states[0]),
+            first_out ? "" : ",", esc_oname, esc_odesc, out->width, out->height, out->logical_width,
+            out->logical_height, scale_val, fscale, (long long)out->pres_sync.pll.period_est_ns,
+            (double)scanout_fps, render_dur, (unsigned long long)out_vram,
+            (pmask != 0) ? "true" : "false", pmask, eng_kind, esc_mpath, esc_mpath, fps,
+            scaling_mode_to_str(out->scaling_mode), (unsigned)bo_states[0], (unsigned)bo_states[1],
+            (unsigned)bo_states[2], (unsigned)bo_states[3], bo_slot_state_to_str(bo_states[0]),
             bo_slot_state_to_str(bo_states[1]), bo_slot_state_to_str(bo_states[2]),
             bo_slot_state_to_str(bo_states[3]));
         if (!appended && !db->owns_heap) {
@@ -540,8 +541,7 @@ static char *daemon_build_status_json_alloc(daemon_state_t *state, const char *e
     }
     ipc_dyn_buf_t db;
     ipc_dyn_init_heap(&db, 16384u);
-    if (!daemon_build_status_json_into(state, event_name, &db) || !db.data ||
-        db.len > UINT32_MAX) {
+    if (!daemon_build_status_json_into(state, event_name, &db) || !db.data || db.len > UINT32_MAX) {
         ipc_dyn_free(&db);
         return NULL;
     }
@@ -908,7 +908,8 @@ void daemon_broadcast_event(daemon_state_t *state, const char *event_name)
         return;
     }
     size_t len = 0;
-    char *json_buf = daemon_build_status_json_alloc(state, event_name ? event_name : "update", &len);
+    char *json_buf =
+        daemon_build_status_json_alloc(state, event_name ? event_name : "update", &len);
     if (!json_buf || len == 0) {
         free(json_buf);
         return;
@@ -2886,8 +2887,9 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     media_path =
                         out->slideshow_eng->file_list[out->slideshow_eng->current_file_idx];
                 } else {
+                    waywal_state_store_t *saved_store = daemon_saved_state();
                     const waywal_output_saved_state_t *s_ent =
-                        waywal_state_store_find_output(&g_saved_state, oname);
+                        saved_store ? waywal_state_store_find_output(saved_store, oname) : NULL;
                     if (s_ent && s_ent->kind != WAYWAL_CONTENT_SOLID_COLOR &&
                         s_ent->media_path[0] != '\0') {
                         media_path = s_ent->media_path;
@@ -2969,6 +2971,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                 char matched_outputs[512] = {0};
                 size_t mo_len = 0;
 
+                waywal_state_store_t *saved_store = daemon_saved_state();
                 if (has_targets && state->outputs) {
                     const char *ptr = extra_buf;
                     size_t rem = extra_len;
@@ -2982,10 +2985,12 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                                 stop_engines_on_output(state, out, false, false, false, false);
                                 output_node_render_color(state, out, color);
                                 if (out->name[0] != '\0') {
-                                    ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name),
-                                                  out->name);
-                                    (void)waywal_state_store_update_output(&g_saved_state,
-                                                                           &s_entry);
+                                    if (saved_store) {
+                                        ipc_copy_cstr(s_entry.output_name,
+                                                      sizeof(s_entry.output_name), out->name);
+                                        (void)waywal_state_store_update_output(saved_store,
+                                                                               &s_entry);
+                                    }
                                     int n = snprintf(matched_outputs + mo_len,
                                                      sizeof(matched_outputs) - mo_len, "%s%s",
                                                      mo_len ? "," : "", out->name);
@@ -2997,8 +3002,11 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                             }
                         }
                         if (!any_matched && ptr[0] != '\0') {
-                            ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name), ptr);
-                            (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
+                            if (saved_store) {
+                                ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name),
+                                              ptr);
+                                (void)waywal_state_store_update_output(saved_store, &s_entry);
+                            }
                             int n =
                                 snprintf(matched_outputs + mo_len, sizeof(matched_outputs) - mo_len,
                                          "%s%s", mo_len ? "," : "", ptr);
@@ -3025,13 +3033,17 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     shader_engine_stop_playback(state);
                     anim_engine_stop_playback(state);
                     daemon_clear_all_outputs(state, color);
-                    ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name), "*");
-                    (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
+                    if (saved_store) {
+                        ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name), "*");
+                        (void)waywal_state_store_update_output(saved_store, &s_entry);
+                    }
                     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
                         if (out->name[0] != '\0') {
-                            ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name),
-                                          out->name);
-                            (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
+                            if (saved_store) {
+                                ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name),
+                                              out->name);
+                                (void)waywal_state_store_update_output(saved_store, &s_entry);
+                            }
                             int n =
                                 snprintf(matched_outputs + mo_len, sizeof(matched_outputs) - mo_len,
                                          "%s%s", mo_len ? "," : "", out->name);
@@ -3047,7 +3059,9 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                 (void)waywal_ecosystem_cache_sync(mo_len > 0 ? matched_outputs : "*", "",
                                                   "Lanczos3", solid_px, 64, 64,
                                                   state->config.general.caelestia_sync, false);
-                (void)waywal_state_store_save(&g_saved_state, NULL);
+                if (saved_store) {
+                    (void)waywal_state_store_save(saved_store, NULL);
+                }
                 WAYWAL_LOG_INFO("Cleared screen with color: #%02x%02x%02x%02x", color.r, color.g,
                                 color.b, color.a);
             }
@@ -3452,7 +3466,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                                     ipc_copy_cstr(s_entry.backdrop, sizeof(s_entry.backdrop),
                                                   meta->backdrop);
 
-                                    if (meta->num_target_outputs > 0 &&
+                                    waywal_state_store_t *saved_store = daemon_saved_state();
+                                    if (saved_store && meta->num_target_outputs > 0 &&
                                         !extra_has_wildcard(
                                             (const char *)meta + sizeof(waywal_img_metadata_t),
                                             meta->extra_data_len, meta->num_target_outputs)) {
@@ -3468,22 +3483,22 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                                                                   sizeof(s_entry.output_name),
                                                                   out->name);
                                                     (void)waywal_state_store_update_output(
-                                                        &g_saved_state, &s_entry);
+                                                        saved_store, &s_entry);
                                                     matched_out = true;
                                                 }
                                             }
                                             if (!matched_out) {
                                                 ipc_copy_cstr(s_entry.output_name,
                                                               sizeof(s_entry.output_name), ptr);
-                                                (void)waywal_state_store_update_output(
-                                                    &g_saved_state, &s_entry);
+                                                (void)waywal_state_store_update_output(saved_store,
+                                                                                       &s_entry);
                                             }
                                             ptr += strlen(ptr) + 1;
                                         }
-                                    } else {
+                                    } else if (saved_store) {
                                         ipc_copy_cstr(s_entry.output_name,
                                                       sizeof(s_entry.output_name), "*");
-                                        (void)waywal_state_store_update_output(&g_saved_state,
+                                        (void)waywal_state_store_update_output(saved_store,
                                                                                &s_entry);
                                         for (output_node_t *out = state->outputs; out != NULL;
                                              out = out->next) {
@@ -3491,12 +3506,14 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                                                 ipc_copy_cstr(s_entry.output_name,
                                                               sizeof(s_entry.output_name),
                                                               out->name);
-                                                (void)waywal_state_store_update_output(
-                                                    &g_saved_state, &s_entry);
+                                                (void)waywal_state_store_update_output(saved_store,
+                                                                                       &s_entry);
                                             }
                                         }
                                     }
-                                    (void)waywal_state_store_save(&g_saved_state, NULL);
+                                    if (saved_store) {
+                                        (void)waywal_state_store_save(saved_store, NULL);
+                                    }
                                 }
                             }
 
@@ -3903,7 +3920,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                 s_entry.loop_count = vpay.loop_count;
                 s_entry.volume = vpay.volume;
                 s_entry.mute_on_audio = vpay.mute_on_audio;
-                if (has_extra_targets) {
+                waywal_state_store_t *saved_store = daemon_saved_state();
+                if (saved_store && has_extra_targets) {
                     const char *ptr = extra_buf;
                     size_t rem = extra_len;
                     for (uint32_t i = 0; i < vpay.num_target_outputs && rem > 0; ++i) {
@@ -3915,23 +3933,25 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                             if (output_matches_target_spec(out, ptr) && out->name[0] != '\0') {
                                 ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name),
                                               out->name);
-                                (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
+                                (void)waywal_state_store_update_output(saved_store, &s_entry);
                                 matched_out = true;
                             }
                         }
                         if (!matched_out) {
                             ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name), ptr);
-                            (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
+                            (void)waywal_state_store_update_output(saved_store, &s_entry);
                         }
                         size_t step = (size_t)(end - ptr) + 1;
                         ptr += step;
                         rem -= step;
                     }
-                } else {
+                } else if (saved_store) {
                     ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name), "*");
-                    (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
+                    (void)waywal_state_store_update_output(saved_store, &s_entry);
                 }
-                (void)waywal_state_store_save(&g_saved_state, NULL);
+                if (saved_store) {
+                    (void)waywal_state_store_save(saved_store, NULL);
+                }
             }
         }
         resp_hdr.opcode = ok ? WAYWAL_RESP_OK : WAYWAL_RESP_ERR;
@@ -4145,21 +4165,24 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     s_entry.crop_gravity_x = spay.has_crop_gravity ? spay.crop_gravity_x : 0.5f;
                     s_entry.crop_gravity_y = spay.has_crop_gravity ? spay.crop_gravity_y : 0.5f;
                     s_entry.has_crop_gravity = spay.has_crop_gravity ? 1 : 0;
-                    if (spay.num_target_outputs > 0) {
+                    waywal_state_store_t *saved_store = daemon_saved_state();
+                    if (saved_store && spay.num_target_outputs > 0) {
                         uint32_t max_t =
                             spay.num_target_outputs <= 16 ? spay.num_target_outputs : 16;
                         for (uint32_t i = 0; i < max_t; ++i) {
                             if (spay.target_outputs[i][0] != '\0') {
                                 ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name),
                                               spay.target_outputs[i]);
-                                (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
+                                (void)waywal_state_store_update_output(saved_store, &s_entry);
                             }
                         }
-                    } else {
+                    } else if (saved_store) {
                         ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name), "*");
-                        (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
+                        (void)waywal_state_store_update_output(saved_store, &s_entry);
                     }
-                    (void)waywal_state_store_save(&g_saved_state, NULL);
+                    if (saved_store) {
+                        (void)waywal_state_store_save(saved_store, NULL);
+                    }
                 }
             }
         } else if (req_hdr.payload_size > 0) {
@@ -4465,7 +4488,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     s_entry.volume = spay.volume;
                     s_entry.mute_on_audio = spay.mute_on_audio;
                     ipc_copy_cstr(s_entry.backdrop, sizeof(s_entry.backdrop), spay.backdrop);
-                    if (spay.output[0] != '\0' && strchr(spay.output, ',') != NULL) {
+                    waywal_state_store_t *saved_store = daemon_saved_state();
+                    if (saved_store && spay.output[0] != '\0' && strchr(spay.output, ',') != NULL) {
                         char out_copy[sizeof(spay.output)];
                         ipc_copy_cstr(out_copy, sizeof(out_copy), spay.output);
                         char *saveptr = NULL;
@@ -4476,15 +4500,17 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                             if (*tok != '\0') {
                                 ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name),
                                               tok);
-                                (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
+                                (void)waywal_state_store_update_output(saved_store, &s_entry);
                             }
                         }
-                    } else {
+                    } else if (saved_store) {
                         ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name),
                                       spay.output[0] ? spay.output : "*");
-                        (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
+                        (void)waywal_state_store_update_output(saved_store, &s_entry);
                     }
-                    (void)waywal_state_store_save(&g_saved_state, NULL);
+                    if (saved_store) {
+                        (void)waywal_state_store_save(saved_store, NULL);
+                    }
                 }
             }
         } else if (req_hdr.payload_size > 0) {
@@ -4579,7 +4605,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                     s_entry.volume = wpay.volume;
                     s_entry.mute_on_audio = wpay.mute_on_audio;
                     ipc_copy_cstr(s_entry.backdrop, sizeof(s_entry.backdrop), wpay.backdrop);
-                    if (wpay.output[0] != '\0' && strchr(wpay.output, ',') != NULL) {
+                    waywal_state_store_t *saved_store = daemon_saved_state();
+                    if (saved_store && wpay.output[0] != '\0' && strchr(wpay.output, ',') != NULL) {
                         char out_copy[sizeof(wpay.output)];
                         ipc_copy_cstr(out_copy, sizeof(out_copy), wpay.output);
                         char *saveptr = NULL;
@@ -4590,15 +4617,17 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                             if (*tok != '\0') {
                                 ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name),
                                               tok);
-                                (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
+                                (void)waywal_state_store_update_output(saved_store, &s_entry);
                             }
                         }
-                    } else {
+                    } else if (saved_store) {
                         ipc_copy_cstr(s_entry.output_name, sizeof(s_entry.output_name),
                                       wpay.output[0] ? wpay.output : "*");
-                        (void)waywal_state_store_update_output(&g_saved_state, &s_entry);
+                        (void)waywal_state_store_update_output(saved_store, &s_entry);
                     }
-                    (void)waywal_state_store_save(&g_saved_state, NULL);
+                    if (saved_store) {
+                        (void)waywal_state_store_save(saved_store, NULL);
+                    }
                 }
             }
         } else if (req_hdr.payload_size > 0) {
@@ -4654,7 +4683,8 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
             state->dmabuf_ctx.has_10bit ? "yes" : "no", state->dmabuf_ctx.has_nv12 ? "yes" : "no",
             state->num_outputs);
 
-        for (output_node_t *out = state->outputs; out != NULL && !stats_buf.failed; out = out->next) {
+        for (output_node_t *out = state->outputs; out != NULL && !stats_buf.failed;
+             out = out->next) {
             uint32_t pmask =
                 state->power_gov
                     ? waywal_power_governor_get_output_mask(state->power_gov, out->name)
@@ -4705,29 +4735,34 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
         if (req_hdr.payload_size > 0) {
             ipc_drain_bytes(client_fd, req_hdr.payload_size);
         }
-        (void)waywal_state_store_load(&g_saved_state, NULL);
+        waywal_state_store_t *saved_store = daemon_saved_state();
+        if (saved_store) {
+            (void)waywal_state_store_load(saved_store, NULL);
+        }
         bool restored_any = false;
 
-        for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
-            if (out->name[0] == '\0')
-                continue;
-            const waywal_output_saved_state_t *out_saved =
-                waywal_state_store_find_output(&g_saved_state, out->name);
-            if (out_saved) {
-                if (daemon_restore_output_entry(state, out_saved, out->name)) {
-                    restored_any = true;
+        if (saved_store) {
+            for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+                if (out->name[0] == '\0')
+                    continue;
+                const waywal_output_saved_state_t *out_saved =
+                    waywal_state_store_find_output(saved_store, out->name);
+                if (out_saved) {
+                    if (daemon_restore_output_entry(state, out_saved, out->name)) {
+                        restored_any = true;
+                    }
                 }
             }
-        }
 
-        if (!restored_any) {
-            const waywal_output_saved_state_t *saved =
-                waywal_state_store_find_output(&g_saved_state, "*");
-            if (!saved && g_saved_state.count > 0) {
-                saved = &g_saved_state.outputs[0];
-            }
-            if (saved) {
-                (void)daemon_restore_output_entry(state, saved, "*");
+            if (!restored_any) {
+                const waywal_output_saved_state_t *saved =
+                    waywal_state_store_find_output(saved_store, "*");
+                if (!saved && saved_store->count > 0) {
+                    saved = &saved_store->outputs[0];
+                }
+                if (saved) {
+                    (void)daemon_restore_output_entry(state, saved, "*");
+                }
             }
         }
 
@@ -4781,16 +4816,15 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                 float u_vals[4] = {0};
                 uint32_t u_flags = 0;
 
-                if (drain_ok &&
-                    waywal_decode_set_uniform_payload(&upay, target_out, sizeof(target_out),
-                                                      uniform_name, sizeof(uniform_name),
-                                                      &num_comp, u_vals, &u_flags)) {
+                if (drain_ok && waywal_decode_set_uniform_payload(
+                                    &upay, target_out, sizeof(target_out), uniform_name,
+                                    sizeof(uniform_name), &num_comp, u_vals, &u_flags)) {
                     char prop_kv[160];
                     size_t kv_off = 0;
                     buf_appendf(prop_kv, sizeof(prop_kv), &kv_off, "%s=", uniform_name);
                     for (uint32_t i = 0; i < num_comp; ++i) {
-                        buf_appendf(prop_kv, sizeof(prop_kv), &kv_off, "%s%.6g",
-                                    (i > 0) ? "," : "", (double)u_vals[i]);
+                        buf_appendf(prop_kv, sizeof(prop_kv), &kv_off, "%s%.6g", (i > 0) ? "," : "",
+                                    (double)u_vals[i]);
                     }
 
                     bool apply_global =
@@ -4799,8 +4833,7 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                         if (!state->shader_eng && !state->we_scene) {
                             if (state->dmabuf_ctx.available) {
                                 render_engine_make_current(&state->render_engine);
-                                state->shader_eng =
-                                    waywal_shader_engine_create(&state->dmabuf_ctx);
+                                state->shader_eng = waywal_shader_engine_create(&state->dmabuf_ctx);
                             } else {
                                 state->shader_eng = waywal_shader_engine_create(NULL);
                             }
@@ -4847,21 +4880,24 @@ static void daemon_process_ipc_client(daemon_state_t *state, int client_fd)
                         }
                     }
                     if (ok && (u_flags & WAYWAL_UNIFORM_FLAG_PERSIST)) {
-                        bool saved_dirty = false;
-                        for (size_t k = 0; k < g_saved_state.count; ++k) {
-                            waywal_output_saved_state_t *se = &g_saved_state.outputs[k];
-                            if (se->kind != WAYWAL_CONTENT_WORKSHOP)
-                                continue;
-                            if (apply_global || strcmp(se->output_name, target_out) == 0 ||
-                                strcmp(se->output_name, "*") == 0) {
-                                upsert_workshop_prop_kv(se->prop_overrides,
-                                                        sizeof(se->prop_overrides), uniform_name,
-                                                        prop_kv);
-                                saved_dirty = true;
+                        waywal_state_store_t *saved_store = daemon_saved_state();
+                        if (saved_store) {
+                            bool saved_dirty = false;
+                            for (size_t k = 0; k < saved_store->count; ++k) {
+                                waywal_output_saved_state_t *se = &saved_store->outputs[k];
+                                if (se->kind != WAYWAL_CONTENT_WORKSHOP)
+                                    continue;
+                                if (apply_global || strcmp(se->output_name, target_out) == 0 ||
+                                    strcmp(se->output_name, "*") == 0) {
+                                    upsert_workshop_prop_kv(se->prop_overrides,
+                                                            sizeof(se->prop_overrides),
+                                                            uniform_name, prop_kv);
+                                    saved_dirty = true;
+                                }
                             }
-                        }
-                        if (saved_dirty) {
-                            (void)waywal_state_store_save(&g_saved_state, NULL);
+                            if (saved_dirty) {
+                                (void)waywal_state_store_save(saved_store, NULL);
+                            }
                         }
                     }
                 }
@@ -5632,8 +5668,7 @@ void daemon_handle_ipc_connection(daemon_state_t *state)
         return;
 
     while (true) {
-        int client_fd =
-            accept4(state->server_socket_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        int client_fd = accept4(state->server_socket_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (client_fd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;

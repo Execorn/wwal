@@ -2,6 +2,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include "daemon_internal.h"
 #include "gpu_compute.h"
 #include "wayland_core.h"
 #include "waywal/anim_engine.h"
@@ -18,6 +19,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <malloc.h>
+#include <poll.h>
 #include <spawn.h>
 #include <stdlib.h>
 #include <string.h>
@@ -142,10 +144,10 @@ static bool recompute_output_dimensions(output_node_t *out)
     uint32_t phys_w = out->logical_width;
     uint32_t phys_h = out->logical_height;
     if (out->fractional_scale > 0) {
-        uint64_t fw = ((uint64_t)out->logical_width * (uint64_t)out->fractional_scale + 60ULL) /
-                      120ULL;
-        uint64_t fh = ((uint64_t)out->logical_height * (uint64_t)out->fractional_scale + 60ULL) /
-                      120ULL;
+        uint64_t fw =
+            ((uint64_t)out->logical_width * (uint64_t)out->fractional_scale + 60ULL) / 120ULL;
+        uint64_t fh =
+            ((uint64_t)out->logical_height * (uint64_t)out->fractional_scale + 60ULL) / 120ULL;
         if (fw > 0 && fw <= (uint64_t)INT32_MAX && fh > 0 && fh <= (uint64_t)INT32_MAX) {
             phys_w = (uint32_t)fw;
             phys_h = (uint32_t)fh;
@@ -192,8 +194,8 @@ static void output_reapply_geometry_and_commit(output_node_t *out)
     if (!out->configured || !out->state || out->width <= 0 || out->height <= 0)
         return;
 
-    bool size_changed =
-        out->dims_dirty || out->width != out->committed_buf_w || out->height != out->committed_buf_h;
+    bool size_changed = out->dims_dirty || out->width != out->committed_buf_w ||
+                        out->height != out->committed_buf_h;
     bool anim_active =
         out->transition_active || out->shader_active || out->anim_active || out->workshop_active ||
         (out->video_eng && out->video_eng->state != WAYWAL_VIDEO_STATE_STOPPED) ||
@@ -207,8 +209,7 @@ static void output_reapply_geometry_and_commit(output_node_t *out)
         } else if (out->displaying_color) {
             output_node_render_color(out->state, out, out->active_color);
         } else {
-            color_rgba_t col =
-                out->has_fill_color ? out->fill_color : out->state->current_color;
+            color_rgba_t col = out->has_fill_color ? out->fill_color : out->state->current_color;
             output_node_render_color(out->state, out, col);
         }
         out->committed_buf_w = out->width;
@@ -348,9 +349,8 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *la
     out->configured = true;
 
     bool dims_changed = (out->width != old_w || out->height != old_h || out->dims_dirty ||
-                         (out->committed_buf_w > 0 &&
-                          (out->width != out->committed_buf_w ||
-                           out->height != out->committed_buf_h)));
+                         (out->committed_buf_w > 0 && (out->width != out->committed_buf_w ||
+                                                       out->height != out->committed_buf_h)));
 
     WAYWAL_LOG_DEBUG("Output %s (%s) configured: logical=%ux%u physical=%dx%d", out->name,
                      out->description, out->logical_width, out->logical_height, out->width,
@@ -436,8 +436,8 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *la
 
             if (!out->displaying_color && out->has_image && out->surface) {
                 int cur_idx = out->active_buffer_idx;
-                void *cur_ptr = (cur_idx >= 0 && cur_idx < 2) ? shm_get_slot_ptr(out, cur_idx)
-                                                              : NULL;
+                void *cur_ptr =
+                    (cur_idx >= 0 && cur_idx < 2) ? shm_get_slot_ptr(out, cur_idx) : NULL;
                 if (cur_ptr && out->shm_buffers[cur_idx] && out->shm_width == out->width &&
                     out->shm_height == out->height) {
                     int commit_idx = cur_idx;
@@ -611,6 +611,11 @@ void output_node_create_surface(daemon_state_t *state, output_node_t *node)
         return;
 
     node->state = state;
+    if (!node->has_pending_gpu_fence) {
+        node->pending_gpu_fence_fd = -1;
+        node->pending_gpu_bo = NULL;
+        node->pending_transition_finish = false;
+    }
     node->surface = wl_compositor_create_surface(state->compositor);
     if (!node->surface) {
         WAYWAL_LOG_ERR("Failed to create wl_surface for output %s", node->name);
@@ -789,6 +794,58 @@ void layer_shell_release_output_bo_refs(daemon_state_t *state, output_node_t *no
     release_output_bo_refs(state, node, bo);
 }
 
+static void layer_shell_register_loop_fd(daemon_state_t *state, int fd, uring_event_type_t ev_type)
+{
+    if (!state || fd < 0) {
+        return;
+    }
+    if (state->epoll_initialized && state->epoll_fd >= 0) {
+        struct epoll_event ev = {.events = EPOLLIN, .data.fd = fd};
+        if (epoll_ctl(state->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0 && errno == EEXIST) {
+            (void)epoll_ctl(state->epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+        }
+    }
+    if (state->use_uring && state->uring_loop) {
+        (void)uring_loop_add_poll(state->uring_loop, fd, POLLIN, ev_type, state);
+    }
+}
+
+static void layer_shell_unregister_loop_fd(daemon_state_t *state, int fd)
+{
+    if (!state || fd < 0) {
+        return;
+    }
+    if (state->epoll_initialized && state->epoll_fd >= 0) {
+        (void)epoll_ctl(state->epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+    }
+    if (state->use_uring && state->uring_loop) {
+        (void)uring_loop_remove_poll(state->uring_loop, fd);
+    }
+}
+
+void layer_shell_cancel_pending_gpu_fence(daemon_state_t *state, output_node_t *out)
+{
+    if (!out || !out->has_pending_gpu_fence) {
+        return;
+    }
+    int fd = out->pending_gpu_fence_fd;
+    out->pending_gpu_fence_fd = -1;
+    out->has_pending_gpu_fence = false;
+    out->pending_transition_finish = false;
+    dmabuf_bo_t *bo = out->pending_gpu_bo;
+    out->pending_gpu_bo = NULL;
+    if (bo) {
+        bo->in_use = false;
+    }
+    if (fd >= 0) {
+        /* Unregister from io_uring and epoll before closing so closed FDs are never re-armed. */
+        if (state) {
+            layer_shell_unregister_loop_fd(state, fd);
+        }
+        close(fd);
+    }
+}
+
 static void trim_output_dmabuf_ring(daemon_state_t *state, output_node_t *node)
 {
     if (!node || !node->use_dmabuf || !node->dmabuf_ring.initialized)
@@ -831,7 +888,8 @@ static void trim_output_dmabuf_ring(daemon_state_t *state, output_node_t *node)
     }
 
     for (size_t i = 0; i < WAYWAL_DMABUF_RING_SIZE; ++i) {
-        if (ring->buffers[i].gbm_bo != NULL && !ring->buffers[i].in_use && (int)i != keep_idx) {
+        if (ring->buffers[i].gbm_bo != NULL && !ring->buffers[i].in_use && (int)i != keep_idx &&
+            !(node->has_pending_gpu_fence && node->pending_gpu_bo == &ring->buffers[i])) {
             release_output_bo_refs(state, node, &ring->buffers[i]);
             dmabuf_bo_free(&ring->buffers[i]);
         }
@@ -846,7 +904,8 @@ void layer_shell_trim_output_dmabuf_ring(daemon_state_t *state, output_node_t *n
 static void on_output_dmabuf_bo_released(void *user_data, dmabuf_bo_t *bo)
 {
     output_node_t *node = (output_node_t *)user_data;
-    if (!node || !node->state || !bo || node->transition_active)
+    if (!node || !node->state || !bo || node->transition_active ||
+        (node->has_pending_gpu_fence && node->pending_gpu_bo == bo))
         return;
     if (node->video_eng && node->video_eng->state != WAYWAL_VIDEO_STATE_STOPPED &&
         !node->video_eng->using_swdec) {
@@ -868,6 +927,7 @@ void output_node_destroy_surface(output_node_t *node)
 {
     if (!node)
         return;
+    layer_shell_cancel_pending_gpu_fence(node->state, node);
     node->vp_configured = false;
     node->last_presented_bo = NULL;
 
@@ -1209,6 +1269,7 @@ static void teardown_output_dmabuf(daemon_state_t *state, output_node_t *node)
 {
     if (!state || !node)
         return;
+    layer_shell_cancel_pending_gpu_fence(state, node);
     node->last_presented_bo = NULL;
     node->last_committed_ring_idx = -1;
     if (node->use_dmabuf) {
@@ -1380,10 +1441,10 @@ static bool ensure_shm_buffer(daemon_state_t *state, output_node_t *node, int32_
         return false;
     }
 
-    if (node->shm_slot_data[0] && node->shm_slot_data[1] &&
-        node->shm_slot_sizes[0] == slot_sz && node->shm_slot_sizes[1] == slot_sz &&
-        node->shm_frame_bytes == frame_sz && node->shm_width == width &&
-        node->shm_height == height && node->shm_buffers[0] && node->shm_buffers[1]) {
+    if (node->shm_slot_data[0] && node->shm_slot_data[1] && node->shm_slot_sizes[0] == slot_sz &&
+        node->shm_slot_sizes[1] == slot_sz && node->shm_frame_bytes == frame_sz &&
+        node->shm_width == width && node->shm_height == height && node->shm_buffers[0] &&
+        node->shm_buffers[1]) {
         return true;
     }
 
@@ -1399,8 +1460,7 @@ static bool ensure_shm_buffer(daemon_state_t *state, output_node_t *node, int32_
             return false;
         }
 
-        void *mapped =
-            mmap(NULL, slot_sz, PROT_READ | PROT_WRITE, MAP_SHARED, node->shm_fds[i], 0);
+        void *mapped = mmap(NULL, slot_sz, PROT_READ | PROT_WRITE, MAP_SHARED, node->shm_fds[i], 0);
         if (mapped == MAP_FAILED) {
             WAYWAL_LOG_ERR("mmap[%d] failed for output %s buffer", i, node->name);
             teardown_shm_slots(node);
@@ -1437,6 +1497,7 @@ void output_node_render_color(daemon_state_t *state, output_node_t *node, color_
 {
     if (!state || !node)
         return;
+    layer_shell_cancel_pending_gpu_fence(state, node);
     node->transition_active = false;
     node->transition_current_frame = 0;
     node->transition_start_ns = 0;
@@ -2250,6 +2311,7 @@ void output_node_render_image(daemon_state_t *state, output_node_t *node, const 
     if (node->width <= 0 || node->height <= 0 || img_w == 0 || img_h == 0)
         return;
 
+    layer_shell_cancel_pending_gpu_fence(state, node);
     node->transition_active = false;
     node->transition_current_frame = 0;
     node->transition_start_ns = 0;
@@ -2421,6 +2483,9 @@ void transition_engine_destroy(daemon_state_t *state)
 {
     if (!state)
         return;
+    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+        layer_shell_cancel_pending_gpu_fence(state, out);
+    }
     if (state->transition_timer_fd >= 0) {
         close(state->transition_timer_fd);
         state->transition_timer_fd = -1;
@@ -2501,11 +2566,12 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
         meta && meta->transition_type != WAYWAL_TRANSITION_NONE && meta->transition_duration_ms > 0;
     for (output_node_t *pout = state->outputs; pout != NULL; pout = pout->next) {
         if (!is_target_output(pout, meta)) {
-            if (pout->transition_active) {
+            if (pout->transition_active || pout->has_pending_gpu_fence) {
                 any_other_transition = true;
             }
             continue;
         }
+        layer_shell_cancel_pending_gpu_fence(state, pout);
         if (has_transition) {
             layer_shell_snapshot_live_output(state, pout);
         } else {
@@ -2916,6 +2982,31 @@ bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels,
     return true;
 }
 
+static void transition_maybe_finish_all(daemon_state_t *state)
+{
+    if (!state)
+        return;
+    for (output_node_t *o = state->outputs; o != NULL; o = o->next) {
+        if (o->transition_active || o->has_pending_gpu_fence) {
+            return;
+        }
+    }
+    if (state->transition_timer_fd >= 0) {
+        struct itimerspec its;
+        memset(&its, 0, sizeof(its));
+        timerfd_settime(state->transition_timer_fd, 0, &its, NULL);
+        uint64_t dummy;
+        while (read(state->transition_timer_fd, &dummy, sizeof(dummy)) > 0)
+            ;
+    }
+    state->transitions_in_progress = false;
+    if (!state->anim_active) {
+        render_engine_release_upload_cache(&state->render_engine);
+    }
+    malloc_trim(0);
+    WAYWAL_LOG_INFO("Transition completed successfully across active outputs");
+}
+
 static void transition_engine_step(daemon_state_t *state)
 {
     if (!state)
@@ -2926,10 +3017,16 @@ static void transition_engine_step(daemon_state_t *state)
     uint64_t now_ns = (uint64_t)ts_now.tv_sec * 1000000000ULL + (uint64_t)ts_now.tv_nsec;
 
     int active_count = 0;
+    bool any_sync_committed = false;
 
     for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
         if (!out->transition_active)
             continue;
+
+        if (out->has_pending_gpu_fence) {
+            active_count++;
+            continue;
+        }
 
         if (out->transition_delay_frames > 0) {
             out->transition_delay_frames--;
@@ -2969,10 +3066,10 @@ static void transition_engine_step(daemon_state_t *state)
             bool has_legacy_shm = (out->shm_data != NULL && out->shm_size == frame_sz * 2u);
             if (out->width <= 0 || out->height <= 0 ||
                 (out->surface && (!out->shm_buffers[0] || !out->shm_buffers[1])) ||
-                (!has_disjoint_shm && !has_legacy_shm) || !out->shm_old_data || !out->shm_new_data ||
-                out->shm_buffer_cap < frame_sz || out->shm_width != out->width ||
-                out->shm_height != out->height || out->staging_width != out->width ||
-                out->staging_height != out->height) {
+                (!has_disjoint_shm && !has_legacy_shm) || !out->shm_old_data ||
+                !out->shm_new_data || out->shm_buffer_cap < frame_sz ||
+                out->shm_width != out->width || out->shm_height != out->height ||
+                out->staging_width != out->width || out->staging_height != out->height) {
                 abort_invalid = true;
             } else {
                 back_idx = 1 - out->active_buffer_idx;
@@ -3012,8 +3109,8 @@ static void transition_engine_step(daemon_state_t *state)
             if (out->surface && out->configured && out->width > 0 && out->height > 0) {
                 if (!out->displaying_color && state->wallpaper_rgba && state->wallpaper_w > 0 &&
                     state->wallpaper_h > 0) {
-                    output_node_render_image(state, out, state->wallpaper_rgba,
-                                             state->wallpaper_w, state->wallpaper_h);
+                    output_node_render_image(state, out, state->wallpaper_rgba, state->wallpaper_w,
+                                             state->wallpaper_h);
                 } else if (out->displaying_color) {
                     output_node_render_color(state, out, out->active_color);
                 } else {
@@ -3067,18 +3164,33 @@ static void transition_engine_step(daemon_state_t *state)
                                               : bezier_eval(&out->transition_params.bezier, t);
 
         bool committed = false;
+        bool deferred_async = false;
         if (out->use_dmabuf) {
-            if (render_engine_execute_transition(&state->render_engine, target_bo,
-                                                 &out->source_old_bo, &out->source_new_bo,
-                                                 &out->transition_params)) {
-                if (out->surface && target_bo->wl_buffer) {
-                    wl_surface_attach(out->surface, target_bo->wl_buffer, 0, 0);
-                    wl_surface_damage_buffer(out->surface, 0, 0, out->width, out->height);
-                    output_commit_frame(out);
+            bool can_async_fence = ((state->use_uring && state->uring_loop != NULL) ||
+                                    (state->epoll_initialized && state->epoll_fd >= 0));
+            int fence_fd = -1;
+            if (render_engine_execute_transition_async(
+                    &state->render_engine, target_bo, &out->source_old_bo, &out->source_new_bo,
+                    &out->transition_params, can_async_fence ? &fence_fd : NULL)) {
+                if (fence_fd >= 0) {
+                    out->pending_gpu_fence_fd = fence_fd;
+                    out->has_pending_gpu_fence = true;
+                    out->pending_gpu_bo = target_bo;
+                    out->pending_transition_finish = (out->transition_progress_linear >= 1.0f);
+                    layer_shell_register_loop_fd(state, fence_fd, URING_EV_GPU_FENCE);
+                    deferred_async = true;
+                    committed = true;
+                } else {
+                    if (out->surface && target_bo->wl_buffer) {
+                        wl_surface_attach(out->surface, target_bo->wl_buffer, 0, 0);
+                        wl_surface_damage_buffer(out->surface, 0, 0, out->width, out->height);
+                        output_commit_frame(out);
+                    }
+                    out->last_presented_bo = target_bo;
+                    out->last_committed_ring_idx = (int)(target_bo - out->dmabuf_ring.buffers);
+                    any_sync_committed = true;
+                    committed = true;
                 }
-                out->last_presented_bo = target_bo;
-                out->last_committed_ring_idx = (int)(target_bo - out->dmabuf_ring.buffers);
-                committed = true;
             } else {
                 target_bo->in_use = false;
             }
@@ -3110,6 +3222,7 @@ static void transition_engine_step(daemon_state_t *state)
                 }
                 out->shm_buffer_released[back_idx] = false;
                 out->active_buffer_idx = back_idx;
+                any_sync_committed = true;
                 committed = true;
 
                 if (out->transition_current_frame <= 2 || out->transition_current_frame % 20 == 0) {
@@ -3128,9 +3241,11 @@ static void transition_engine_step(daemon_state_t *state)
             continue;
         }
 
-        out->has_image = true;
+        if (!deferred_async) {
+            out->has_image = true;
+        }
 
-        if (out->transition_progress_linear >= 1.0f) {
+        if (out->transition_progress_linear >= 1.0f && !deferred_async) {
             out->transition_active = false;
             if (out->use_dmabuf) {
                 if (out->has_source_old_bo) {
@@ -3164,26 +3279,74 @@ static void transition_engine_step(daemon_state_t *state)
         }
     }
 
-    if (state->display) {
+    if (any_sync_committed && state->display) {
         wl_display_flush(state->display);
     }
 
     if (active_count == 0) {
-        if (state->transition_timer_fd >= 0) {
-            struct itimerspec its;
-            memset(&its, 0, sizeof(its));
-            timerfd_settime(state->transition_timer_fd, 0, &its, NULL);
-            uint64_t dummy;
-            while (read(state->transition_timer_fd, &dummy, sizeof(dummy)) > 0)
-                ;
-        }
-        state->transitions_in_progress = false;
-        if (!state->anim_active) {
-            render_engine_release_upload_cache(&state->render_engine);
-        }
-        malloc_trim(0);
-        WAYWAL_LOG_INFO("Transition completed successfully across active outputs");
+        transition_maybe_finish_all(state);
     }
+}
+
+bool transition_engine_handle_gpu_fence(daemon_state_t *state, int fence_fd)
+{
+    if (!state || fence_fd < 0) {
+        return false;
+    }
+    output_node_t *matched = NULL;
+    for (output_node_t *out = state->outputs; out != NULL; out = out->next) {
+        if (out->has_pending_gpu_fence && out->pending_gpu_fence_fd == fence_fd) {
+            matched = out;
+            break;
+        }
+    }
+    if (!matched) {
+        return false;
+    }
+
+    /* Unregister from io_uring and epoll before closing so closed FDs are never re-armed. */
+    matched->pending_gpu_fence_fd = -1;
+    matched->has_pending_gpu_fence = false;
+    layer_shell_unregister_loop_fd(state, fence_fd);
+    close(fence_fd);
+
+    dmabuf_bo_t *bo = matched->pending_gpu_bo;
+    matched->pending_gpu_bo = NULL;
+    bool finish = matched->pending_transition_finish;
+    matched->pending_transition_finish = false;
+
+    if (bo) {
+        if (matched->surface && bo->wl_buffer) {
+            wl_surface_attach(matched->surface, bo->wl_buffer, 0, 0);
+            wl_surface_damage_buffer(matched->surface, 0, 0, matched->width, matched->height);
+            output_commit_frame(matched);
+            matched->last_presented_bo = bo;
+            matched->last_committed_ring_idx = (int)(bo - matched->dmabuf_ring.buffers);
+            matched->has_image = true;
+            if (state->display) {
+                wl_display_flush(state->display);
+            }
+        } else {
+            bo->in_use = false;
+        }
+    }
+
+    if (finish) {
+        matched->transition_active = false;
+        if (matched->has_source_old_bo) {
+            release_output_bo_refs(state, matched, &matched->source_old_bo);
+            dmabuf_bo_free(&matched->source_old_bo);
+            matched->has_source_old_bo = false;
+        }
+        if (matched->has_source_new_bo) {
+            release_output_bo_refs(state, matched, &matched->source_new_bo);
+            dmabuf_bo_free(&matched->source_new_bo);
+            matched->has_source_new_bo = false;
+        }
+        trim_output_dmabuf_ring(state, matched);
+        transition_maybe_finish_all(state);
+    }
+    return true;
 }
 
 void transition_engine_dispatch_tick(daemon_state_t *state)

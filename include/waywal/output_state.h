@@ -157,6 +157,10 @@ struct output_node {
     uint64_t transition_duration_ns;
     float transition_progress_linear;
     waywal_transition_params_t transition_params;
+    int pending_gpu_fence_fd;
+    bool has_pending_gpu_fence;
+    dmabuf_bo_t *pending_gpu_bo;
+    bool pending_transition_finish;
 
     /* Dynamic Cursor Tracking & Spring Filter */
     double cursor_x;

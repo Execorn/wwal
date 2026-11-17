@@ -42,6 +42,7 @@ typedef enum {
     URING_EV_SOLAR_TIMER = 12,
     EVENT_TYPE_SOLAR_TIMER = URING_EV_SOLAR_TIMER,
     URING_EV_MPRIS = 13,
+    URING_EV_GPU_FENCE = 14,
 } uring_event_type_t;
 
 typedef struct {

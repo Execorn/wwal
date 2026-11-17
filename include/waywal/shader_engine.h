@@ -80,6 +80,10 @@ bool waywal_shader_engine_poll_hot_reload(waywal_shader_engine_t *eng);
 
 bool waywal_shader_engine_render_frame(waywal_shader_engine_t *eng, dmabuf_bo_t *target_bo,
                                        const waywal_shader_frame_params_t *params);
+bool waywal_shader_engine_render_frame_async(waywal_shader_engine_t *eng, dmabuf_bo_t *target_bo,
+                                             const waywal_shader_frame_params_t *params,
+                                             int *out_fence_fd);
+bool waywal_shader_engine_has_native_fence(const waywal_shader_engine_t *eng);
 static inline bool waywal_shader_engine_render(waywal_shader_engine_t *eng, dmabuf_bo_t *target_bo,
                                                const waywal_shader_frame_params_t *params)
 {

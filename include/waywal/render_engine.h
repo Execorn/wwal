@@ -53,8 +53,22 @@ bool render_engine_upload_static(render_engine_t *re, const uint8_t *src_rgba, u
                                  uint32_t src_h, dmabuf_bo_t *dst_bo, uint32_t scaling_mode,
                                  uint32_t clear_color);
 
+/* Asynchronous variant exporting a CLOEXEC native fence FD via out_fence_fd when supported */
+bool render_engine_upload_static_async(render_engine_t *re, const uint8_t *src_rgba, uint32_t src_w,
+                                       uint32_t src_h, dmabuf_bo_t *dst_bo, uint32_t scaling_mode,
+                                       uint32_t clear_color, int *out_fence_fd);
+
 bool render_engine_copy_bo(render_engine_t *re, dmabuf_bo_t *dst_bo, dmabuf_bo_t *src_bo,
                            uint32_t scaling_mode, uint32_t clear_color, bool release_src_gl);
+
+bool render_engine_copy_bo_async(render_engine_t *re, dmabuf_bo_t *dst_bo, dmabuf_bo_t *src_bo,
+                                 uint32_t scaling_mode, uint32_t clear_color, bool release_src_gl,
+                                 int *out_fence_fd);
+
+/* Native GPU fence synchronization queries for event-driven commit scheduling */
+bool render_engine_has_native_fence(const render_engine_t *re);
+int render_engine_export_fence_fd(render_engine_t *re);
+bool render_engine_wait_idle(render_engine_t *re);
 
 void render_engine_make_current(render_engine_t *re);
 
@@ -72,6 +86,12 @@ bool render_engine_load_custom_shader(render_engine_t *re, const char *shader_sr
 bool render_engine_execute_transition(render_engine_t *re, dmabuf_bo_t *target_bo,
                                       dmabuf_bo_t *old_bo, dmabuf_bo_t *new_bo,
                                       const waywal_transition_params_t *params);
+
+/* Executes transition asynchronously; sets *out_fence_fd to native fence FD or -1 if sync */
+bool render_engine_execute_transition_async(render_engine_t *re, dmabuf_bo_t *target_bo,
+                                            dmabuf_bo_t *old_bo, dmabuf_bo_t *new_bo,
+                                            const waywal_transition_params_t *params,
+                                            int *out_fence_fd);
 
 /* CPU software transition fallback operating on raw pixel memory */
 bool render_engine_execute_cpu_transition(uint32_t *dst, const uint32_t *old_pixels,

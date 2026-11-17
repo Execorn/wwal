@@ -268,6 +268,7 @@ typedef struct daemon_state {
     bool transitions_in_progress;
 
     int epoll_fd;
+    bool epoll_initialized;
     int server_socket_fd;
     int signal_fd;
     bool running;
@@ -313,6 +314,8 @@ bool daemon_query_cursor_pos(daemon_state_t *state, output_node_t *out, double *
 bool transition_engine_init(daemon_state_t *state);
 void transition_engine_destroy(daemon_state_t *state);
 void transition_engine_dispatch_tick(daemon_state_t *state);
+bool transition_engine_handle_gpu_fence(daemon_state_t *state, int fence_fd);
+void layer_shell_cancel_pending_gpu_fence(daemon_state_t *state, output_node_t *out);
 bool daemon_start_image_transition(daemon_state_t *state, const uint8_t *pixels, uint32_t img_w,
                                    uint32_t img_h, const waywal_img_metadata_t *meta);
 

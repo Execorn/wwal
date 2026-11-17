@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/we_shader.h"
+#include "gpu_compute.h"
+#include "waywal/log.h"
 #include "waywal/we_builtin_effects.h"
 
-#include "waywal/log.h"
-
-#include <GLES3/gl31.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -345,26 +343,62 @@ static const char *json_find_key_value(const char *json, const char *key)
     if (!json || !key || key[0] == '\0') {
         return NULL;
     }
-    char pattern[128];
-    int n = snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    if (n <= 0 || (size_t)n >= sizeof(pattern)) {
-        return NULL;
-    }
-    size_t pat_len = (size_t)n;
-    const char *search = json;
-    while ((search = strstr(search, pattern)) != NULL) {
-        const char *p = search + pat_len;
-        while (*p && isspace((unsigned char)*p)) {
+    size_t key_len = strlen(key);
+    const char *p = json;
+    while (*p != '\0') {
+        if (*p != '"') {
             p++;
+            continue;
         }
-        if (*p == ':') {
-            p++;
-            while (*p && isspace((unsigned char)*p)) {
+        p++;
+        const char *str_start = p;
+        bool has_escape = false;
+        while (*p != '\0' && *p != '"') {
+            if (*p == '\\' && p[1] != '\0') {
+                has_escape = true;
+                p += 2;
+            } else {
                 p++;
             }
-            return p;
         }
-        search += pat_len;
+        if (*p != '"') {
+            break;
+        }
+        size_t str_len = (size_t)(p - str_start);
+        p++;
+
+        const char *q = p;
+        while (*q && isspace((unsigned char)*q)) {
+            q++;
+        }
+        if (*q == ':') {
+            bool match = false;
+            if (!has_escape) {
+                match = (str_len == key_len && strncmp(str_start, key, key_len) == 0);
+            } else {
+                size_t k = 0;
+                const char *s = str_start;
+                const char *end = str_start + str_len;
+                while (s < end && k < key_len) {
+                    char ch = *s++;
+                    if (ch == '\\' && s < end) {
+                        ch = *s++;
+                    }
+                    if (ch != key[k]) {
+                        break;
+                    }
+                    k++;
+                }
+                match = (s == end && k == key_len);
+            }
+            if (match) {
+                q++;
+                while (*q && isspace((unsigned char)*q)) {
+                    q++;
+                }
+                return q;
+            }
+        }
     }
     return NULL;
 }
@@ -847,7 +881,7 @@ static bool expand_includes_recursive(const char *src, const we_pkg_t *pkg,
                                       we_include_tracker_t *tr, we_strbuf_t *out, int depth)
 {
     if (!src || depth > 8) {
-        return true;
+        return false;
     }
 
     bool in_block_comment = false;
@@ -997,16 +1031,19 @@ typedef struct {
 
 static int type_to_width(const char *type)
 {
-    if (strcmp(type, "float") == 0) {
+    if (strcmp(type, "float") == 0 || strcmp(type, "half") == 0 || strcmp(type, "fixed") == 0) {
         return 1;
     }
-    if (strcmp(type, "vec2") == 0 || strcmp(type, "float2") == 0) {
+    if (strcmp(type, "vec2") == 0 || strcmp(type, "float2") == 0 || strcmp(type, "half2") == 0 ||
+        strcmp(type, "fixed2") == 0) {
         return 2;
     }
-    if (strcmp(type, "vec3") == 0 || strcmp(type, "float3") == 0) {
+    if (strcmp(type, "vec3") == 0 || strcmp(type, "float3") == 0 || strcmp(type, "half3") == 0 ||
+        strcmp(type, "fixed3") == 0) {
         return 3;
     }
-    if (strcmp(type, "vec4") == 0 || strcmp(type, "float4") == 0) {
+    if (strcmp(type, "vec4") == 0 || strcmp(type, "float4") == 0 || strcmp(type, "half4") == 0 ||
+        strcmp(type, "fixed4") == 0) {
         return 4;
     }
     if (strcmp(type, "int") == 0 || strcmp(type, "uint") == 0) {
@@ -1869,29 +1906,59 @@ static const char *lookup_inferred_var_type(const we_var_type_entry_t *entries, 
     return inside_subscript ? "int" : "float";
 }
 
-static bool line_starts_control_or_pp(const char *code_view, size_t len)
+static bool is_control_kw(const char *tok, size_t len)
 {
-    size_t i = 0;
-    while (i < len && (code_view[i] == ' ' || code_view[i] == '\t')) {
-        i++;
-    }
-    if (i >= len || code_view[i] == '#') {
-        return true;
-    }
     static const char *const kw[] = {"if", "else", "for", "while", "do", "switch", "case"};
     for (size_t k = 0; k < sizeof(kw) / sizeof(kw[0]); ++k) {
-        size_t klen = strlen(kw[k]);
-        if (i + klen <= len && strncmp(code_view + i, kw[k], klen) == 0 &&
-            (i + klen == len ||
-             !(isalnum((unsigned char)code_view[i + klen]) || code_view[i + klen] == '_'))) {
+        if (strlen(kw[k]) == len && strncmp(tok, kw[k], len) == 0) {
             return true;
         }
     }
     return false;
 }
 
+static bool line_starts_control_or_pp(const char *code_view, size_t len)
+{
+    size_t i = 0;
+    while (i < len && (code_view[i] == ' ' || code_view[i] == '\t' || code_view[i] == '}')) {
+        i++;
+    }
+    if (i >= len || code_view[i] == '#') {
+        return true;
+    }
+    size_t start = i;
+    while (i < len && (isalnum((unsigned char)code_view[i]) || code_view[i] == '_')) {
+        i++;
+    }
+    return i > start && is_control_kw(code_view + start, i - start);
+}
+
+static bool line_has_inline_control(const char *code_view, size_t len)
+{
+    size_t i = 0;
+    while (i < len) {
+        if (isalpha((unsigned char)code_view[i]) || code_view[i] == '_') {
+            size_t start = i;
+            while (i < len && (isalnum((unsigned char)code_view[i]) || code_view[i] == '_')) {
+                i++;
+            }
+            size_t b = start;
+            while (b > 0 && (code_view[b - 1] == ' ' || code_view[b - 1] == '\t')) {
+                b--;
+            }
+            if ((b == 0 || code_view[b - 1] != '.') &&
+                is_control_kw(code_view + start, i - start)) {
+                return true;
+            }
+        } else {
+            i++;
+        }
+    }
+    return false;
+}
+
 static void update_unbraced_control_state(const char *code_view, size_t len,
-                                          bool *inout_expects_unbraced)
+                                          bool *inout_expects_unbraced, int *inout_ctrl_paren_depth)
 {
     size_t s = 0;
     while (s < len && (code_view[s] == ' ' || code_view[s] == '\t' || code_view[s] == '\r')) {
@@ -1905,6 +1972,91 @@ static void update_unbraced_control_state(const char *code_view, size_t len,
     if (s == e || code_view[s] == '#') {
         return;
     }
+
+    /* Track multi-line if/else-if/for/while header parentheses so braceless bodies stay guarded. */
+    if (*inout_ctrl_paren_depth > 0) {
+        size_t i = s;
+        while (i < e && *inout_ctrl_paren_depth > 0) {
+            if (code_view[i] == '(') {
+                (*inout_ctrl_paren_depth)++;
+            } else if (code_view[i] == ')') {
+                (*inout_ctrl_paren_depth)--;
+            }
+            i++;
+        }
+        if (*inout_ctrl_paren_depth > 0) {
+            *inout_expects_unbraced = false;
+            return;
+        }
+        while (i < e && (code_view[i] == ' ' || code_view[i] == '\t')) {
+            i++;
+        }
+        if (i == e) {
+            *inout_expects_unbraced = true;
+            return;
+        }
+        s = i;
+    } else {
+        size_t i = s;
+        while (i < e && (code_view[i] == ' ' || code_view[i] == '\t' || code_view[i] == '}')) {
+            i++;
+        }
+        size_t kstart = i;
+        while (i < e && (isalnum((unsigned char)code_view[i]) || code_view[i] == '_')) {
+            i++;
+        }
+        size_t klen = i - kstart;
+        bool has_paren_hdr = false;
+        if ((klen == 2 && strncmp(code_view + kstart, "if", 2) == 0) ||
+            (klen == 3 && strncmp(code_view + kstart, "for", 3) == 0) ||
+            (klen == 5 && strncmp(code_view + kstart, "while", 5) == 0)) {
+            has_paren_hdr = true;
+        } else if (klen == 4 && strncmp(code_view + kstart, "else", 4) == 0) {
+            size_t j = i;
+            while (j < e && (code_view[j] == ' ' || code_view[j] == '\t')) {
+                j++;
+            }
+            if (j + 2 <= e && strncmp(code_view + j, "if", 2) == 0 &&
+                (j + 2 == e ||
+                 !(isalnum((unsigned char)code_view[j + 2]) || code_view[j + 2] == '_'))) {
+                has_paren_hdr = true;
+                i = j + 2;
+            }
+        }
+        if (has_paren_hdr) {
+            int depth = 0;
+            bool saw_open = false;
+            while (i < e) {
+                if (code_view[i] == '(') {
+                    saw_open = true;
+                    depth++;
+                } else if (code_view[i] == ')' && depth > 0) {
+                    depth--;
+                    if (saw_open && depth == 0) {
+                        i++;
+                        break;
+                    }
+                }
+                i++;
+            }
+            if (depth > 0) {
+                *inout_ctrl_paren_depth = depth;
+                *inout_expects_unbraced = false;
+                return;
+            }
+            if (saw_open && depth == 0) {
+                while (i < e && (code_view[i] == ' ' || code_view[i] == '\t')) {
+                    i++;
+                }
+                if (i == e) {
+                    *inout_expects_unbraced = true;
+                    return;
+                }
+                s = i;
+            }
+        }
+    }
+
     char last = code_view[e - 1];
     if (last == '{' || last == '}' || last == ';') {
         *inout_expects_unbraced = false;
@@ -1958,12 +2110,14 @@ static bool span_contains_standalone_ident(const char *s, const char *end, const
 
 static bool hoist_mul_side_effects(we_strbuf_t *sb, const char *line, const char *code_view,
                                    size_t line_len, uint32_t *tmp_counter,
-                                   bool prev_expects_unbraced, const we_var_type_entry_t *var_types,
-                                   uint32_t var_type_count, char **out_rewritten)
+                                   bool prev_expects_unbraced, int ctrl_paren_depth,
+                                   const we_var_type_entry_t *var_types, uint32_t var_type_count,
+                                   char **out_rewritten)
 {
     *out_rewritten = NULL;
-    if (prev_expects_unbraced || line_starts_control_or_pp(code_view, line_len) ||
-        strstr(code_view, "mul") == NULL) {
+    if (prev_expects_unbraced || ctrl_paren_depth > 0 ||
+        line_starts_control_or_pp(code_view, line_len) ||
+        line_has_inline_control(code_view, line_len) || strstr(code_view, "mul") == NULL) {
         return true;
     }
 
@@ -2182,6 +2336,7 @@ static char *transform_stage_declarations(const char *expanded_src, bool is_frag
     uint32_t tmp_counter = 0;
     bool in_block_comment = false;
     bool prev_expects_unbraced = false;
+    int ctrl_paren_depth = 0;
     const char *line = expanded_src;
     while (*line) {
         const char *eol = strchr(line, '\n');
@@ -2213,7 +2368,8 @@ static char *transform_stage_declarations(const char *expanded_src, bool is_frag
 
         char *rewritten = NULL;
         if (!hoist_mul_side_effects(&sb, lbuf, code_view, line_len, &tmp_counter,
-                                    prev_expects_unbraced, var_types, var_type_count, &rewritten)) {
+                                    prev_expects_unbraced, ctrl_paren_depth, var_types,
+                                    var_type_count, &rewritten)) {
             if (lbuf != stack_buf) {
                 free(lbuf);
             }
@@ -2375,7 +2531,8 @@ static char *transform_stage_declarations(const char *expanded_src, bool is_frag
             ok = sb_append_len(&sb, lbuf, line_len) && sb_append(&sb, "\n");
         }
 
-        update_unbraced_control_state(code_view, line_len, &prev_expects_unbraced);
+        update_unbraced_control_state(code_view, line_len, &prev_expects_unbraced,
+                                      &ctrl_paren_depth);
 
         if (lbuf != stack_buf) {
             free(lbuf);
@@ -2427,6 +2584,10 @@ static const char WE_GLSL_PREAMBLE_COMMON[] =
     "#define half2 vec2\n"
     "#define half3 vec3\n"
     "#define half4 vec4\n"
+    "#define fixed float\n"
+    "#define fixed2 vec2\n"
+    "#define fixed3 vec3\n"
+    "#define fixed4 vec4\n"
     "#define CAST2(x) vec2(x)\n"
     "#define CAST3(x) vec3(x)\n"
     "#define CAST4(x) vec4(x)\n"
@@ -2778,183 +2939,6 @@ static GLuint compile_gl_stage(GLenum stage, const char *src, const char *debug_
     return sh;
 }
 
-typedef struct {
-    uint32_t magic;
-    uint32_t format;
-    uint32_t length;
-} we_prog_cache_hdr_t;
-
-#define WE_PROG_CACHE_MAGIC 0x57455042u
-
-static uint64_t fnv1a_step_str(uint64_t h, const char *s)
-{
-    if (!s) {
-        return h;
-    }
-    for (const unsigned char *p = (const unsigned char *)s; *p != '\0'; ++p) {
-        h ^= (uint64_t)(*p);
-        h *= 1099511628211ULL;
-    }
-    h ^= 0xFFULL;
-    h *= 1099511628211ULL;
-    return h;
-}
-
-static bool resolve_we_shader_cache_path(uint64_t hash, char *out_path, size_t cap)
-{
-    const char *xdg = getenv("XDG_CACHE_HOME");
-    char base[4096];
-    if (xdg && xdg[0] != '\0') {
-        snprintf(base, sizeof(base), "%s", xdg);
-    } else {
-        const char *home = getenv("HOME");
-        if (!home || home[0] == '\0') {
-            return false;
-        }
-        snprintf(base, sizeof(base), "%s/.cache", home);
-        (void)mkdir(base, 0700);
-    }
-    char dir1[4200];
-    char dir2[4300];
-    snprintf(dir1, sizeof(dir1), "%s/wwal", base);
-    (void)mkdir(dir1, 0700);
-    snprintf(dir2, sizeof(dir2), "%s/shaders", dir1);
-    (void)mkdir(dir2, 0700);
-    int n = snprintf(out_path, cap, "%s/we_%016llx.bin", dir2, (unsigned long long)hash);
-    return (n > 0 && (size_t)n < cap);
-}
-
-static _Atomic uint32_t s_we_cache_tmp_seq = 0u;
-
-static bool we_read_all_no_eintr(int fd, void *buf, size_t len)
-{
-    uint8_t *dst = (uint8_t *)buf;
-    size_t got = 0;
-    while (got < len) {
-        ssize_t n = read(fd, dst + got, len - got);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return false;
-        }
-        if (n == 0) {
-            return false;
-        }
-        got += (size_t)n;
-    }
-    return true;
-}
-
-static bool we_write_all_no_eintr(int fd, const void *buf, size_t len)
-{
-    const uint8_t *src = (const uint8_t *)buf;
-    size_t sent = 0;
-    while (sent < len) {
-        ssize_t n = write(fd, src + sent, len - sent);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return false;
-        }
-        if (n == 0) {
-            return false;
-        }
-        sent += (size_t)n;
-    }
-    return true;
-}
-
-static GLuint try_load_we_cached_program(const char *cache_path)
-{
-    int fd = open(cache_path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        return 0;
-    }
-    struct stat st;
-    we_prog_cache_hdr_t hdr;
-    if (fstat(fd, &st) != 0 || st.st_size <= (off_t)sizeof(hdr) ||
-        !we_read_all_no_eintr(fd, &hdr, sizeof(hdr)) || hdr.magic != WE_PROG_CACHE_MAGIC ||
-        hdr.length == 0 || hdr.length > 16u * 1024u * 1024u ||
-        st.st_size != (off_t)(sizeof(hdr) + hdr.length)) {
-        close(fd);
-        return 0;
-    }
-    uint8_t *buf = (uint8_t *)malloc(hdr.length);
-    if (!buf) {
-        close(fd);
-        return 0;
-    }
-    bool ok_rd = we_read_all_no_eintr(fd, buf, hdr.length);
-    close(fd);
-    if (!ok_rd) {
-        free(buf);
-        return 0;
-    }
-    GLuint prog = glCreateProgram();
-    if (!prog) {
-        free(buf);
-        return 0;
-    }
-    while (glGetError() != GL_NO_ERROR) {
-    }
-    glProgramBinary(prog, (GLenum)hdr.format, buf, (GLsizei)hdr.length);
-    free(buf);
-    GLenum err = glGetError();
-    GLint linked = 0;
-    glGetProgramiv(prog, GL_LINK_STATUS, &linked);
-    if (err != GL_NO_ERROR || !linked) {
-        glDeleteProgram(prog);
-        return 0;
-    }
-    return prog;
-}
-
-static void save_we_cached_program(GLuint prog, const char *cache_path)
-{
-    GLint bin_len = 0;
-    glGetProgramiv(prog, GL_PROGRAM_BINARY_LENGTH, &bin_len);
-    if (bin_len <= 0 || bin_len > 16 * 1024 * 1024) {
-        return;
-    }
-    uint8_t *buf = (uint8_t *)malloc((size_t)bin_len);
-    if (!buf) {
-        return;
-    }
-    GLsizei actual_len = 0;
-    GLenum bin_fmt = 0;
-    glGetProgramBinary(prog, bin_len, &actual_len, &bin_fmt, buf);
-    if (actual_len <= 0 || actual_len > bin_len) {
-        free(buf);
-        return;
-    }
-    char tmp_path[4480];
-    uint32_t seq = atomic_fetch_add_explicit(&s_we_cache_tmp_seq, 1u, memory_order_relaxed);
-    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d.%u", cache_path, (int)getpid(), seq) >=
-        (int)sizeof(tmp_path)) {
-        free(buf);
-        return;
-    }
-    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    if (fd >= 0) {
-        we_prog_cache_hdr_t hdr = {
-            .magic = WE_PROG_CACHE_MAGIC,
-            .format = (uint32_t)bin_fmt,
-            .length = (uint32_t)actual_len,
-        };
-        bool ok = we_write_all_no_eintr(fd, &hdr, sizeof(hdr)) &&
-                  we_write_all_no_eintr(fd, buf, (size_t)actual_len);
-        if (close(fd) != 0) {
-            ok = false;
-        }
-        if (!ok || rename(tmp_path, cache_path) != 0) {
-            unlink(tmp_path);
-        }
-    }
-    free(buf);
-}
-
 uint32_t we_shader_compile_program(const char *vert_glsl, const char *frag_glsl,
                                    const char *debug_name)
 {
@@ -2962,19 +2946,18 @@ uint32_t we_shader_compile_program(const char *vert_glsl, const char *frag_glsl,
         return 0;
     }
 
-    char cache_path[4400] = {0};
-    uint64_t h = 14695981039346656037ULL;
-    const char *gl_vendor = (const char *)glGetString(GL_VENDOR);
-    const char *gl_renderer = (const char *)glGetString(GL_RENDERER);
-    const char *gl_version = (const char *)glGetString(GL_VERSION);
-    h = fnv1a_step_str(h, vert_glsl);
-    h = fnv1a_step_str(h, frag_glsl);
-    h = fnv1a_step_str(h, gl_vendor ? gl_vendor : "unknown_vendor");
-    h = fnv1a_step_str(h, gl_renderer ? gl_renderer : "unknown_renderer");
-    h = fnv1a_step_str(h, gl_version ? gl_version : "unknown_version");
-    bool have_cache_path = resolve_we_shader_cache_path(h, cache_path, sizeof(cache_path));
+    /* Include WE fixed attribute binding salt in vs_hash so WWBC v2 entries never collide with
+     * unbound graphics programs from gpu_compute or shader_engine. */
+    uint64_t vs_hash = wwal_fnv1a_64_str(14695981039346656037ULL, vert_glsl);
+    vs_hash = wwal_fnv1a_64_str(vs_hash, "we_attrib_layout_v1");
+    uint64_t main_hash = wwal_fnv1a_64_str(14695981039346656037ULL, frag_glsl);
+    uint64_t driver_hash = wwal_gl_driver_hash();
+
+    char cache_path[PATH_MAX] = {0};
+    bool have_cache_path =
+        wwal_prog_cache_path(vs_hash, main_hash, driver_hash, cache_path, sizeof(cache_path));
     if (have_cache_path) {
-        GLuint cached_prog = try_load_we_cached_program(cache_path);
+        GLuint cached_prog = wwal_prog_cache_load(cache_path, vs_hash, main_hash, driver_hash);
         if (cached_prog != 0) {
             return (uint32_t)cached_prog;
         }
@@ -3026,7 +3009,7 @@ uint32_t we_shader_compile_program(const char *vert_glsl, const char *frag_glsl,
         return 0;
     }
     if (have_cache_path) {
-        save_we_cached_program(prog, cache_path);
+        wwal_prog_cache_save(cache_path, prog, vs_hash, main_hash, driver_hash);
     }
     return (uint32_t)prog;
 }

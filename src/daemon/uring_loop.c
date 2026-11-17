@@ -219,7 +219,7 @@ bool uring_loop_add_poll(uring_loop_t *loop, int fd, uint32_t poll_mask, uring_e
         slot->gen = 1;
     slot->in_flight_tag = ((uint64_t)slot->gen << 32) | (uint64_t)(slot_idx + 1U);
     slot->active = true;
-    slot->is_multishot = loop->multishot_supported;
+    slot->is_multishot = (type != URING_EV_GPU_FENCE) && loop->multishot_supported;
     slot->in_flight = true;
 
     if (slot->is_multishot) {
