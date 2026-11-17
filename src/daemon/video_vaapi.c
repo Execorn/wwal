@@ -41,6 +41,89 @@ static bool profile_supported(const VAProfile *profiles, int count, VAProfile ta
     return false;
 }
 
+static void vaapi_cleanup_partial(vaapi_decoder_t *dec)
+{
+    if (!dec)
+        return;
+
+    uint32_t pool_size = dec->num_surfaces > 0 ? dec->num_surfaces : WAYWAL_VA_SURFACE_POOL_SIZE;
+    uint32_t vpp_pool = dec->num_vpp_surfaces > 0 ? dec->num_vpp_surfaces : WAYWAL_VA_VPP_POOL_SIZE;
+
+    if (dec->va_display) {
+        if (dec->vpp_context != VA_INVALID_ID) {
+            vaDestroyContext(dec->va_display, dec->vpp_context);
+            dec->vpp_context = VA_INVALID_ID;
+        }
+        if (dec->num_vpp_surfaces > 0) {
+            vaDestroySurfaces(dec->va_display, dec->vpp_surfaces, vpp_pool);
+        }
+        if (dec->vpp_config != VA_INVALID_ID) {
+            vaDestroyConfig(dec->va_display, dec->vpp_config);
+            dec->vpp_config = VA_INVALID_ID;
+        }
+        dec->has_vpp = false;
+        dec->num_vpp_surfaces = 0;
+
+        if (dec->va_context != VA_INVALID_ID) {
+            vaDestroyContext(dec->va_display, dec->va_context);
+            dec->va_context = VA_INVALID_ID;
+        }
+        if (dec->num_surfaces > 0) {
+            vaDestroySurfaces(dec->va_display, dec->surfaces, pool_size);
+        }
+        if (dec->va_config != VA_INVALID_ID) {
+            vaDestroyConfig(dec->va_display, dec->va_config);
+            dec->va_config = VA_INVALID_ID;
+        }
+        vaTerminate(dec->va_display);
+        dec->va_display = NULL;
+    }
+
+    for (uint32_t i = 0; i < WAYWAL_VA_SURFACE_POOL_SIZE; ++i) {
+        dec->surfaces[i] = VA_INVALID_SURFACE;
+        dec->vpp_surfaces[i] = VA_INVALID_SURFACE;
+    }
+    dec->num_surfaces = 0;
+    dec->num_vpp_surfaces = 0;
+    dec->has_vpp = false;
+
+    if (dec->owns_drm_fd && dec->drm_fd >= 0) {
+        close(dec->drm_fd);
+    }
+    dec->drm_fd = -1;
+    dec->owns_drm_fd = false;
+    dec->initialized = false;
+}
+
+static bool hevc_vps_indicates_main10(const uint8_t *nal, size_t nal_len)
+{
+    if (!nal || nal_len < 10)
+        return false;
+    /* Strip emulation prevention bytes from first 18 bytes past the 2-byte NAL header to read PTL.
+     */
+    uint8_t rbsp[18];
+    size_t rlen = 0;
+    for (size_t i = 2; i < nal_len && rlen < sizeof(rbsp); ++i) {
+        if (i + 1 < nal_len && nal[i] == 0x00 && nal[i + 1] == 0x00 &&
+            (i + 2 < nal_len && nal[i + 2] == 0x03)) {
+            rbsp[rlen++] = 0x00;
+            if (rlen < sizeof(rbsp))
+                rbsp[rlen++] = 0x00;
+            i += 2;
+        } else {
+            rbsp[rlen++] = nal[i];
+        }
+    }
+    /* VPS layout before profile_tier_level: 4 bytes (vps_id..max_sub_layers) + 2 bytes
+     * reserved_0xffff. */
+    if (rlen < 12)
+        return false;
+    uint8_t profile_idc = rbsp[6] & 0x1Fu;
+    uint32_t compat = ((uint32_t)rbsp[7] << 24) | ((uint32_t)rbsp[8] << 16) |
+                      ((uint32_t)rbsp[9] << 8) | (uint32_t)rbsp[10];
+    return profile_idc == 2 || (compat & (1U << (31U - 2U))) != 0;
+}
+
 static VAProfile select_va_profile(VADisplay dpy, waywal_codec_t codec, const uint8_t *extradata,
                                    size_t extradata_size)
 {
@@ -60,13 +143,38 @@ static VAProfile select_va_profile(VADisplay dpy, waywal_codec_t codec, const ui
     }
 
     bool is_10bit_hint = false;
-    if (codec == WAYWAL_CODEC_HEVC && extradata && extradata_size >= 19 && extradata[0] == 1) {
-        uint8_t general_profile_idc = extradata[1] & 0x1Fu;
-        uint8_t bit_depth_luma_minus8 = extradata[17] & 0x07u;
-        uint8_t bit_depth_chroma_minus8 = extradata[18] & 0x07u;
-        if (general_profile_idc == 2 || bit_depth_luma_minus8 == 2 ||
-            bit_depth_chroma_minus8 == 2) {
-            is_10bit_hint = true;
+    if (codec == WAYWAL_CODEC_HEVC && extradata && extradata_size > 0) {
+        if (extradata_size >= 19 && extradata[0] == 1) {
+            uint8_t general_profile_idc = extradata[1] & 0x1Fu;
+            uint8_t bit_depth_luma_minus8 = extradata[17] & 0x07u;
+            uint8_t bit_depth_chroma_minus8 = extradata[18] & 0x07u;
+            if (general_profile_idc == 2 || bit_depth_luma_minus8 >= 2 ||
+                bit_depth_chroma_minus8 >= 2) {
+                is_10bit_hint = true;
+            }
+        } else {
+            size_t scan_off = 0;
+            const uint8_t *nal_ptr = NULL;
+            uint32_t nal_len = 0;
+            while (
+                next_h264_nal(extradata, extradata_size, false, 4, &scan_off, &nal_ptr, &nal_len)) {
+                if (nal_len < 2)
+                    continue;
+                uint8_t ntype = (nal_ptr[0] >> 1) & 0x3Fu;
+                if (ntype == 33) {
+                    parsed_hevc_sps_t hevc_sps;
+                    memset(&hevc_sps, 0, sizeof(hevc_sps));
+                    if (parse_hevc_sps(nal_ptr, nal_len, &hevc_sps) &&
+                        (hevc_sps.bit_depth_luma_minus8 >= 2 ||
+                         hevc_sps.bit_depth_chroma_minus8 >= 2)) {
+                        is_10bit_hint = true;
+                        break;
+                    }
+                } else if (ntype == 32 && hevc_vps_indicates_main10(nal_ptr, nal_len)) {
+                    is_10bit_hint = true;
+                    break;
+                }
+            }
         }
     }
 
@@ -120,12 +228,22 @@ bool vaapi_decoder_init_with_params(vaapi_decoder_t *dec, int drm_render_fd, way
                                     uint32_t width, uint32_t height, const uint8_t *extradata,
                                     size_t extradata_size, bool allow_direct_nv12)
 {
-    if (!dec || width == 0 || height == 0)
+    if (!dec || width == 0 || height == 0 || width > (uint32_t)INT32_MAX ||
+        height > (uint32_t)INT32_MAX)
         return false;
     uint8_t raw_p010 = 0;
     memcpy(&raw_p010, &dec->allow_direct_p010, sizeof(raw_p010));
     bool saved_allow_direct_p010 = allow_direct_nv12 && (raw_p010 == 1);
     memset(dec, 0, sizeof(*dec));
+    dec->drm_fd = -1;
+    dec->va_config = VA_INVALID_ID;
+    dec->va_context = VA_INVALID_ID;
+    dec->vpp_config = VA_INVALID_ID;
+    dec->vpp_context = VA_INVALID_ID;
+    for (uint32_t i = 0; i < WAYWAL_VA_SURFACE_POOL_SIZE; ++i) {
+        dec->surfaces[i] = VA_INVALID_SURFACE;
+        dec->vpp_surfaces[i] = VA_INVALID_SURFACE;
+    }
     dec->allow_direct_p010 = saved_allow_direct_p010;
     dec->width = width;
     dec->height = height;
@@ -201,9 +319,6 @@ bool vaapi_decoder_init_with_params(vaapi_decoder_t *dec, int drm_render_fd, way
         dec->is_nvidia_vaapi =
             vendor && (strstr(vendor, "nvidia") != NULL || strstr(vendor, "NVIDIA") != NULL ||
                        strstr(vendor, "NVDEC") != NULL || strstr(vendor, "vdpau") != NULL);
-        if (dec->is_nvidia_vaapi && drm_render_fd >= 0) {
-            allow_direct_nv12 = false;
-        }
         found = true;
         WAYWAL_LOG_INFO("VA-API v%d.%d initialized on DRM node %s (Profile: %d, Driver: %s)", major,
                         minor, candidate_nodes[i] ? candidate_nodes[i] : "supplied fd",
@@ -256,7 +371,6 @@ bool vaapi_decoder_init_with_params(vaapi_decoder_t *dec, int drm_render_fd, way
     if (needed_surfaces > WAYWAL_VA_SURFACE_POOL_SIZE) {
         needed_surfaces = WAYWAL_VA_SURFACE_POOL_SIZE;
     }
-    dec->num_surfaces = needed_surfaces;
 
     bool use_10bit = is_10bit_stream;
     uint32_t rt_format = use_10bit ? VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420;
@@ -274,9 +388,7 @@ bool vaapi_decoder_init_with_params(vaapi_decoder_t *dec, int drm_render_fd, way
     }
     if (st != VA_STATUS_SUCCESS) {
         WAYWAL_LOG_ERR("vaCreateConfig failed: %s", vaErrorStr(st));
-        vaTerminate(dec->va_display);
-        if (dec->owns_drm_fd && dec->drm_fd >= 0)
-            close(dec->drm_fd);
+        vaapi_cleanup_partial(dec);
         return false;
     }
 
@@ -291,27 +403,21 @@ bool vaapi_decoder_init_with_params(vaapi_decoder_t *dec, int drm_render_fd, way
     sattrs[1].value.type = VAGenericValueTypeInteger;
     sattrs[1].value.value.i = VA_SURFACE_ATTRIB_USAGE_HINT_DECODER;
 
-    st = vaCreateSurfaces(dec->va_display, rt_format, width, height, dec->surfaces,
-                          dec->num_surfaces, sattrs, 2);
+    st = vaCreateSurfaces(dec->va_display, rt_format, width, height, dec->surfaces, needed_surfaces,
+                          sattrs, 2);
     if (st != VA_STATUS_SUCCESS) {
         WAYWAL_LOG_ERR("vaCreateSurfaces failed for %ux%u pool (%u surfaces): %s", width, height,
-                       dec->num_surfaces, vaErrorStr(st));
-        vaDestroyConfig(dec->va_display, dec->va_config);
-        vaTerminate(dec->va_display);
-        if (dec->owns_drm_fd && dec->drm_fd >= 0)
-            close(dec->drm_fd);
+                       needed_surfaces, vaErrorStr(st));
+        vaapi_cleanup_partial(dec);
         return false;
     }
+    dec->num_surfaces = needed_surfaces;
 
     st = vaCreateContext(dec->va_display, dec->va_config, (int)width, (int)height, VA_PROGRESSIVE,
                          dec->surfaces, (int)dec->num_surfaces, &dec->va_context);
     if (st != VA_STATUS_SUCCESS) {
         WAYWAL_LOG_ERR("vaCreateContext failed: %s", vaErrorStr(st));
-        vaDestroySurfaces(dec->va_display, dec->surfaces, dec->num_surfaces);
-        vaDestroyConfig(dec->va_display, dec->va_config);
-        vaTerminate(dec->va_display);
-        if (dec->owns_drm_fd && dec->drm_fd >= 0)
-            close(dec->drm_fd);
+        vaapi_cleanup_partial(dec);
         return false;
     }
 
@@ -325,39 +431,42 @@ bool vaapi_decoder_init_with_params(vaapi_decoder_t *dec, int drm_render_fd, way
         VAConfigAttrib vpp_attrib = {.type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_RGB32};
         VAStatus vpp_st = vaCreateConfig(dec->va_display, VAProfileNone, VAEntrypointVideoProc,
                                          &vpp_attrib, 1, &dec->vpp_config);
-        if (vpp_st == VA_STATUS_SUCCESS) {
-            VASurfaceAttrib vpp_sattrs[2];
-            vpp_sattrs[0].type = VASurfaceAttribPixelFormat;
-            vpp_sattrs[0].flags = VA_SURFACE_ATTRIB_SETTABLE;
-            vpp_sattrs[0].value.type = VAGenericValueTypeInteger;
-            vpp_sattrs[0].value.value.i = VA_FOURCC_BGRX;
-            vpp_sattrs[1].type = VASurfaceAttribUsageHint;
-            vpp_sattrs[1].flags = VA_SURFACE_ATTRIB_SETTABLE;
-            vpp_sattrs[1].value.type = VAGenericValueTypeInteger;
-            vpp_sattrs[1].value.value.i = VA_SURFACE_ATTRIB_USAGE_HINT_VPP_WRITE;
-
-            uint32_t vpp_pool = WAYWAL_VA_VPP_POOL_SIZE;
-            vpp_st = vaCreateSurfaces(dec->va_display, VA_RT_FORMAT_RGB32, width, height,
-                                      dec->vpp_surfaces, vpp_pool, vpp_sattrs, 2);
-            if (vpp_st == VA_STATUS_SUCCESS) {
-                vpp_st = vaCreateContext(dec->va_display, dec->vpp_config, (int)width, (int)height,
-                                         0, dec->vpp_surfaces, (int)vpp_pool, &dec->vpp_context);
-                if (vpp_st == VA_STATUS_SUCCESS) {
-                    dec->has_vpp = true;
-                    dec->num_vpp_surfaces = vpp_pool;
-                    WAYWAL_LOG_INFO("VA-API VPP active (NV12 -> BGRX, %u decode surfaces + %u VPP "
-                                    "surfaces @ %ux%u)",
-                                    dec->num_surfaces, dec->num_vpp_surfaces, width, height);
-                } else {
-                    vaDestroySurfaces(dec->va_display, dec->vpp_surfaces, vpp_pool);
-                    vaDestroyConfig(dec->va_display, dec->vpp_config);
-                    dec->vpp_config = VA_INVALID_ID;
-                }
-            } else {
-                vaDestroyConfig(dec->va_display, dec->vpp_config);
-                dec->vpp_config = VA_INVALID_ID;
-            }
+        if (vpp_st != VA_STATUS_SUCCESS) {
+            WAYWAL_LOG_ERR("VA-API VPP vaCreateConfig failed: %s", vaErrorStr(vpp_st));
+            vaapi_cleanup_partial(dec);
+            return false;
         }
+        VASurfaceAttrib vpp_sattrs[2];
+        vpp_sattrs[0].type = VASurfaceAttribPixelFormat;
+        vpp_sattrs[0].flags = VA_SURFACE_ATTRIB_SETTABLE;
+        vpp_sattrs[0].value.type = VAGenericValueTypeInteger;
+        vpp_sattrs[0].value.value.i = VA_FOURCC_BGRX;
+        vpp_sattrs[1].type = VASurfaceAttribUsageHint;
+        vpp_sattrs[1].flags = VA_SURFACE_ATTRIB_SETTABLE;
+        vpp_sattrs[1].value.type = VAGenericValueTypeInteger;
+        vpp_sattrs[1].value.value.i = VA_SURFACE_ATTRIB_USAGE_HINT_VPP_WRITE;
+
+        uint32_t vpp_pool = WAYWAL_VA_VPP_POOL_SIZE;
+        vpp_st = vaCreateSurfaces(dec->va_display, VA_RT_FORMAT_RGB32, width, height,
+                                  dec->vpp_surfaces, vpp_pool, vpp_sattrs, 2);
+        if (vpp_st != VA_STATUS_SUCCESS) {
+            WAYWAL_LOG_ERR("VA-API VPP vaCreateSurfaces failed: %s", vaErrorStr(vpp_st));
+            vaapi_cleanup_partial(dec);
+            return false;
+        }
+        dec->num_vpp_surfaces = vpp_pool;
+
+        vpp_st = vaCreateContext(dec->va_display, dec->vpp_config, (int)width, (int)height, 0,
+                                 dec->vpp_surfaces, (int)vpp_pool, &dec->vpp_context);
+        if (vpp_st != VA_STATUS_SUCCESS) {
+            WAYWAL_LOG_ERR("VA-API VPP vaCreateContext failed: %s", vaErrorStr(vpp_st));
+            vaapi_cleanup_partial(dec);
+            return false;
+        }
+        dec->has_vpp = true;
+        WAYWAL_LOG_INFO("VA-API VPP active (NV12 -> BGRX, %u decode surfaces + %u VPP "
+                        "surfaces @ %ux%u)",
+                        dec->num_surfaces, dec->num_vpp_surfaces, width, height);
     } else {
         WAYWAL_LOG_INFO("VA-API direct %s DMA-BUF export active (%u surfaces @ %ux%u, max_refs=%u, "
                         "VPP bypassed)",
@@ -434,43 +543,225 @@ void vaapi_decoder_destroy(vaapi_decoder_t *dec)
         }
     }
 
-    if (dec->has_vpp) {
-        if (dec->vpp_context != VA_INVALID_ID) {
-            vaDestroyContext(dec->va_display, dec->vpp_context);
-            dec->vpp_context = VA_INVALID_ID;
+    vaapi_cleanup_partial(dec);
+}
+
+static bool parse_h264_extradata_into(const uint8_t *extradata, size_t size, parsed_sps_t *sps,
+                                      parsed_pps_t *pps, bool *out_is_avcc, uint8_t *out_nal_len_sz)
+{
+    if (!extradata || size < 4 || !sps || !pps || !out_is_avcc || !out_nal_len_sz)
+        return false;
+
+    if (extradata[0] == 1) {
+        if (size < 7)
+            return false;
+        *out_is_avcc = true;
+        *out_nal_len_sz = (extradata[4] & 0x03) + 1;
+        uint32_t num_sps = extradata[5] & 0x1F;
+        size_t off = 6;
+        for (uint32_t i = 0; i < num_sps; ++i) {
+            if (2 > size - off)
+                return false;
+            uint16_t sps_len = ((uint16_t)extradata[off] << 8) | extradata[off + 1];
+            off += 2;
+            if ((size_t)sps_len > size - off)
+                return false;
+            parse_h264_sps(extradata + off, sps_len, sps);
+            off += sps_len;
         }
-        vaDestroySurfaces(dec->va_display, dec->vpp_surfaces, vpp_pool);
-        if (dec->vpp_config != VA_INVALID_ID) {
-            vaDestroyConfig(dec->va_display, dec->vpp_config);
-            dec->vpp_config = VA_INVALID_ID;
+        if (off >= size)
+            return false;
+        uint8_t num_pps = extradata[off++];
+        for (uint32_t i = 0; i < num_pps; ++i) {
+            if (2 > size - off)
+                return false;
+            uint16_t pps_len = ((uint16_t)extradata[off] << 8) | extradata[off + 1];
+            off += 2;
+            if ((size_t)pps_len > size - off)
+                return false;
+            parse_h264_pps(extradata + off, pps_len, sps, pps);
+            off += pps_len;
         }
-        dec->has_vpp = false;
-        dec->num_vpp_surfaces = 0;
+        return sps->valid;
     }
 
-    if (dec->va_context != VA_INVALID_ID) {
-        vaDestroyContext(dec->va_display, dec->va_context);
-        dec->va_context = VA_INVALID_ID;
+    *out_is_avcc = false;
+    *out_nal_len_sz = 4;
+    size_t scan_off = 0;
+    const uint8_t *nal_ptr = NULL;
+    uint32_t nal_len = 0;
+    while (next_h264_nal(extradata, size, false, 4, &scan_off, &nal_ptr, &nal_len)) {
+        if (nal_len == 0)
+            continue;
+        uint8_t ntype = nal_ptr[0] & 0x1F;
+        if (ntype == 7) {
+            parse_h264_sps(nal_ptr, nal_len, sps);
+        } else if (ntype == 8) {
+            parse_h264_pps(nal_ptr, nal_len, sps, pps);
+        }
+    }
+    return sps->valid;
+}
+
+static bool parse_hevc_extradata_into(const uint8_t *extradata, size_t size, parsed_hevc_sps_t *sps,
+                                      parsed_hevc_pps_t *pps, bool *out_is_avcc,
+                                      uint8_t *out_nal_len_sz, bool *out_vps_10bit)
+{
+    if (!extradata || size < 4 || !sps || !pps || !out_is_avcc || !out_nal_len_sz)
+        return false;
+    if (out_vps_10bit)
+        *out_vps_10bit = false;
+
+    if (extradata[0] == 1) {
+        if (size < 23)
+            return false;
+        *out_is_avcc = true;
+        *out_nal_len_sz = (extradata[21] & 0x03) + 1;
+        uint8_t num_arrays = extradata[22];
+        size_t off = 23;
+        for (uint8_t a = 0; a < num_arrays; ++a) {
+            if (3 > size - off)
+                return false;
+            uint8_t nal_type = extradata[off] & 0x3F;
+            uint16_t num_nalus = ((uint16_t)extradata[off + 1] << 8) | extradata[off + 2];
+            off += 3;
+            for (uint16_t n = 0; n < num_nalus; ++n) {
+                if (2 > size - off)
+                    return false;
+                uint16_t nal_len = ((uint16_t)extradata[off] << 8) | extradata[off + 1];
+                off += 2;
+                if ((size_t)nal_len > size - off)
+                    return false;
+                if (nal_type == 33) {
+                    parse_hevc_sps(extradata + off, nal_len, sps);
+                } else if (nal_type == 34) {
+                    parse_hevc_pps(extradata + off, nal_len, pps);
+                } else if (nal_type == 32 && out_vps_10bit &&
+                           hevc_vps_indicates_main10(extradata + off, nal_len)) {
+                    *out_vps_10bit = true;
+                }
+                off += nal_len;
+            }
+        }
+        return sps->valid;
     }
 
-    vaDestroySurfaces(dec->va_display, dec->surfaces, pool_size);
+    *out_is_avcc = false;
+    *out_nal_len_sz = 4;
+    size_t scan_off = 0;
+    const uint8_t *nal_ptr = NULL;
+    uint32_t nal_len = 0;
+    while (next_h264_nal(extradata, size, false, 4, &scan_off, &nal_ptr, &nal_len)) {
+        if (nal_len >= 2) {
+            uint8_t ntype = (nal_ptr[0] >> 1) & 0x3F;
+            if (ntype == 33) {
+                parse_hevc_sps(nal_ptr, nal_len, sps);
+            } else if (ntype == 34) {
+                parse_hevc_pps(nal_ptr, nal_len, pps);
+            } else if (ntype == 32 && out_vps_10bit &&
+                       hevc_vps_indicates_main10(nal_ptr, nal_len)) {
+                *out_vps_10bit = true;
+            }
+        }
+    }
+    return sps->valid;
+}
 
-    if (dec->va_config != VA_INVALID_ID) {
-        vaDestroyConfig(dec->va_display, dec->va_config);
-        dec->va_config = VA_INVALID_ID;
+static void parse_av1_extradata_into(const uint8_t *extradata, size_t size, parsed_av1_seq_t *seq)
+{
+    if (!extradata || size == 0 || !seq)
+        return;
+    size_t off = (size >= 4 && (extradata[0] & 0x80) != 0) ? 4 : 0;
+    while (off < size) {
+        uint8_t obu_hdr = extradata[off++];
+        uint32_t obu_type = (obu_hdr >> 3) & 0x0F;
+        bool has_ext = (obu_hdr & 0x04) != 0;
+        bool has_size = (obu_hdr & 0x02) != 0;
+        if (has_ext) {
+            if (off >= size)
+                break;
+            off++;
+        }
+        size_t obu_sz = size - off;
+        if (has_size) {
+            size_t leb_bytes = 0;
+            uint64_t parsed_sz = av1_read_leb128(extradata + off, size - off, &leb_bytes);
+            if (leb_bytes == 0)
+                break;
+            off += leb_bytes;
+            if (parsed_sz > size - off)
+                break;
+            obu_sz = (size_t)parsed_sz;
+        }
+        if (obu_type == 1) {
+            parse_av1_sequence_header(extradata + off, obu_sz, seq);
+        }
+        off += obu_sz;
+    }
+}
+
+bool vaapi_decoder_probe_extradata(waywal_codec_t codec, VAProfile profile,
+                                   const uint8_t *extradata, size_t size, bool *out_is_10bit,
+                                   uint32_t *out_max_refs)
+{
+    bool is_10bit = (profile == VAProfileHEVCMain10 || profile == VAProfileVP9Profile2);
+    uint32_t max_refs = (codec == WAYWAL_CODEC_VP9 || codec == WAYWAL_CODEC_AV1) ? 8U : 4U;
+
+    if (extradata && size >= 4) {
+        if (codec == WAYWAL_CODEC_H264) {
+            parsed_sps_t sps;
+            parsed_pps_t pps;
+            bool is_avcc = false;
+            uint8_t nls = 4;
+            memset(&sps, 0, sizeof(sps));
+            memset(&pps, 0, sizeof(pps));
+            if (parse_h264_extradata_into(extradata, size, &sps, &pps, &is_avcc, &nls) &&
+                sps.num_ref_frames > 0) {
+                max_refs = sps.num_ref_frames;
+                if (max_refs > 16U)
+                    max_refs = 16U;
+            }
+        } else if (codec == WAYWAL_CODEC_HEVC) {
+            parsed_hevc_sps_t sps;
+            parsed_hevc_pps_t pps;
+            bool is_avcc = false;
+            uint8_t nls = 4;
+            bool vps_10bit = false;
+            memset(&sps, 0, sizeof(sps));
+            memset(&pps, 0, sizeof(pps));
+            if (extradata[0] == 1 && size >= 19) {
+                uint8_t general_profile_idc = extradata[1] & 0x1Fu;
+                uint8_t bd_l = extradata[17] & 0x07u;
+                uint8_t bd_c = extradata[18] & 0x07u;
+                if (general_profile_idc == 2 || bd_l >= 2 || bd_c >= 2)
+                    is_10bit = true;
+            }
+            if (parse_hevc_extradata_into(extradata, size, &sps, &pps, &is_avcc, &nls,
+                                          &vps_10bit)) {
+                max_refs = (uint32_t)sps.sps_max_dec_pic_buffering_minus1 + 1U;
+                if (max_refs < 4U)
+                    max_refs = 4U;
+                if (max_refs > 15U)
+                    max_refs = 15U;
+                if (sps.bit_depth_luma_minus8 >= 2 || sps.bit_depth_chroma_minus8 >= 2)
+                    is_10bit = true;
+            }
+            if (vps_10bit)
+                is_10bit = true;
+        } else if (codec == WAYWAL_CODEC_AV1) {
+            parsed_av1_seq_t seq;
+            memset(&seq, 0, sizeof(seq));
+            parse_av1_extradata_into(extradata, size, &seq);
+            if (seq.valid && seq.high_bitdepth)
+                is_10bit = true;
+        }
     }
 
-    if (dec->va_display) {
-        vaTerminate(dec->va_display);
-        dec->va_display = NULL;
-    }
-
-    if (dec->owns_drm_fd && dec->drm_fd >= 0) {
-        close(dec->drm_fd);
-        dec->drm_fd = -1;
-    }
-
-    dec->initialized = false;
+    if (out_is_10bit)
+        *out_is_10bit = is_10bit;
+    if (out_max_refs)
+        *out_max_refs = max_refs;
+    return true;
 }
 
 bool vaapi_decoder_set_extradata(vaapi_decoder_t *dec, const uint8_t *extradata, size_t size)
@@ -480,110 +771,32 @@ bool vaapi_decoder_set_extradata(vaapi_decoder_t *dec, const uint8_t *extradata,
 
     if (dec->va_profile == VAProfileH264Main || dec->va_profile == VAProfileH264High ||
         dec->va_profile == VAProfileH264ConstrainedBaseline) {
-        if (size < 7)
-            return false;
-        if (extradata[0] == 1) {
-            dec->is_avcc = true;
-            dec->nal_length_size = (extradata[4] & 0x03) + 1;
-        }
-        uint32_t num_sps = extradata[5] & 0x1F;
-        size_t off = 6;
-        for (uint32_t i = 0; i < num_sps && off + 2 <= size; ++i) {
-            uint16_t sps_len = ((uint16_t)extradata[off] << 8) | extradata[off + 1];
-            off += 2;
-            if (off + sps_len <= size) {
-                parse_h264_sps(extradata + off, sps_len, &dec->cached_sps);
-                off += sps_len;
-            }
-        }
-        if (off < size) {
-            uint8_t num_pps = extradata[off++];
-            for (uint32_t i = 0; i < num_pps && off + 2 <= size; ++i) {
-                uint16_t pps_len = ((uint16_t)extradata[off] << 8) | extradata[off + 1];
-                off += 2;
-                if (off + pps_len <= size) {
-                    parse_h264_pps(extradata + off, pps_len, &dec->cached_sps, &dec->cached_pps);
-                    off += pps_len;
-                }
-            }
-        }
+        bool ok = parse_h264_extradata_into(extradata, size, &dec->cached_sps, &dec->cached_pps,
+                                            &dec->is_avcc, &dec->nal_length_size);
         refresh_cached_h264_iq(dec);
-        return dec->cached_sps.valid;
+        return ok;
     } else if (dec->va_profile == VAProfileHEVCMain || dec->va_profile == VAProfileHEVCMain10) {
-        if (size >= 23 && (extradata[0] == 1 || extradata[0] == 0)) {
-            dec->is_avcc = true;
-            dec->nal_length_size = (extradata[21] & 0x03) + 1;
-            uint8_t num_arrays = extradata[22];
-            size_t off = 23;
-            for (uint8_t a = 0; a < num_arrays && off + 3 <= size; ++a) {
-                uint8_t nal_type = extradata[off] & 0x3F;
-                uint16_t num_nalus = ((uint16_t)extradata[off + 1] << 8) | extradata[off + 2];
-                off += 3;
-                for (uint16_t n = 0; n < num_nalus && off + 2 <= size; ++n) {
-                    uint16_t nal_len = ((uint16_t)extradata[off] << 8) | extradata[off + 1];
-                    off += 2;
-                    if (off + nal_len > size)
-                        break;
-                    if (nal_type == 33) {
-                        parse_hevc_sps(extradata + off, nal_len, &dec->cached_hevc_sps);
-                    } else if (nal_type == 34) {
-                        parse_hevc_pps(extradata + off, nal_len, &dec->cached_hevc_pps);
-                    }
-                    off += nal_len;
-                }
-            }
-            return dec->cached_hevc_sps.valid;
-        }
-        size_t scan_off = 0;
-        const uint8_t *nal_ptr = NULL;
-        uint32_t nal_len = 0;
-        while (next_h264_nal(extradata, size, false, 4, &scan_off, &nal_ptr, &nal_len)) {
-            if (nal_len >= 2) {
-                uint8_t ntype = (nal_ptr[0] >> 1) & 0x3F;
-                if (ntype == 33) {
-                    parse_hevc_sps(nal_ptr, nal_len, &dec->cached_hevc_sps);
-                } else if (ntype == 34) {
-                    parse_hevc_pps(nal_ptr, nal_len, &dec->cached_hevc_pps);
-                }
-            }
-        }
-        return dec->cached_hevc_sps.valid;
+        return parse_hevc_extradata_into(extradata, size, &dec->cached_hevc_sps,
+                                         &dec->cached_hevc_pps, &dec->is_avcc,
+                                         &dec->nal_length_size, NULL);
     } else if (dec->va_profile == VAProfileAV1Profile0) {
-        size_t off = (size >= 4 && (extradata[0] & 0x80) != 0) ? 4 : 0;
-        while (off < size) {
-            uint8_t obu_hdr = extradata[off++];
-            uint32_t obu_type = (obu_hdr >> 3) & 0x0F;
-            bool has_ext = (obu_hdr & 0x04) != 0;
-            bool has_size = (obu_hdr & 0x02) != 0;
-            if (has_ext) {
-                if (off >= size)
-                    break;
-                off++;
-            }
-            size_t obu_sz = size - off;
-            if (has_size) {
-                size_t leb_bytes = 0;
-                uint64_t parsed_sz = av1_read_leb128(extradata + off, size - off, &leb_bytes);
-                off += leb_bytes;
-                if (parsed_sz > size - off)
-                    break;
-                obu_sz = (size_t)parsed_sz;
-            }
-            if (obu_type == 1) {
-                parse_av1_sequence_header(extradata + off, obu_sz, &dec->cached_av1_seq);
-            }
-            off += obu_sz;
-        }
+        parse_av1_extradata_into(extradata, size, &dec->cached_av1_seq);
         return dec->cached_av1_seq.valid;
     }
     return true;
 }
 
-bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt,
-                                 VASurfaceID *out_surface)
+vaapi_decode_status_t vaapi_decoder_decode_packet_ex(vaapi_decoder_t *dec,
+                                                     const demux_packet_t *pkt,
+                                                     VASurfaceID *out_surface)
 {
-    if (!dec || !dec->initialized || !pkt || !out_surface)
-        return false;
+    if (out_surface) {
+        *out_surface = VA_INVALID_SURFACE;
+    }
+    if (!dec || !dec->initialized || !pkt || !out_surface || !pkt->data || pkt->size == 0 ||
+        pkt->size > (size_t)UINT32_MAX || pkt->size > (size_t)INT32_MAX) {
+        return VAAPI_DECODE_ERROR;
+    }
 
     uint32_t pool_size = dec->num_surfaces > 0 ? dec->num_surfaces : WAYWAL_VA_SURFACE_POOL_SIZE;
     bool is_vp9 =
@@ -662,24 +875,14 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
     if (!surface_found) {
         WAYWAL_LOG_WARN("All %u VA surfaces are busy (presentation), failing frame decode cleanly",
                         pool_size);
-        return false;
+        return VAAPI_DECODE_BUSY;
     }
 
     VASurfaceID target = dec->surfaces[dec->current_surface_idx];
     bool picture_begun = false;
+    bool decoded_hidden_frame = false;
 
     VAStatus st = VA_STATUS_SUCCESS;
-    if (!is_vp9 && !is_av1) {
-        st = vaBeginPicture(dec->va_display, dec->va_context, target);
-        if (st != VA_STATUS_SUCCESS) {
-            WAYWAL_LOG_ERR("vaBeginPicture failed: %s", vaErrorStr(st));
-            return false;
-        }
-        picture_begun = true;
-    }
-
-    VABufferID bufs[8];
-    uint32_t num_bufs = 0;
 
     int32_t curr_frame_num = (int32_t)dec->frame_num;
     int32_t curr_poc = (int32_t)(dec->frame_num * 2);
@@ -702,21 +905,29 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
         const uint8_t *nal_ptr = NULL;
         uint32_t nal_len = 0;
         bool found_slice = false;
+        bool saw_control_nal = false;
+        bool saw_sps_or_other = false;
         VASliceParameterBufferH264 first_slice_sp;
         memset(&first_slice_sp, 0, sizeof(first_slice_sp));
         while (next_h264_nal(pkt->data, pkt->size, dec->is_avcc, dec->nal_length_size, &scan_off,
                              &nal_ptr, &nal_len)) {
+            if (nal_len == 0)
+                continue;
             uint8_t ntype = nal_ptr[0] & 0x1F;
             if (ntype == 7) {
+                saw_sps_or_other = true;
                 if (parse_h264_sps(nal_ptr, nal_len, &sps)) {
                     dec->cached_sps = sps;
                     iq_needs_refresh = true;
                 }
             } else if (ntype == 8) {
+                saw_sps_or_other = true;
                 if (parse_h264_pps(nal_ptr, nal_len, &sps, &pps)) {
                     dec->cached_pps = pps;
                     iq_needs_refresh = true;
                 }
+            } else if (ntype == 6 || ntype == 9 || ntype == 10 || ntype == 11 || ntype == 12) {
+                saw_control_nal = true;
             } else if (ntype >= 1 && ntype <= 5 && !found_slice) {
                 found_slice = true;
                 is_idr_pic = (ntype == 5);
@@ -837,36 +1048,59 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
             }
         }
 
+        if (!found_slice && (pkt->size <= 4 || (saw_control_nal && !saw_sps_or_other))) {
+            return VAAPI_DECODE_ERROR;
+        }
+
+        st = vaBeginPicture(dec->va_display, dec->va_context, target);
+        if (st != VA_STATUS_SUCCESS) {
+            WAYWAL_LOG_ERR("vaBeginPicture failed: %s", vaErrorStr(st));
+            return VAAPI_DECODE_ERROR;
+        }
+        picture_begun = true;
+
         VABufferID hdr_bufs[2] = {VA_INVALID_ID, VA_INVALID_ID};
         uint32_t num_hdr_bufs = 0;
-        st = vaCreateBuffer(dec->va_display, dec->va_context, VAPictureParameterBufferType,
-                            sizeof(pic_param), 1, &pic_param, &hdr_bufs[0]);
-        if (st == VA_STATUS_SUCCESS) {
+        VAStatus st_pic =
+            vaCreateBuffer(dec->va_display, dec->va_context, VAPictureParameterBufferType,
+                           sizeof(pic_param), 1, &pic_param, &hdr_bufs[0]);
+        if (st_pic == VA_STATUS_SUCCESS) {
+            num_hdr_bufs++;
+        }
+        VAStatus st_iq =
+            vaCreateBuffer(dec->va_display, dec->va_context, VAIQMatrixBufferType,
+                           sizeof(dec->cached_iq), 1, &dec->cached_iq, &hdr_bufs[num_hdr_bufs]);
+        if (st_iq == VA_STATUS_SUCCESS) {
             num_hdr_bufs++;
         }
 
-        st = vaCreateBuffer(dec->va_display, dec->va_context, VAIQMatrixBufferType,
-                            sizeof(dec->cached_iq), 1, &dec->cached_iq, &hdr_bufs[num_hdr_bufs]);
-        if (st == VA_STATUS_SUCCESS) {
-            num_hdr_bufs++;
+        VAStatus st_hdr = VA_STATUS_ERROR_UNKNOWN;
+        if (st_pic == VA_STATUS_SUCCESS && st_iq == VA_STATUS_SUCCESS && num_hdr_bufs == 2) {
+            st_hdr = vaRenderPicture(dec->va_display, dec->va_context, hdr_bufs, (int)num_hdr_bufs);
         }
-
-        if (num_hdr_bufs > 0) {
-            vaRenderPicture(dec->va_display, dec->va_context, hdr_bufs, (int)num_hdr_bufs);
-            for (uint32_t b = 0; b < num_hdr_bufs; ++b) {
-                vaDestroyBuffer(dec->va_display, hdr_bufs[b]);
-            }
+        for (uint32_t b = 0; b < num_hdr_bufs; ++b) {
+            vaDestroyBuffer(dec->va_display, hdr_bufs[b]);
+        }
+        if (st_pic != VA_STATUS_SUCCESS || st_iq != VA_STATUS_SUCCESS ||
+            st_hdr != VA_STATUS_SUCCESS) {
+            WAYWAL_LOG_ERR("H.264 header buffer submit failed: pic=%s iq=%s render=%s",
+                           vaErrorStr(st_pic), vaErrorStr(st_iq), vaErrorStr(st_hdr));
+            vaEndPicture(dec->va_display, dec->va_context);
+            return VAAPI_DECODE_ERROR;
         }
 
         /* Iterate and render all slice NAL units */
         scan_off = 0;
         uint32_t slice_count = 0;
+        uint32_t rendered_slices = 0;
         uint32_t fn_m4 =
             sps.valid ? (sps.log2_max_frame_num_minus4 <= 12 ? sps.log2_max_frame_num_minus4 : 12)
                       : 4;
         int32_t max_fn = (int32_t)(1U << (fn_m4 + 4U));
         while (next_h264_nal(pkt->data, pkt->size, dec->is_avcc, dec->nal_length_size, &scan_off,
                              &nal_ptr, &nal_len)) {
+            if (nal_len == 0)
+                continue;
             uint8_t ntype = nal_ptr[0] & 0x1F;
             if (ntype >= 1 && ntype <= 5) {
                 VASliceParameterBufferH264 slice_param;
@@ -896,22 +1130,30 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
                 VAStatus s2 =
                     vaCreateBuffer(dec->va_display, dec->va_context, VASliceDataBufferType, nal_len,
                                    1, (void *)nal_ptr, &slice_bufs[1]);
+                VAStatus sr = VA_STATUS_ERROR_UNKNOWN;
                 if (s1 == VA_STATUS_SUCCESS && s2 == VA_STATUS_SUCCESS) {
-                    vaRenderPicture(dec->va_display, dec->va_context, slice_bufs, 2);
+                    sr = vaRenderPicture(dec->va_display, dec->va_context, slice_bufs, 2);
                 }
                 if (slice_bufs[0] != VA_INVALID_ID)
                     vaDestroyBuffer(dec->va_display, slice_bufs[0]);
                 if (slice_bufs[1] != VA_INVALID_ID)
                     vaDestroyBuffer(dec->va_display, slice_bufs[1]);
+                if (s1 != VA_STATUS_SUCCESS || s2 != VA_STATUS_SUCCESS || sr != VA_STATUS_SUCCESS) {
+                    WAYWAL_LOG_ERR("H.264 slice submit failed: p=%s d=%s render=%s", vaErrorStr(s1),
+                                   vaErrorStr(s2), vaErrorStr(sr));
+                    vaEndPicture(dec->va_display, dec->va_context);
+                    return VAAPI_DECODE_ERROR;
+                }
+                rendered_slices++;
                 slice_count++;
             }
         }
 
-        /* Fallback if no slice NAL was identified */
-        if (slice_count == 0 && pkt->size > 4) {
+        /* Fallback only for unframed raw packet (never empty/control-only) */
+        if (slice_count == 0 && pkt->size > 4 && (pkt->size - 4) <= (size_t)UINT32_MAX) {
             VASliceParameterBufferH264 slice_param;
             memset(&slice_param, 0, sizeof(slice_param));
-            slice_param.slice_data_size = (uint32_t)pkt->size - 4;
+            slice_param.slice_data_size = (uint32_t)(pkt->size - 4);
             slice_param.slice_data_offset = 0;
             slice_param.slice_data_flag = VA_SLICE_DATA_FLAG_ALL;
             slice_param.slice_type = pkt->is_keyframe ? 2 : 0;
@@ -922,14 +1164,25 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
                 vaCreateBuffer(dec->va_display, dec->va_context, VASliceParameterBufferType,
                                sizeof(slice_param), 1, &slice_param, &slice_bufs[0]);
             VAStatus s2 = vaCreateBuffer(dec->va_display, dec->va_context, VASliceDataBufferType,
-                                         pkt->size - 4, 1, (void *)(pkt->data + 4), &slice_bufs[1]);
+                                         (uint32_t)(pkt->size - 4), 1, (void *)(pkt->data + 4),
+                                         &slice_bufs[1]);
+            VAStatus sr = VA_STATUS_ERROR_UNKNOWN;
             if (s1 == VA_STATUS_SUCCESS && s2 == VA_STATUS_SUCCESS) {
-                vaRenderPicture(dec->va_display, dec->va_context, slice_bufs, 2);
+                sr = vaRenderPicture(dec->va_display, dec->va_context, slice_bufs, 2);
             }
             if (slice_bufs[0] != VA_INVALID_ID)
                 vaDestroyBuffer(dec->va_display, slice_bufs[0]);
             if (slice_bufs[1] != VA_INVALID_ID)
                 vaDestroyBuffer(dec->va_display, slice_bufs[1]);
+            if (s1 != VA_STATUS_SUCCESS || s2 != VA_STATUS_SUCCESS || sr != VA_STATUS_SUCCESS) {
+                vaEndPicture(dec->va_display, dec->va_context);
+                return VAAPI_DECODE_ERROR;
+            }
+            rendered_slices++;
+        }
+        if (rendered_slices == 0) {
+            vaEndPicture(dec->va_display, dec->va_context);
+            return VAAPI_DECODE_ERROR;
         }
     } else if (dec->va_profile == VAProfileHEVCMain || dec->va_profile == VAProfileHEVCMain10) {
         parsed_hevc_sps_t sps = dec->cached_hevc_sps;
@@ -1180,16 +1433,35 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
         pic_param.num_extra_slice_header_bits = pps.valid ? pps.num_extra_slice_header_bits : 0;
         pic_param.st_rps_bits = st_rps_bits;
 
+        if (total_hevc_slices == 0) {
+            return VAAPI_DECODE_ERROR;
+        }
+
+        st = vaBeginPicture(dec->va_display, dec->va_context, target);
+        if (st != VA_STATUS_SUCCESS) {
+            WAYWAL_LOG_ERR("vaBeginPicture (HEVC) failed: %s", vaErrorStr(st));
+            return VAAPI_DECODE_ERROR;
+        }
+        picture_begun = true;
+
         VABufferID pic_buf = VA_INVALID_ID;
         st = vaCreateBuffer(dec->va_display, dec->va_context, VAPictureParameterBufferType,
                             sizeof(pic_param), 1, &pic_param, &pic_buf);
+        VAStatus st_render = VA_STATUS_ERROR_UNKNOWN;
         if (st == VA_STATUS_SUCCESS) {
-            vaRenderPicture(dec->va_display, dec->va_context, &pic_buf, 1);
+            st_render = vaRenderPicture(dec->va_display, dec->va_context, &pic_buf, 1);
             vaDestroyBuffer(dec->va_display, pic_buf);
+        }
+        if (st != VA_STATUS_SUCCESS || st_render != VA_STATUS_SUCCESS) {
+            WAYWAL_LOG_ERR("HEVC picture param submit failed: create=%s render=%s", vaErrorStr(st),
+                           vaErrorStr(st_render));
+            vaEndPicture(dec->va_display, dec->va_context);
+            return VAAPI_DECODE_ERROR;
         }
 
         scan_off = 0;
         uint32_t slice_count = 0;
+        uint32_t rendered_slices = 0;
         VASliceParameterBufferHEVC last_indep_sp = first_slice_sp;
         while (next_h264_nal(pkt->data, pkt->size, dec->is_avcc, dec->nal_length_size, &scan_off,
                              &nal_ptr, &nal_len)) {
@@ -1223,32 +1495,27 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
                 VAStatus s2 =
                     vaCreateBuffer(dec->va_display, dec->va_context, VASliceDataBufferType, nal_len,
                                    1, (void *)nal_ptr, &slice_bufs[1]);
+                VAStatus sr = VA_STATUS_ERROR_UNKNOWN;
                 if (s1 == VA_STATUS_SUCCESS && s2 == VA_STATUS_SUCCESS) {
-                    vaRenderPicture(dec->va_display, dec->va_context, slice_bufs, 2);
+                    sr = vaRenderPicture(dec->va_display, dec->va_context, slice_bufs, 2);
                 }
                 if (slice_bufs[0] != VA_INVALID_ID)
                     vaDestroyBuffer(dec->va_display, slice_bufs[0]);
                 if (slice_bufs[1] != VA_INVALID_ID)
                     vaDestroyBuffer(dec->va_display, slice_bufs[1]);
+                if (s1 != VA_STATUS_SUCCESS || s2 != VA_STATUS_SUCCESS || sr != VA_STATUS_SUCCESS) {
+                    WAYWAL_LOG_ERR("HEVC slice submit failed: p=%s d=%s render=%s", vaErrorStr(s1),
+                                   vaErrorStr(s2), vaErrorStr(sr));
+                    vaEndPicture(dec->va_display, dec->va_context);
+                    return VAAPI_DECODE_ERROR;
+                }
+                rendered_slices++;
                 slice_count++;
             }
         }
-        if (slice_count == 0 && pkt->size > 0) {
-            VASliceParameterBufferHEVC slice_param;
-            memset(&slice_param, 0, sizeof(slice_param));
-            slice_param.slice_data_size = (uint32_t)pkt->size;
-            slice_param.slice_data_offset = 0;
-            slice_param.slice_data_flag = VA_SLICE_DATA_FLAG_ALL;
-            slice_param.LongSliceFlags.fields.slice_type = pkt->is_keyframe ? 2 : 1;
-            slice_param.LongSliceFlags.fields.LastSliceOfPic = 1;
-            build_hevc_ref_lists(&dec->dpb, (uint8_t)slice_param.LongSliceFlags.fields.slice_type,
-                                 curr_poc, &slice_param);
-            VABufferID slice_buf = VA_INVALID_ID;
-            if (vaCreateBuffer(dec->va_display, dec->va_context, VASliceParameterBufferType,
-                               sizeof(slice_param), 1, &slice_param,
-                               &slice_buf) == VA_STATUS_SUCCESS) {
-                bufs[num_bufs++] = slice_buf;
-            }
+        if (rendered_slices == 0) {
+            vaEndPicture(dec->va_display, dec->va_context);
+            return VAAPI_DECODE_ERROR;
         }
         for (size_t d = 0; d < dec->dpb.count; ++d) {
             dec->dpb.entries[d].is_reference = true;
@@ -1265,7 +1532,11 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
 
         is_idr_pic = false;
         VASurfaceID display_target = VA_INVALID_SURFACE;
+        bool decoded_any_vp9 = false;
         for (uint32_t sf = 0; sf < num_subframes; ++sf) {
+            if (!sub_ptrs[sf] || sub_sizes[sf] == 0 || sub_sizes[sf] > (size_t)UINT32_MAX) {
+                return VAAPI_DECODE_ERROR;
+            }
             VADecPictureParameterBufferVP9 pic_param;
             VASliceParameterBufferVP9 slice_param;
             memset(&pic_param, 0, sizeof(pic_param));
@@ -1298,11 +1569,12 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
                 if (ref_surf != VA_INVALID_SURFACE) {
                     target = ref_surf;
                     display_target = ref_surf;
+                    decoded_any_vp9 = true;
                     continue;
                 }
                 WAYWAL_LOG_WARN("VP9 show_existing references unpopulated slot %u",
                                 show_existing_idx);
-                return false;
+                return VAAPI_DECODE_ERROR;
             }
 
             bool vp9_surf_found = false;
@@ -1344,7 +1616,7 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
                 WAYWAL_LOG_WARN(
                     "All %u VA surfaces are busy (presentation), failing VP9 decode cleanly",
                     pool_size);
-                return false;
+                return VAAPI_DECODE_BUSY;
             }
 
             if (sub_is_idr) {
@@ -1357,39 +1629,43 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
             st = vaBeginPicture(dec->va_display, dec->va_context, target);
             if (st != VA_STATUS_SUCCESS) {
                 WAYWAL_LOG_ERR("vaBeginPicture failed: %s", vaErrorStr(st));
-                return false;
+                return VAAPI_DECODE_ERROR;
             }
 
             VABufferID sf_bufs[3] = {VA_INVALID_ID, VA_INVALID_ID, VA_INVALID_ID};
             uint32_t sf_num_bufs = 0;
-            if (vaCreateBuffer(dec->va_display, dec->va_context, VAPictureParameterBufferType,
-                               sizeof(pic_param), 1, &pic_param,
-                               &sf_bufs[sf_num_bufs]) == VA_STATUS_SUCCESS) {
+            VAStatus s1 =
+                vaCreateBuffer(dec->va_display, dec->va_context, VAPictureParameterBufferType,
+                               sizeof(pic_param), 1, &pic_param, &sf_bufs[0]);
+            if (s1 == VA_STATUS_SUCCESS)
                 sf_num_bufs++;
-            }
-            if (vaCreateBuffer(dec->va_display, dec->va_context, VASliceParameterBufferType,
-                               sizeof(slice_param), 1, &slice_param,
-                               &sf_bufs[sf_num_bufs]) == VA_STATUS_SUCCESS) {
+            VAStatus s2 =
+                vaCreateBuffer(dec->va_display, dec->va_context, VASliceParameterBufferType,
+                               sizeof(slice_param), 1, &slice_param, &sf_bufs[sf_num_bufs]);
+            if (s2 == VA_STATUS_SUCCESS)
                 sf_num_bufs++;
-            }
-            if (sub_sizes[sf] > 0 && sub_ptrs[sf] &&
-                vaCreateBuffer(dec->va_display, dec->va_context, VASliceDataBufferType,
-                               (uint32_t)sub_sizes[sf], 1, (void *)sub_ptrs[sf],
-                               &sf_bufs[sf_num_bufs]) == VA_STATUS_SUCCESS) {
+            VAStatus s3 = vaCreateBuffer(dec->va_display, dec->va_context, VASliceDataBufferType,
+                                         (uint32_t)sub_sizes[sf], 1, (void *)sub_ptrs[sf],
+                                         &sf_bufs[sf_num_bufs]);
+            if (s3 == VA_STATUS_SUCCESS)
                 sf_num_bufs++;
-            }
 
-            if (sf_num_bufs > 0) {
-                vaRenderPicture(dec->va_display, dec->va_context, sf_bufs, (int)sf_num_bufs);
-                for (uint32_t b = 0; b < sf_num_bufs; ++b) {
-                    vaDestroyBuffer(dec->va_display, sf_bufs[b]);
-                }
+            VAStatus sr = VA_STATUS_ERROR_UNKNOWN;
+            if (s1 == VA_STATUS_SUCCESS && s2 == VA_STATUS_SUCCESS && s3 == VA_STATUS_SUCCESS &&
+                sf_num_bufs == 3) {
+                sr = vaRenderPicture(dec->va_display, dec->va_context, sf_bufs, (int)sf_num_bufs);
+            }
+            for (uint32_t b = 0; b < sf_num_bufs; ++b) {
+                vaDestroyBuffer(dec->va_display, sf_bufs[b]);
             }
             VAStatus end_st = vaEndPicture(dec->va_display, dec->va_context);
-            if (end_st != VA_STATUS_SUCCESS) {
-                WAYWAL_LOG_ERR("vaEndPicture failed: %s", vaErrorStr(end_st));
-                return false;
+            if (s1 != VA_STATUS_SUCCESS || s2 != VA_STATUS_SUCCESS || s3 != VA_STATUS_SUCCESS ||
+                sr != VA_STATUS_SUCCESS || end_st != VA_STATUS_SUCCESS) {
+                WAYWAL_LOG_ERR("VP9 subframe %u failed: b=%s/%s/%s r=%s end=%s", sf, vaErrorStr(s1),
+                               vaErrorStr(s2), vaErrorStr(s3), vaErrorStr(sr), vaErrorStr(end_st));
+                return VAAPI_DECODE_ERROR;
             }
+            decoded_any_vp9 = true;
             for (int i = 0; i < 8; ++i) {
                 if (refresh_flags & (1U << i)) {
                     dec->vp9_ref_frames[i] = target;
@@ -1398,6 +1674,9 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
         }
 
         target = display_target;
+        if (decoded_any_vp9 && target == VA_INVALID_SURFACE) {
+            decoded_hidden_frame = true;
+        }
         if (is_idr_pic) {
             dec->frame_num = 0;
             curr_frame_num = 0;
@@ -1441,6 +1720,8 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
             if (has_size) {
                 size_t leb_bytes = 0;
                 uint64_t parsed_sz = av1_read_leb128(pkt->data + off, pkt->size - off, &leb_bytes);
+                if (leb_bytes == 0)
+                    break;
                 off += leb_bytes;
                 if (parsed_sz > pkt->size - off)
                     break;
@@ -1453,7 +1734,7 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
                     if (!submit_av1_frame_to_va(
                             dec, pool_size, &pic_param, av1_slices, av1_slice_count, pkt,
                             refresh_flags, av1_show_existing, av1_show_existing_idx, &target)) {
-                        return false;
+                        return VAAPI_DECODE_ERROR;
                     }
                     if (av1_show_existing || pic_param.pic_info_fields.bits.show_frame != 0) {
                         display_target = target;
@@ -1483,7 +1764,7 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
                     if (!submit_av1_frame_to_va(
                             dec, pool_size, &pic_param, av1_slices, av1_slice_count, pkt,
                             refresh_flags, av1_show_existing, av1_show_existing_idx, &target)) {
-                        return false;
+                        return VAAPI_DECODE_ERROR;
                     }
                     if (av1_show_existing || pic_param.pic_info_fields.bits.show_frame != 0) {
                         display_target = target;
@@ -1502,18 +1783,24 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
             off += obu_sz;
         }
 
-        if (av1_frame_active || !submitted_any_av1) {
+        if (av1_frame_active) {
             if (!submit_av1_frame_to_va(dec, pool_size, &pic_param, av1_slices, av1_slice_count,
                                         pkt, refresh_flags, av1_show_existing,
                                         av1_show_existing_idx, &target)) {
-                return false;
+                return VAAPI_DECODE_ERROR;
             }
             if (av1_show_existing || pic_param.pic_info_fields.bits.show_frame != 0) {
                 display_target = target;
             }
+            submitted_any_av1 = true;
+        } else if (!submitted_any_av1) {
+            return VAAPI_DECODE_ERROR;
         }
 
         target = display_target;
+        if (submitted_any_av1 && target == VA_INVALID_SURFACE) {
+            decoded_hidden_frame = true;
+        }
         if (is_idr_pic) {
             dec->frame_num = 0;
             curr_frame_num = 0;
@@ -1521,31 +1808,11 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
         }
     }
 
-    /* Slice bitstream data buffer for non-H.264 codecs */
-    if (num_bufs > 0) {
-        if (pkt->size > 0 && pkt->data) {
-            VABufferID data_buf = VA_INVALID_ID;
-            st = vaCreateBuffer(dec->va_display, dec->va_context, VASliceDataBufferType,
-                                (uint32_t)pkt->size, 1, (void *)pkt->data, &data_buf);
-            if (st == VA_STATUS_SUCCESS) {
-                bufs[num_bufs++] = data_buf;
-            }
-        }
-
-        st = vaRenderPicture(dec->va_display, dec->va_context, bufs, (int)num_bufs);
-        if (st != VA_STATUS_SUCCESS) {
-            WAYWAL_LOG_WARN("vaRenderPicture returned: %s", vaErrorStr(st));
-        }
-
-        for (uint32_t i = 0; i < num_bufs; ++i) {
-            vaDestroyBuffer(dec->va_display, bufs[i]);
-        }
-    }
-
     if (picture_begun) {
         st = vaEndPicture(dec->va_display, dec->va_context);
         if (st != VA_STATUS_SUCCESS) {
-            WAYWAL_LOG_WARN("vaEndPicture returned: %s", vaErrorStr(st));
+            WAYWAL_LOG_ERR("vaEndPicture failed: %s", vaErrorStr(st));
+            return VAAPI_DECODE_ERROR;
         }
     }
 
@@ -1616,13 +1883,81 @@ bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt
     dec->frame_num++;
 
     if (target == VA_INVALID_SURFACE) {
+        if (decoded_hidden_frame) {
+            *out_surface = VA_INVALID_SURFACE;
+            return VAAPI_DECODE_HIDDEN_NO_DISPLAY;
+        }
         WAYWAL_LOG_WARN("Decoded surface target is invalid");
-        return false;
+        return VAAPI_DECODE_ERROR;
     }
 
     *out_surface = target;
     dec->current_surface_idx = (dec->current_surface_idx + 1) % pool_size;
-    return true;
+    return VAAPI_DECODE_OK;
+}
+
+bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt,
+                                 VASurfaceID *out_surface)
+{
+    vaapi_decode_status_t st = vaapi_decoder_decode_packet_ex(dec, pkt, out_surface);
+    return (st == VAAPI_DECODE_OK || st == VAAPI_DECODE_HIDDEN_NO_DISPLAY);
+}
+
+static void vaapi_get_color_props(const vaapi_decoder_t *dec, int *out_color_space,
+                                  bool *out_full_range)
+{
+    int cs = VAAPI_COLOR_UNKNOWN;
+    bool full_range = false;
+    if (!dec) {
+        if (out_color_space)
+            *out_color_space = cs;
+        if (out_full_range)
+            *out_full_range = full_range;
+        return;
+    }
+
+    uint8_t mc = 2;
+    if (dec->cached_sps.valid) {
+        mc = dec->cached_sps.matrix_coefficients;
+        full_range = dec->cached_sps.video_full_range_flag;
+        if (mc == 1)
+            cs = VAAPI_COLOR_BT709;
+        else if (mc == 5 || mc == 6)
+            cs = VAAPI_COLOR_BT601;
+        else if (mc == 9 || mc == 10)
+            cs = VAAPI_COLOR_BT2020;
+    } else if (dec->cached_hevc_sps.valid) {
+        mc = dec->cached_hevc_sps.matrix_coefficients;
+        full_range = dec->cached_hevc_sps.video_full_range_flag;
+        if (mc == 1)
+            cs = VAAPI_COLOR_BT709;
+        else if (mc == 5 || mc == 6)
+            cs = VAAPI_COLOR_BT601;
+        else if (mc == 9 || mc == 10)
+            cs = VAAPI_COLOR_BT2020;
+    } else if (dec->cached_av1_seq.valid) {
+        mc = dec->cached_av1_seq.matrix_coefficients;
+        full_range = dec->cached_av1_seq.color_range;
+        if (mc == 1)
+            cs = VAAPI_COLOR_BT709;
+        else if (mc == 5 || mc == 6)
+            cs = VAAPI_COLOR_BT601;
+        else if (mc == 9 || mc == 10)
+            cs = VAAPI_COLOR_BT2020;
+    } else if (dec->va_profile == VAProfileVP9Profile0 || dec->va_profile == VAProfileVP9Profile2) {
+        full_range = dec->vp9_color_range;
+        if (dec->vp9_color_space == 1 || dec->vp9_color_space == 3 || dec->vp9_color_space == 4)
+            cs = VAAPI_COLOR_BT601;
+        else if (dec->vp9_color_space == 2)
+            cs = VAAPI_COLOR_BT709;
+        else if (dec->vp9_color_space == 5)
+            cs = VAAPI_COLOR_BT2020;
+    }
+
+    if (out_color_space)
+        *out_color_space = cs;
+    if (out_full_range)
+        *out_full_range = full_range;
 }
 
 bool vaapi_decoder_vpp_blit(vaapi_decoder_t *dec, VASurfaceID src_surface,
@@ -1633,7 +1968,10 @@ bool vaapi_decoder_vpp_blit(vaapi_decoder_t *dec, VASurfaceID src_surface,
         return false;
     }
 
-    vaSyncSurface(dec->va_display, src_surface);
+    if (vaSyncSurface(dec->va_display, src_surface) != VA_STATUS_SUCCESS) {
+        WAYWAL_LOG_WARN("VPP source vaSyncSurface failed");
+        return false;
+    }
 
     VARectangle in_rect = {
         .x = 0, .y = 0, .width = (uint16_t)dec->width, .height = (uint16_t)dec->height};
@@ -1645,87 +1983,19 @@ bool vaapi_decoder_vpp_blit(vaapi_decoder_t *dec, VASurfaceID src_surface,
     vpp_param.surface = src_surface;
     vpp_param.surface_region = &in_rect;
     vpp_param.output_region = &out_rect;
+
+    int color_space = VAAPI_COLOR_UNKNOWN;
+    bool full_range = false;
+    vaapi_get_color_props(dec, &color_space, &full_range);
     VAProcColorStandardType color_std = VAProcColorStandardNone;
-    if (dec->cached_sps.valid) {
-        switch (dec->cached_sps.matrix_coefficients) {
-        case 1:
-            color_std = VAProcColorStandardBT709;
-            break;
-        case 5:
-        case 6:
-            color_std = VAProcColorStandardBT601;
-            break;
-        case 9:
-        case 10:
-            color_std = VAProcColorStandardBT2020;
-            break;
-        default:
-            color_std = VAProcColorStandardNone;
-            break;
-        }
-        if (dec->cached_sps.video_full_range_flag) {
-            vpp_param.input_color_properties.color_range = VA_SOURCE_RANGE_FULL;
-        }
-    } else if (dec->cached_hevc_sps.valid) {
-        switch (dec->cached_hevc_sps.matrix_coefficients) {
-        case 1:
-            color_std = VAProcColorStandardBT709;
-            break;
-        case 5:
-        case 6:
-            color_std = VAProcColorStandardBT601;
-            break;
-        case 9:
-        case 10:
-            color_std = VAProcColorStandardBT2020;
-            break;
-        default:
-            color_std = VAProcColorStandardNone;
-            break;
-        }
-        if (dec->cached_hevc_sps.video_full_range_flag) {
-            vpp_param.input_color_properties.color_range = VA_SOURCE_RANGE_FULL;
-        }
-    } else if (dec->cached_av1_seq.valid) {
-        switch (dec->cached_av1_seq.matrix_coefficients) {
-        case 1:
-            color_std = VAProcColorStandardBT709;
-            break;
-        case 5:
-        case 6:
-            color_std = VAProcColorStandardBT601;
-            break;
-        case 9:
-        case 10:
-            color_std = VAProcColorStandardBT2020;
-            break;
-        default:
-            color_std = VAProcColorStandardNone;
-            break;
-        }
-        if (dec->cached_av1_seq.color_range) {
-            vpp_param.input_color_properties.color_range = VA_SOURCE_RANGE_FULL;
-        }
-    } else if (dec->va_profile == VAProfileVP9Profile0 || dec->va_profile == VAProfileVP9Profile2) {
-        switch (dec->vp9_color_space) {
-        case 1:
-        case 3:
-        case 4:
-            color_std = VAProcColorStandardBT601;
-            break;
-        case 2:
-            color_std = VAProcColorStandardBT709;
-            break;
-        case 5:
-            color_std = VAProcColorStandardBT2020;
-            break;
-        default:
-            color_std = VAProcColorStandardNone;
-            break;
-        }
-        if (dec->vp9_color_range) {
-            vpp_param.input_color_properties.color_range = VA_SOURCE_RANGE_FULL;
-        }
+    if (color_space == VAAPI_COLOR_BT709)
+        color_std = VAProcColorStandardBT709;
+    else if (color_space == VAAPI_COLOR_BT601)
+        color_std = VAProcColorStandardBT601;
+    else if (color_space == VAAPI_COLOR_BT2020)
+        color_std = VAProcColorStandardBT2020;
+    if (full_range) {
+        vpp_param.input_color_properties.color_range = VA_SOURCE_RANGE_FULL;
     }
     vpp_param.surface_color_standard = color_std;
     vpp_param.output_color_standard = VAProcColorStandardNone;
@@ -1742,10 +2012,18 @@ bool vaapi_decoder_vpp_blit(vaapi_decoder_t *dec, VASurfaceID src_surface,
     bool ok = false;
     vpp_st = vaBeginPicture(dec->va_display, dec->vpp_context, dst_vpp_surface);
     if (vpp_st == VA_STATUS_SUCCESS) {
-        vaRenderPicture(dec->va_display, dec->vpp_context, &vpp_buf, 1);
-        vaEndPicture(dec->va_display, dec->vpp_context);
-        vaSyncSurface(dec->va_display, dst_vpp_surface);
-        ok = true;
+        VAStatus rst = vaRenderPicture(dec->va_display, dec->vpp_context, &vpp_buf, 1);
+        VAStatus est = vaEndPicture(dec->va_display, dec->vpp_context);
+        VAStatus sst = (VAStatus)VA_STATUS_ERROR_UNKNOWN;
+        if (rst == VA_STATUS_SUCCESS && est == VA_STATUS_SUCCESS) {
+            sst = vaSyncSurface(dec->va_display, dst_vpp_surface);
+        }
+        if (rst == VA_STATUS_SUCCESS && est == VA_STATUS_SUCCESS && sst == VA_STATUS_SUCCESS) {
+            ok = true;
+        } else {
+            WAYWAL_LOG_WARN("VPP submit failed: render=%s end=%s sync=%s", vaErrorStr(rst),
+                            vaErrorStr(est), vaErrorStr(sst));
+        }
     } else {
         WAYWAL_LOG_WARN("VPP vaBeginPicture failed: %s", vaErrorStr(vpp_st));
     }
@@ -1767,19 +2045,21 @@ bool vaapi_decoder_export_prime(vaapi_decoder_t *dec, VASurfaceID surface,
     if (!dec || !dec->initialized || surface == VA_INVALID_SURFACE || !out_frame) {
         return false;
     }
-    bool already_synced = false;
+    bool is_vpp_surface = false;
     if (dec->has_vpp) {
         uint32_t vpp_pool =
             dec->num_vpp_surfaces > 0 ? dec->num_vpp_surfaces : WAYWAL_VA_VPP_POOL_SIZE;
         for (uint32_t i = 0; i < vpp_pool; ++i) {
             if (dec->vpp_surfaces[i] == surface) {
-                already_synced = true;
+                is_vpp_surface = true;
                 break;
             }
         }
     }
-    if (!already_synced) {
-        vaSyncSurface(dec->va_display, surface);
+    if (!is_vpp_surface) {
+        if (vaSyncSurface(dec->va_display, surface) != VA_STATUS_SUCCESS) {
+            return false;
+        }
     }
     memset(out_frame, 0, sizeof(*out_frame));
     for (int i = 0; i < 4; ++i)
@@ -1789,39 +2069,24 @@ bool vaapi_decoder_export_prime(vaapi_decoder_t *dec, VASurfaceID surface,
     memset(&prime_desc, 0, sizeof(prime_desc));
 
     VAStatus st;
-    uint32_t export_mode = dec->export_layer_mode;
-    if (export_mode != 0) {
-        st = vaExportSurfaceHandle(dec->va_display, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-                                   VA_EXPORT_SURFACE_READ_ONLY | export_mode, &prime_desc);
-        if (st != VA_STATUS_SUCCESS) {
-            uint32_t alt_mode = (export_mode == VA_EXPORT_SURFACE_COMPOSED_LAYERS)
-                                    ? VA_EXPORT_SURFACE_SEPARATE_LAYERS
-                                    : VA_EXPORT_SURFACE_COMPOSED_LAYERS;
-            st = vaExportSurfaceHandle(dec->va_display, surface,
-                                       VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-                                       VA_EXPORT_SURFACE_READ_ONLY | alt_mode, &prime_desc);
-            if (st == VA_STATUS_SUCCESS) {
-                dec->export_layer_mode = alt_mode;
-            }
-        }
+    uint32_t export_mode = is_vpp_surface
+                               ? VA_EXPORT_SURFACE_SEPARATE_LAYERS
+                               : (dec->export_layer_mode != 0 ? dec->export_layer_mode
+                                                              : VA_EXPORT_SURFACE_SEPARATE_LAYERS);
+    uint32_t alt_mode = (export_mode == VA_EXPORT_SURFACE_SEPARATE_LAYERS)
+                            ? VA_EXPORT_SURFACE_COMPOSED_LAYERS
+                            : VA_EXPORT_SURFACE_SEPARATE_LAYERS;
+
+    st = vaExportSurfaceHandle(dec->va_display, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                               VA_EXPORT_SURFACE_READ_ONLY | export_mode, &prime_desc);
+    if (st == VA_STATUS_SUCCESS) {
+        if (!is_vpp_surface)
+            dec->export_layer_mode = export_mode;
     } else {
-        uint32_t preferred = (!dec->has_vpp && !dec->is_nvidia_vaapi)
-                                 ? VA_EXPORT_SURFACE_COMPOSED_LAYERS
-                                 : VA_EXPORT_SURFACE_SEPARATE_LAYERS;
-        uint32_t fallback = (preferred == VA_EXPORT_SURFACE_COMPOSED_LAYERS)
-                                ? VA_EXPORT_SURFACE_SEPARATE_LAYERS
-                                : VA_EXPORT_SURFACE_COMPOSED_LAYERS;
         st = vaExportSurfaceHandle(dec->va_display, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-                                   VA_EXPORT_SURFACE_READ_ONLY | preferred, &prime_desc);
-        if (st == VA_STATUS_SUCCESS) {
-            dec->export_layer_mode = preferred;
-        } else {
-            st = vaExportSurfaceHandle(dec->va_display, surface,
-                                       VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-                                       VA_EXPORT_SURFACE_READ_ONLY | fallback, &prime_desc);
-            if (st == VA_STATUS_SUCCESS) {
-                dec->export_layer_mode = fallback;
-            }
+                                   VA_EXPORT_SURFACE_READ_ONLY | alt_mode, &prime_desc);
+        if (st == VA_STATUS_SUCCESS && !is_vpp_surface) {
+            dec->export_layer_mode = alt_mode;
         }
     }
 
@@ -1845,8 +2110,16 @@ bool vaapi_decoder_export_prime(vaapi_decoder_t *dec, VASurfaceID surface,
         out_frame->drm_format = prime_desc.layers[0].drm_format;
     } else {
         out_frame->drm_format =
-            dec->has_vpp ? DRM_FORMAT_XRGB8888
-                         : (dec->fourcc == VA_FOURCC_P010 ? DRM_FORMAT_P010 : DRM_FORMAT_NV12);
+            is_vpp_surface ? DRM_FORMAT_XRGB8888
+                           : (dec->fourcc == VA_FOURCC_P010 ? DRM_FORMAT_P010 : DRM_FORMAT_NV12);
+    }
+    out_frame->is_10bit = (out_frame->drm_format == DRM_FORMAT_P010);
+    vaapi_get_color_props(dec, &out_frame->color_space, &out_frame->full_range);
+
+    uint32_t layer_cnt = prime_desc.num_layers < 4 ? prime_desc.num_layers : 4;
+    out_frame->num_layers = layer_cnt;
+    for (uint32_t l = 0; l < layer_cnt; ++l) {
+        out_frame->layer_formats[l] = prime_desc.layers[l].drm_format;
     }
 
     uint32_t plane_idx = 0;
@@ -1878,6 +2151,13 @@ bool vaapi_decoder_export_prime(vaapi_decoder_t *dec, VASurfaceID surface,
     }
 
     out_frame->num_planes = plane_idx;
+    for (uint32_t i = 0; i < plane_idx; ++i) {
+        if (out_frame->fds[i] < 0) {
+            vaapi_prime_frame_close(out_frame);
+            out_frame->num_planes = 0;
+            return false;
+        }
+    }
     return true;
 }
 
@@ -1913,6 +2193,12 @@ static bool vaapi_ops_decode_packet(void *ctx, const demux_packet_t *pkt, uint32
     return vaapi_decoder_decode_packet((vaapi_decoder_t *)ctx, pkt, (VASurfaceID *)out_surface);
 }
 
+static vaapi_decode_status_t vaapi_ops_decode_packet_ex(void *ctx, const demux_packet_t *pkt,
+                                                        uint32_t *out_surface)
+{
+    return vaapi_decoder_decode_packet_ex((vaapi_decoder_t *)ctx, pkt, (VASurfaceID *)out_surface);
+}
+
 static bool vaapi_ops_export_prime(void *ctx, uint32_t surface, vaapi_prime_frame_t *out_frame)
 {
     return vaapi_decoder_export_prime((vaapi_decoder_t *)ctx, (VASurfaceID)surface, out_frame);
@@ -1931,6 +2217,7 @@ const waywal_video_decoder_ops_t g_waywal_vaapi_decoder_ops = {
     .release_frame = vaapi_prime_frame_close,
     .reset = vaapi_ops_reset,
     .destroy = vaapi_ops_destroy,
+    .decode_packet_ex = vaapi_ops_decode_packet_ex,
 };
 
 const waywal_video_decoder_ops_t g_waywal_vulkan_video_decoder_ops = {
@@ -1942,6 +2229,7 @@ const waywal_video_decoder_ops_t g_waywal_vulkan_video_decoder_ops = {
     .release_frame = vaapi_prime_frame_close,
     .reset = vaapi_ops_reset,
     .destroy = vaapi_ops_destroy,
+    .decode_packet_ex = vaapi_ops_decode_packet_ex,
 };
 
 const waywal_video_decoder_ops_t g_waywal_v4l2_m2m_decoder_ops = {
@@ -1953,6 +2241,7 @@ const waywal_video_decoder_ops_t g_waywal_v4l2_m2m_decoder_ops = {
     .release_frame = vaapi_prime_frame_close,
     .reset = vaapi_ops_reset,
     .destroy = vaapi_ops_destroy,
+    .decode_packet_ex = vaapi_ops_decode_packet_ex,
 };
 
 const waywal_video_decoder_ops_t *waywal_video_decoder_get_ops(waywal_video_backend_type_t backend)

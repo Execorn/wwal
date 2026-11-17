@@ -69,6 +69,16 @@ typedef struct video_engine {
     bool using_swdec;
     void *swdec_ctx;
     char filepath[4096];
+
+    uint32_t hw_decode_err_count;
+    void *yuv_gl_ctx;
+    struct {
+        struct output_node *out;
+        struct wl_surface *surface;
+        int32_t buf_idx;
+        int32_t sw_buf_idx;
+        bool active;
+    } tracked_outs[16];
 } video_engine_t;
 
 bool video_engine_init(video_engine_t *ve, struct daemon_state *state);

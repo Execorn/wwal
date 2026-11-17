@@ -292,7 +292,26 @@ typedef struct {
     uint32_t width;
     uint32_t height;
     VASurfaceID surface_id;
+    uint32_t layer_formats[4];
+    uint32_t num_layers;
+    int color_space; /* 0: auto, 1: BT.601, 2: BT.709, 3: BT.2020 */
+    bool full_range;
+    bool is_10bit;
 } vaapi_prime_frame_t;
+
+typedef enum {
+    VAAPI_DECODE_OK = 0,
+    VAAPI_DECODE_HIDDEN_NO_DISPLAY = 1,
+    VAAPI_DECODE_BUSY = 2,
+    VAAPI_DECODE_ERROR = -1
+} vaapi_decode_status_t;
+
+typedef enum {
+    VAAPI_COLOR_UNKNOWN = 0,
+    VAAPI_COLOR_BT601 = 1,
+    VAAPI_COLOR_BT709 = 2,
+    VAAPI_COLOR_BT2020 = 3
+} vaapi_color_space_t;
 
 /* Initialize hardware VA-API decoder on DRM file descriptor */
 bool vaapi_decoder_init(vaapi_decoder_t *dec, int drm_render_fd, waywal_codec_t codec,
@@ -303,6 +322,11 @@ bool vaapi_decoder_init_with_params(vaapi_decoder_t *dec, int drm_render_fd, way
                                     uint32_t width, uint32_t height, const uint8_t *extradata,
                                     size_t extradata_size, bool allow_direct_nv12);
 
+/* Inspect extradata bit depth and reference requirements without mutating decoder state */
+bool vaapi_decoder_probe_extradata(waywal_codec_t codec, VAProfile profile,
+                                   const uint8_t *extradata, size_t size, bool *out_is_10bit,
+                                   uint32_t *out_max_refs);
+
 /* Sets codec extradata (e.g. SPS/PPS from MP4 avcC or WebM) */
 bool vaapi_decoder_set_extradata(vaapi_decoder_t *dec, const uint8_t *extradata, size_t size);
 
@@ -311,6 +335,11 @@ void vaapi_decoder_destroy(vaapi_decoder_t *dec);
 
 /* Reset decoder state (DPB, frame_num) */
 void vaapi_decoder_reset(vaapi_decoder_t *dec);
+
+/* Submits elementary stream packet to hardware ASIC with explicit hidden-frame status */
+vaapi_decode_status_t vaapi_decoder_decode_packet_ex(vaapi_decoder_t *dec,
+                                                     const demux_packet_t *pkt,
+                                                     VASurfaceID *out_surface);
 
 /* Submits elementary stream packet to hardware ASIC */
 bool vaapi_decoder_decode_packet(vaapi_decoder_t *dec, const demux_packet_t *pkt,

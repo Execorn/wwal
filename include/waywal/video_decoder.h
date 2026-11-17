@@ -31,6 +31,8 @@ typedef struct {
     void (*release_frame)(vaapi_prime_frame_t *frame);
     void (*reset)(void *ctx);
     void (*destroy)(void *ctx);
+    vaapi_decode_status_t (*decode_packet_ex)(void *ctx, const demux_packet_t *pkt,
+                                              uint32_t *out_surface);
 } waywal_video_decoder_ops_t;
 
 extern const waywal_video_decoder_ops_t g_waywal_vaapi_decoder_ops;
