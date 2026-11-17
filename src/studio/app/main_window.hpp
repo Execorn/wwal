@@ -11,12 +11,15 @@
 #include <QStringList>
 #include <QAction>
 #include <QComboBox>
+#include <QImage>
 #include <QLabel>
 #include <QPointer>
 #include <QPushButton>
+#include <deque>
 #include <memory>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace wwal::studio {
 class VirtualizedGridWidget;
@@ -149,6 +152,10 @@ class MainWindow : public QMainWindow {
     QAction *exportScenePackageAction() const { return m_exportScenePkgAction; }
     QPushButton *pauseButton() const { return m_pauseBtn; }
 
+    bool loadPuppetFromMdlFile(const QString &filePath, int32_t objectId = 0);
+    void loadExistingPuppetIntoPanels(int32_t objectId, const we_puppet_t *puppet,
+                                      uint32_t texWidth = 0u, uint32_t texHeight = 0u);
+
   public slots:
     void handleUndo();
     void handleRedo();
@@ -180,9 +187,19 @@ class MainWindow : public QMainWindow {
     void updateGpuShaderEditorContext();
     void syncThemeStateToIpcOrActiveWallpaper(bool includeApplyHint = false);
     void dispatchScenePackageExport(const QString &destPath);
+    struct CachedAlphaBuffer {
+        uint32_t width{0};
+        uint32_t height{0};
+        std::vector<uint8_t> alpha;
+        bool pushed{false};
+    };
+
     void detachPanelServicePointers() noexcept;
     void setActivePuppetObjectContext(int32_t objectId, uint32_t texWidth, uint32_t texHeight);
+    void hydratePuppetMeshPanel(PuppetMeshPanel *panel);
     void hydrateWeightPaintPanel(WeightPaintPanel *panel) const;
+    void syncWeightPaintBrushAndLocks(WeightPaintPanel *panel) const;
+    void syncSourceAlphaFromPreviewImage(const QImage &image);
     void hydrateDopeSheetTimeline(DopeSheetTimelineWidget *timeline);
     void refreshOnionSkinFrames();
 
@@ -245,6 +262,9 @@ class MainWindow : public QMainWindow {
     uint32_t m_activePuppetTexHeight{0};
     int32_t m_timelineHydratedObjectId{-1};
     PuppetMeshSnapshot m_cachedPuppetMesh;
+    CachedAlphaBuffer m_cachedPreviewAlpha;
+    std::unordered_map<int32_t, CachedAlphaBuffer> m_cachedObjectAlphas;
+    std::deque<int32_t> m_pendingAlphaReadbackObjectIds;
     BoneHierarchySnapshot m_cachedPuppetRig;
     bool m_hasCachedPuppetRig{false};
     std::unordered_map<int32_t, std::unordered_map<int32_t, we_bone_drive_mode_t>>

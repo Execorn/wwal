@@ -1652,6 +1652,15 @@ bool WeightPaintBrushBridge::isBoneLocked(uint32_t boneIdx) const noexcept
     return isBoneLockedInMask(m_lockedBoneMask, boneIdx);
 }
 
+bool WeightPaintBrushBridge::isVertexLocked(size_t vertIdx) const noexcept
+{
+    const size_t wordIdx = vertIdx >> 6u;
+    if (wordIdx >= m_lockedVertexBits.size()) {
+        return false;
+    }
+    return (m_lockedVertexBits[wordIdx] & (1ull << (vertIdx & 63u))) != 0ull;
+}
+
 void WeightPaintBrushBridge::beginStroke()
 {
     m_pendingDabs.clear();
@@ -1702,6 +1711,9 @@ void WeightPaintBrushBridge::applyDab(ViewportGizmoOverlay &overlay, uint32_t co
         return avoidBone;
     };
 
+    const float rawFalloff = (dab.falloff > 0.0f) ? dab.falloff : m_falloff;
+    const float falloffExp = std::clamp(std::isfinite(rawFalloff) ? rawFalloff : 1.5f, 0.25f, 4.0f);
+
     float neighborAvg = 0.0f;
     float neighborW = 0.0f;
     if (dab.op == WE_WEIGHT_OP_SMOOTH) {
@@ -1720,7 +1732,11 @@ void WeightPaintBrushBridge::applyDab(ViewportGizmoOverlay &overlay, uint32_t co
                         w += std::max(0.0f, verts[i].weight[k]);
                     }
                 }
-                const float g = 1.0f - std::sqrt(d2) / dab.radiusPx;
+                const float d = std::sqrt(d2);
+                const float cosFalloff = std::clamp(
+                    0.5f * (1.0f + std::cos(static_cast<float>(M_PI) * d / dab.radiusPx)), 0.0f,
+                    1.0f);
+                const float g = std::pow(cosFalloff, falloffExp);
                 neighborAvg += w * g;
                 neighborW += g;
             }
@@ -1737,7 +1753,7 @@ void WeightPaintBrushBridge::applyDab(ViewportGizmoOverlay &overlay, uint32_t co
         const float dx = verts[i].pos[0] - dabLocalX;
         const float dy = verts[i].pos[1] - dabLocalY;
         const float distSq = dx * dx + dy * dy;
-        if (distSq > radiusSq) {
+        if (distSq > radiusSq || isVertexLocked(i)) {
             continue;
         }
 
@@ -1753,8 +1769,9 @@ void WeightPaintBrushBridge::applyDab(ViewportGizmoOverlay &overlay, uint32_t co
         }
 
         const float dist = std::sqrt(distSq);
-        const float falloff =
-            0.5f * (1.0f + std::cos(static_cast<float>(M_PI) * dist / dab.radiusPx));
+        const float cosFalloff = std::clamp(
+            0.5f * (1.0f + std::cos(static_cast<float>(M_PI) * dist / dab.radiusPx)), 0.0f, 1.0f);
+        const float falloff = std::pow(cosFalloff, falloffExp);
         const float alpha = std::clamp(dab.strength * dab.pressure * falloff, 0.0f, 1.0f);
 
         auto &v = verts[i];
@@ -1904,6 +1921,9 @@ void WeightPaintBrushBridge::normalizeAllWeights(
         preSnap.blockIndex = static_cast<uint32_t>(bStart / 256u);
 
         for (size_t i = bStart; i < bEnd; ++i) {
+            if (isVertexLocked(i)) {
+                continue;
+            }
             auto &v = verts[i];
             float lockedSum = 0.0f;
             float freeSum = 0.0f;
@@ -2298,6 +2318,7 @@ void GpuPreviewViewport::setPreviewImage(const QImage &image)
     m_previewMode = PreviewMode::InProcessImage;
     updateAnimationTimerState();
     update();
+    emit previewImageChanged(m_fallbackImage);
 }
 
 bool GpuPreviewViewport::setPreviewImagePath(const QString &filePath)
@@ -2530,6 +2551,7 @@ void GpuPreviewViewport::clearPreviewImage()
     }
     updateAnimationTimerState();
     update();
+    emit previewImageChanged(QImage());
 }
 
 bool GpuPreviewViewport::compileShaderInternal(const QString &glslSource, QString *outError)
@@ -4162,7 +4184,7 @@ void GpuPreviewViewport::renderGizmoOverlayPass(uint32_t contentW, uint32_t cont
 {
     m_gizmoOverlay.setContentSize(contentW, contentH);
     if (m_gizmoOverlay.toolMode() == ViewportToolMode::Navigate && !m_hasGizmoEmittersOrLights &&
-        !m_gizmoOverlay.hasVisibleRiggingOverlay()) {
+        !m_gizmoOverlay.hasVisibleRiggingOverlay() && m_contourPreviewLoops.empty()) {
         return;
     }
 
@@ -4177,6 +4199,36 @@ void GpuPreviewViewport::renderGizmoOverlayPass(uint32_t contentW, uint32_t cont
     m_gizmoOverlay.buildHeatmapTriangleVertices(m_heatmapVertices);
     m_gizmoOverlay.buildRenderVertices(size(), viewProj, camEye, fovYDeg, orthoZoom,
                                        m_hasCustomSceneViewProj, m_gizmoVertices);
+    if (!m_contourPreviewLoops.empty()) {
+        const float ch = static_cast<float>(std::max<uint32_t>(
+            1u, contentH > 0u ? contentH : static_cast<uint32_t>(std::max(1, height()))));
+        for (const auto &loop : m_contourPreviewLoops) {
+            if (loop.points.size() < 2u) {
+                continue;
+            }
+            const float r = loop.isHole ? 0.976f : 0.220f;
+            const float g = loop.isHole ? 0.886f : 0.741f;
+            const float b = loop.isHole ? 0.686f : 0.973f;
+            const float a = loop.isHole ? 0.85f : 0.92f;
+            for (size_t i = 0; i < loop.points.size(); ++i) {
+                if (m_gizmoVertices.size() + 2u > ViewportGizmoOverlay::kMaxDynamicVertices) {
+                    break;
+                }
+                const auto &p0 = loop.points[i];
+                const auto &p1 = loop.points[(i + 1u) % loop.points.size()];
+                if (!std::isfinite(p0.x) || !std::isfinite(p0.y) || !std::isfinite(p1.x) ||
+                    !std::isfinite(p1.y)) {
+                    continue;
+                }
+                m_gizmoVertices.push_back(GizmoVertex{
+                    static_cast<float>(p0.x), static_cast<float>(static_cast<double>(ch) - p0.y),
+                    0.0f, r, g, b, a});
+                m_gizmoVertices.push_back(GizmoVertex{
+                    static_cast<float>(p1.x), static_cast<float>(static_cast<double>(ch) - p1.y),
+                    0.0f, r, g, b, a});
+            }
+        }
+    }
     if (m_heatmapVertices.empty() && m_gizmoVertices.empty()) {
         return;
     }
@@ -4256,10 +4308,22 @@ void GpuPreviewViewport::setPuppetContourPins(std::vector<we_cdt_pin_t> pins, in
     update();
 }
 
+void GpuPreviewViewport::setPuppetContourPreviewLoops(std::vector<ContourPreviewLoop> loops)
+{
+    m_contourPreviewLoops = std::move(loops);
+    update();
+}
+
 void GpuPreviewViewport::setPuppetSkeleton(const BoneHierarchySnapshot &rig,
                                            int32_t selectedBoneIndex)
 {
     m_gizmoOverlay.setContentSize(contentWidth(), contentHeight());
+    const auto lockIt = m_lockedVertexBitsByObject.find(rig.objectId);
+    if (lockIt != m_lockedVertexBitsByObject.end()) {
+        m_weightBridge.m_lockedVertexBits = lockIt->second;
+    } else if (m_puppetObjectId != rig.objectId) {
+        m_weightBridge.m_lockedVertexBits.clear();
+    }
     m_puppetObjectId = rig.objectId;
     const size_t boneCount = rig.bones.size();
     std::vector<std::array<float, 16>> worldMats(boneCount);
@@ -4374,6 +4438,155 @@ void GpuPreviewViewport::setSelectedPuppetBone(int32_t boneIndex)
     update();
 }
 
+void GpuPreviewViewport::remapPuppetBoneIndices(int32_t objectId,
+                                                const std::vector<int32_t> &oldToNew)
+{
+    if (oldToNew.empty()) {
+        return;
+    }
+    if (objectId >= 0 && m_puppetObjectId >= 0 && objectId != m_puppetObjectId) {
+        return;
+    }
+
+    const size_t mapCount = std::min(oldToNew.size(), static_cast<size_t>(WE_MDL_MAX_BONES));
+    int32_t maxNew = -1;
+    for (size_t i = 0; i < mapCount; ++i) {
+        const int32_t mapped = oldToNew[i];
+        if (mapped >= 0 && mapped < static_cast<int32_t>(WE_MDL_MAX_BONES)) {
+            maxNew = std::max(maxNew, mapped);
+        }
+    }
+    const size_t newBoneCount = (maxNew >= 0) ? static_cast<size_t>(maxNew + 1) : 0u;
+    const bool anySurviving = newBoneCount > 0u;
+
+    const auto &oldBones = m_gizmoOverlay.puppetBones();
+    const int32_t oldSelected = m_gizmoOverlay.selectedBoneIndex();
+    int32_t nextSelected = -1;
+    if (oldSelected >= 0 && static_cast<size_t>(oldSelected) < mapCount) {
+        const int32_t mapped = oldToNew[static_cast<size_t>(oldSelected)];
+        if (mapped >= 0 && static_cast<size_t>(mapped) < newBoneCount) {
+            nextSelected = mapped;
+        }
+    }
+
+    std::vector<GizmoBoneNode> nextBones(newBoneCount);
+    for (size_t i = 0; i < newBoneCount; ++i) {
+        nextBones[i].index = static_cast<uint32_t>(i);
+    }
+    for (size_t oldIdx = 0; oldIdx < mapCount && oldIdx < oldBones.size(); ++oldIdx) {
+        const int32_t newIdx = oldToNew[oldIdx];
+        if (newIdx < 0 || static_cast<size_t>(newIdx) >= newBoneCount) {
+            continue;
+        }
+        const size_t n = static_cast<size_t>(newIdx);
+        nextBones[n] = oldBones[oldIdx];
+        nextBones[n].index = static_cast<uint32_t>(n);
+        nextBones[n].selected = (newIdx == nextSelected);
+
+        const uint32_t oldParent = oldBones[oldIdx].parentIndex;
+        if (oldParent != 0xFFFFFFFFu && oldParent < mapCount) {
+            const int32_t mappedParent = oldToNew[oldParent];
+            nextBones[n].parentIndex =
+                (mappedParent >= 0 && static_cast<size_t>(mappedParent) < newBoneCount &&
+                 mappedParent != newIdx)
+                    ? static_cast<uint32_t>(mappedParent)
+                    : 0xFFFFFFFFu;
+        } else {
+            nextBones[n].parentIndex = 0xFFFFFFFFu;
+        }
+    }
+    m_gizmoOverlay.setPuppetBones(std::move(nextBones), nextSelected);
+
+    std::vector<GizmoIkHandleData> nextIkHandles;
+    for (const auto &ik : m_gizmoOverlay.ikHandles()) {
+        auto remapU16 = [&](uint16_t oldB, uint16_t &outB) -> bool {
+            if (oldB < mapCount) {
+                const int32_t mapped = oldToNew[oldB];
+                if (mapped >= 0 && static_cast<size_t>(mapped) < newBoneCount) {
+                    outB = static_cast<uint16_t>(mapped);
+                    return true;
+                }
+            }
+            return false;
+        };
+        GizmoIkHandleData updated = ik;
+        if (remapU16(ik.chain.root_bone, updated.chain.root_bone) &&
+            remapU16(ik.chain.mid_bone, updated.chain.mid_bone) &&
+            remapU16(ik.chain.end_bone, updated.chain.end_bone)) {
+            nextIkHandles.push_back(updated);
+        }
+    }
+    m_gizmoOverlay.setIkHandles(std::move(nextIkHandles));
+
+    auto &verts = m_gizmoOverlay.mutableMeshWireframe().vertices;
+    for (auto &v : verts) {
+        float sum = 0.0f;
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t oldB = v.blend_indices[k];
+            const float w = std::isfinite(v.weight[k]) ? v.weight[k] : 0.0f;
+            if (oldB < mapCount && oldToNew[oldB] >= 0 &&
+                static_cast<size_t>(oldToNew[oldB]) < newBoneCount && w > 0.0f) {
+                v.blend_indices[k] = static_cast<uint32_t>(oldToNew[oldB]);
+                sum += w;
+            } else {
+                v.blend_indices[k] = 0u;
+                v.weight[k] = 0.0f;
+            }
+        }
+        if (sum > 1e-6f) {
+            for (int k = 0; k < 4; ++k) {
+                v.weight[k] /= sum;
+            }
+        } else {
+            v.blend_indices[0] = 0u;
+            v.blend_indices[1] = 0u;
+            v.blend_indices[2] = 0u;
+            v.blend_indices[3] = 0u;
+            v.weight[0] = anySurviving ? 1.0f : 0.0f;
+            v.weight[1] = 0.0f;
+            v.weight[2] = 0.0f;
+            v.weight[3] = 0.0f;
+        }
+    }
+
+    auto brushState = m_gizmoOverlay.weightBrushState();
+    if (brushState.activeBoneIndex < mapCount && oldToNew[brushState.activeBoneIndex] >= 0 &&
+        static_cast<size_t>(oldToNew[brushState.activeBoneIndex]) < newBoneCount) {
+        brushState.activeBoneIndex = static_cast<uint32_t>(oldToNew[brushState.activeBoneIndex]);
+    } else {
+        brushState.activeBoneIndex = 0u;
+    }
+    m_gizmoOverlay.setWeightBrushState(brushState);
+
+    std::array<uint64_t, 2> nextLockedMask{0ull, 0ull};
+    const size_t maskLimit = std::min<size_t>(mapCount, 128u);
+    for (size_t oldIdx = 0; oldIdx < maskLimit; ++oldIdx) {
+        const int32_t newIdx = oldToNew[oldIdx];
+        if (newIdx >= 0 && newIdx < 128 &&
+            WeightPaintBrushBridge::isBoneLockedInMask(m_weightBridge.m_lockedBoneMask,
+                                                       static_cast<uint32_t>(oldIdx))) {
+            const size_t n = static_cast<size_t>(newIdx);
+            nextLockedMask[n >> 6u] |= (1ull << (n & 63u));
+        }
+    }
+    m_weightBridge.m_lockedBoneMask = nextLockedMask;
+    // Discard pre-remap undo snapshots/dabs because their bone indices are stale.
+    m_weightBridge.beginStroke();
+
+    if (m_rigDragKind == RigDragKind::BoneCreate ||
+        m_rigDragKind == RigDragKind::BoneJointMoveOrReparent ||
+        m_rigDragKind == RigDragKind::BonePivotRotate ||
+        m_rigDragKind == RigDragKind::IkTargetMove || m_rigDragKind == RigDragKind::IkPoleMove) {
+        m_gizmoOverlay.setBoneCreatePreview(false, QVector3D(), QVector3D());
+        m_rigDragKind = RigDragKind::None;
+        m_rigDragIndex = -1;
+        m_rigDragIkL1 = 0.0f;
+        m_rigDragIkL2 = 0.0f;
+    }
+
+    update();
+}
+
 void GpuPreviewViewport::setPuppetIkHandles(std::vector<GizmoIkHandleData> chains)
 {
     m_gizmoOverlay.setContentSize(contentWidth(), contentHeight());
@@ -4403,9 +4616,21 @@ void GpuPreviewViewport::setWeightHeatmapMode(bool enabled, uint32_t activeBoneI
     update();
 }
 
+void GpuPreviewViewport::setWeightBrushActiveBone(uint32_t activeBoneIdx)
+{
+    auto state = m_gizmoOverlay.weightBrushState();
+    if (state.activeBoneIndex == activeBoneIdx) {
+        return;
+    }
+    state.activeBoneIndex = activeBoneIdx;
+    m_gizmoOverlay.setWeightBrushState(state);
+    update();
+}
+
 void GpuPreviewViewport::setWeightBrushParameters(we_weight_brush_op_t op, float radiusPx,
                                                   float strength, float targetWeight,
-                                                  const std::array<uint64_t, 2> &lockedBones)
+                                                  const std::array<uint64_t, 2> &lockedBones,
+                                                  float falloff)
 {
     m_gizmoOverlay.setContentSize(contentWidth(), contentHeight());
     m_weightBridge.m_op = op;
@@ -4413,6 +4638,7 @@ void GpuPreviewViewport::setWeightBrushParameters(we_weight_brush_op_t op, float
     m_weightBridge.m_strength = std::clamp(strength, 0.0f, 1.0f);
     m_weightBridge.m_targetValue = std::clamp(targetWeight, 0.0f, 1.0f);
     m_weightBridge.m_lockedBoneMask = lockedBones;
+    m_weightBridge.m_falloff = std::clamp(std::isfinite(falloff) ? falloff : 1.5f, 0.25f, 4.0f);
 
     auto state = m_gizmoOverlay.weightBrushState();
     state.op = m_weightBridge.m_op;
@@ -4422,6 +4648,17 @@ void GpuPreviewViewport::setWeightBrushParameters(we_weight_brush_op_t op, float
     update();
 }
 
+void GpuPreviewViewport::setWeightLockedVertices(int32_t objectId,
+                                                 std::vector<uint64_t> lockedVertexBitset)
+{
+    if (objectId >= 0) {
+        m_lockedVertexBitsByObject[objectId] = lockedVertexBitset;
+    }
+    if (objectId < 0 || m_puppetObjectId < 0 || objectId == m_puppetObjectId) {
+        m_weightBridge.m_lockedVertexBits = std::move(lockedVertexBitset);
+    }
+}
+
 void GpuPreviewViewport::beginWeightPaintStroke()
 {
     m_weightBridge.beginStroke();
@@ -4429,7 +4666,11 @@ void GpuPreviewViewport::beginWeightPaintStroke()
 
 void GpuPreviewViewport::applyWeightBrushDab(const WeightBrushDab &dab)
 {
-    m_weightBridge.applyDab(m_gizmoOverlay, contentWidth(), contentHeight(), dab);
+    WeightBrushDab effectiveDab = dab;
+    if (effectiveDab.falloff <= 0.0f || !std::isfinite(effectiveDab.falloff)) {
+        effectiveDab.falloff = m_weightBridge.m_falloff;
+    }
+    m_weightBridge.applyDab(m_gizmoOverlay, contentWidth(), contentHeight(), effectiveDab);
 }
 
 void GpuPreviewViewport::recordWeightBrushDab(const QPointF &texel, float pressure, double tsSec)
@@ -4444,6 +4685,7 @@ void GpuPreviewViewport::recordWeightBrushDab(const QPointF &texel, float pressu
     dab.activeBoneIndex = m_gizmoOverlay.weightBrushState().activeBoneIndex;
     dab.op = m_weightBridge.m_op;
     dab.timestampSec = tsSec;
+    dab.falloff = m_weightBridge.m_falloff;
 
     applyWeightBrushDab(dab);
     m_weightBridge.m_pendingDabs.push_back(dab);

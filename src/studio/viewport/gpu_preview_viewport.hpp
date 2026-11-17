@@ -56,6 +56,7 @@
 #endif
 
 #include "studio/core/rigging_commands.hpp"
+#include "studio/rigging/puppet_mesh_panel.hpp"
 #include "studio/viewport/viewport_gizmo_overlay.hpp"
 #include "waywal/ipc_proto.h"
 #include "waywal/ipc_proto_rigging.h"
@@ -75,6 +76,7 @@ struct WeightBrushDab {
     uint32_t activeBoneIndex{0};
     we_weight_brush_op_t op{WE_WEIGHT_OP_ADD};
     double timestampSec{0.0};
+    float falloff{-1.0f};
 };
 
 enum class PreviewMode { OfflineEmpty, DmaBufLive, InProcessImage, InProcessShader };
@@ -268,12 +270,15 @@ class WeightPaintBrushBridge {
     [[nodiscard]] bool isBoneLocked(uint32_t boneIdx) const noexcept;
     [[nodiscard]] static bool isBoneLockedInMask(const std::array<uint64_t, 2> &mask,
                                                  uint32_t boneIdx) noexcept;
+    [[nodiscard]] bool isVertexLocked(size_t vertIdx) const noexcept;
 
     we_weight_brush_op_t m_op{WE_WEIGHT_OP_ADD};
     float m_radiusPx{32.0f};
     float m_strength{0.5f};
     float m_targetValue{1.0f};
+    float m_falloff{1.5f};
     std::array<uint64_t, 2> m_lockedBoneMask{0ull, 0ull};
+    std::vector<uint64_t> m_lockedVertexBits{};
     std::vector<WeightBrushDab> m_pendingDabs{};
     std::unordered_map<uint32_t, VertexWeightBlockSnapshot> m_preBlocks{};
     std::vector<uint32_t> m_dirtyVertices{};
@@ -395,16 +400,30 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
         return m_gizmoOverlay.meshWireframe().visible;
     }
     void setPuppetContourPins(std::vector<we_cdt_pin_t> pins, int32_t selectedPin = -1);
+    void setPuppetContourPreviewLoops(std::vector<ContourPreviewLoop> loops);
+    [[nodiscard]] const std::vector<ContourPreviewLoop> &puppetContourPreviewLoops() const noexcept
+    {
+        return m_contourPreviewLoops;
+    }
     void setPuppetSkeleton(const BoneHierarchySnapshot &rig, int32_t selectedBoneIndex = -1);
     void setSelectedPuppetBone(int32_t boneIndex);
+    void remapPuppetBoneIndices(int32_t objectId, const std::vector<int32_t> &oldToNew);
     void setPuppetIkHandles(std::vector<GizmoIkHandleData> chains);
     void setOnionSkinEnabled(bool enabled);
     void setOnionSkinFrames(std::vector<GizmoOnionGhostFrame> frames);
     void setWeightHeatmapMode(bool enabled, uint32_t activeBoneIdx, float opacity,
                               we_heatmap_palette_t palette);
+    void setWeightBrushActiveBone(uint32_t activeBoneIdx);
     void setWeightBrushParameters(we_weight_brush_op_t op, float radiusPx, float strength,
                                   float targetWeight,
-                                  const std::array<uint64_t, 2> &lockedBones = {0ull, 0ull});
+                                  const std::array<uint64_t, 2> &lockedBones = {0ull, 0ull},
+                                  float falloff = 1.5f);
+    void setWeightLockedVertices(int32_t objectId, std::vector<uint64_t> lockedVertexBitset);
+    [[nodiscard]] const std::vector<uint64_t> &weightLockedVertices() const noexcept
+    {
+        return m_weightBridge.m_lockedVertexBits;
+    }
+    [[nodiscard]] float weightBrushFalloff() const noexcept { return m_weightBridge.m_falloff; }
     void applyWeightBrushDab(const WeightBrushDab &dab);
     void applyVertexWeightBlocks(int32_t objectId,
                                  const std::vector<VertexWeightBlockSnapshot> &blocks);
@@ -417,6 +436,7 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
     void monitorSelectionChanged(const QString &monitorName);
     void zoomChanged(float newZoom);
     void panChanged(const QPointF &newOffset);
+    void previewImageChanged(const QImage &image);
     void parallaxToggled(bool enabled);
     void aspectRatioGuideChanged(AspectRatioGuide guide);
     void dmaBufImportFailed(const QString &reason);
@@ -601,6 +621,8 @@ class GpuPreviewViewport : public QOpenGLWidget, protected QOpenGLFunctions {
     };
 
     int32_t m_puppetObjectId{-1};
+    std::vector<ContourPreviewLoop> m_contourPreviewLoops{};
+    std::unordered_map<int32_t, std::vector<uint64_t>> m_lockedVertexBitsByObject{};
     RigDragKind m_rigDragKind{RigDragKind::None};
     int32_t m_rigDragIndex{-1};
     QVector3D m_rigDragStartWorld{0.0f, 0.0f, 0.0f};

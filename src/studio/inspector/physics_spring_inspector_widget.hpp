@@ -15,10 +15,12 @@
 #include <QPushButton>
 #include <QString>
 #include <QTreeWidget>
+#include <QVector>
 #include <QWidget>
 
 #include <array>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 namespace waywal::studio {
@@ -38,13 +40,25 @@ class PhysicsSpringInspectorWidget : public QWidget {
 
     void setTargetOutput(const QString &output) { m_targetOutput = output; }
     [[nodiscard]] QString targetOutput() const noexcept { return m_targetOutput; }
+    [[nodiscard]] int32_t objectId() const noexcept { return m_objectId; }
+    [[nodiscard]] uint32_t boneCount() const noexcept
+    {
+        return static_cast<uint32_t>(m_boneNames.size());
+    }
+    [[nodiscard]] bool hasObjectState(int32_t sceneObjectId) const noexcept;
 
     void loadPuppetSkeleton(const we_puppet_t *puppet, int32_t sceneObjectId = -1);
     void setBoneList(const std::vector<QString> &names, const std::vector<int32_t> &parents,
                      int32_t sceneObjectId = -1);
+    void remapBoneIndices(const QVector<int> &oldToNew);
     void setBoneDriveMode(int32_t boneIndex, we_bone_drive_mode_t mode);
     void setBoneDriveModes(const std::array<we_bone_drive_mode_t, WE_MDL_MAX_BONES> &modes);
     [[nodiscard]] we_bone_drive_mode_t boneDriveMode(int32_t boneIndex) const noexcept;
+    [[nodiscard]] const std::array<bool, WE_MDL_MAX_BONES> &lastPushedXpbd() const noexcept
+    {
+        return m_lastPushedXpbd;
+    }
+    [[nodiscard]] bool lastPushedXpbd(int32_t boneIndex) const noexcept;
     void applyMaterialPreset(we_physics_preset_t preset);
     void selectBoneIndex(int32_t boneIndex);
     [[nodiscard]] int32_t selectedBoneIndex() const noexcept { return m_selectedBoneIndex; }
@@ -56,6 +70,7 @@ class PhysicsSpringInspectorWidget : public QWidget {
     void populateBoneList(const we_puppet_t *puppet = nullptr);
 
   public slots:
+    void remapBoneIndices(int32_t objectId, const std::vector<int32_t> &oldToNew);
     void updateSolverTelemetry(uint32_t activeBones, float stepTimeUs);
     void onPropagateToChildren() { onApplyPresetToDescendantsClicked(); }
 
@@ -76,8 +91,20 @@ class PhysicsSpringInspectorWidget : public QWidget {
     void onApplyPresetToDescendantsClicked();
 
   private:
+    struct PhysicsObjectState {
+        we_puppet_physics_ctx_t ctx{};
+        std::array<we_bone_drive_mode_t, WE_MDL_MAX_BONES> driveModes{};
+        std::array<bool, WE_MDL_MAX_BONES> lastPushedXpbd{};
+        std::vector<QString> boneNames;
+        std::vector<int32_t> boneParents;
+        int32_t selectedBoneIndex{0};
+    };
+
     void setupUi();
     void initDefaultContext();
+    void saveActiveObjectState();
+    bool restoreObjectState(int32_t sceneObjectId);
+    static void remapObjectState(PhysicsObjectState &state, const std::vector<int32_t> &oldToNew);
     void syncUiFromSelectedBone();
     void refreshBoneTreeStates();
     QString boneDriveBadgeText(int32_t boneIndex, QColor &color) const;
@@ -92,9 +119,11 @@ class PhysicsSpringInspectorWidget : public QWidget {
     int32_t m_selectedBoneIndex{0};
     we_puppet_physics_ctx_t m_ctx{};
     std::array<we_bone_drive_mode_t, WE_MDL_MAX_BONES> m_driveModes{};
+    std::array<bool, WE_MDL_MAX_BONES> m_lastPushedXpbd{};
     bool m_updatingUi{false};
     std::vector<QString> m_boneNames;
     std::vector<int32_t> m_boneParents;
+    std::unordered_map<int32_t, PhysicsObjectState> m_objectStates;
 
     CommandBus *m_commandBus{nullptr};
     IpcClient *m_ipcClient{nullptr};

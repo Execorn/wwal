@@ -3,6 +3,9 @@
 #include "studio/app/dock_layout_manager.hpp"
 #include "studio/app/studio_session_context.hpp"
 #include "waywal/ipc_proto_authoring.h"
+#include "waywal/we_mesh_cdt.h"
+#include "waywal/we_mesh_rig.h"
+#include "waywal/we_puppet.h"
 
 #include <QApplication>
 #include <QMenuBar>
@@ -30,6 +33,8 @@
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QImage>
+#include <QListWidget>
 #include <QMessageBox>
 #include <QPointer>
 #include <QProcess>
@@ -38,6 +43,7 @@
 #include <QSignalBlocker>
 #include <QStandardPaths>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -543,6 +549,92 @@ void hydrateBoneRiggingPanelFromSnapshot(BoneRiggingPanel *panel,
     panel->setIpcClient(ipc);
 }
 
+void remapCachedVertexBlendIndices(std::vector<we_mdl_vertex_t> &vertices,
+                                   const std::vector<int32_t> &oldToNew)
+{
+    if (vertices.empty() || oldToNew.empty()) {
+        return;
+    }
+    const bool anySurviving =
+        std::any_of(oldToNew.begin(), oldToNew.end(), [](int32_t mapped) { return mapped >= 0; });
+    for (we_mdl_vertex_t &vert : vertices) {
+        float sum = 0.0f;
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t oldB = vert.blend_indices[k];
+            const float w = std::isfinite(vert.weight[k]) ? vert.weight[k] : 0.0f;
+            if (oldB < oldToNew.size() && oldToNew[oldB] >= 0 && w > 0.0f) {
+                vert.blend_indices[k] = static_cast<uint32_t>(oldToNew[oldB]);
+                sum += w;
+            } else {
+                vert.blend_indices[k] = 0u;
+                vert.weight[k] = 0.0f;
+            }
+        }
+        if (sum > 1e-6f) {
+            for (int k = 0; k < 4; ++k) {
+                vert.weight[k] /= sum;
+            }
+        } else {
+            vert.blend_indices[0] = 0u;
+            vert.blend_indices[1] = 0u;
+            vert.blend_indices[2] = 0u;
+            vert.blend_indices[3] = 0u;
+            vert.weight[0] = anySurviving ? 1.0f : 0.0f;
+            vert.weight[1] = 0.0f;
+            vert.weight[2] = 0.0f;
+            vert.weight[3] = 0.0f;
+        }
+    }
+}
+
+void buildBoneNamesAndParents(const std::vector<we_mdl_bone_t> &bones, std::vector<QString> &names,
+                              std::vector<int32_t> &parents)
+{
+    names.clear();
+    parents.clear();
+    names.reserve(bones.size());
+    parents.reserve(bones.size());
+    for (size_t i = 0; i < bones.size(); ++i) {
+        QString bName = QString::fromUtf8(bones[i].name).trimmed();
+        if (bName.isEmpty()) {
+            bName = QStringLiteral("Bone %1").arg(i);
+        }
+        names.push_back(std::move(bName));
+        parents.push_back(bones[i].parent == 0xFFFFFFFFu ? -1
+                                                         : static_cast<int32_t>(bones[i].parent));
+    }
+}
+
+bool extractImageAlphaBuffer(const QImage &image, uint32_t &outWidth, uint32_t &outHeight,
+                             std::vector<uint8_t> &outAlpha)
+{
+    if (image.isNull()) {
+        return false;
+    }
+    const QImage rgba = image.convertToFormat(QImage::Format_RGBA8888);
+    if (rgba.isNull() || rgba.width() <= 0 || rgba.height() <= 0) {
+        return false;
+    }
+    const uint32_t w = static_cast<uint32_t>(rgba.width());
+    const uint32_t h = static_cast<uint32_t>(rgba.height());
+    const uint64_t pixelCount = static_cast<uint64_t>(w) * static_cast<uint64_t>(h);
+    if (w > WE_CDT_MAX_IMAGE_DIM || h > WE_CDT_MAX_IMAGE_DIM ||
+        pixelCount > WE_CDT_MAX_IMAGE_PIXELS) {
+        return false;
+    }
+    outAlpha.resize(static_cast<size_t>(pixelCount));
+    for (uint32_t y = 0; y < h; ++y) {
+        const uint8_t *row = rgba.constScanLine(static_cast<int>(y));
+        const size_t dstRowBase = static_cast<size_t>(y) * w;
+        for (uint32_t x = 0; x < w; ++x) {
+            outAlpha[dstRowBase + x] = row[static_cast<size_t>(x) * 4u + 3u];
+        }
+    }
+    outWidth = w;
+    outHeight = h;
+    return true;
+}
+
 QString formatAspectRatioGuideLabel(AspectRatioGuide guide)
 {
     switch (guide) {
@@ -1004,12 +1096,33 @@ void MainWindow::setupPanels()
                             }
                             if (m_physicsSpringInspector && m_hasCachedPuppetRig &&
                                 m_cachedPuppetRig.objectId == objectId) {
-                                we_puppet_t physPuppet{};
-                                std::vector<we_mdl_bone_t> bones = m_cachedPuppetRig.bones;
-                                physPuppet.bone_count = static_cast<uint32_t>(bones.size());
-                                physPuppet.bones = bones.empty() ? nullptr : bones.data();
+                                std::vector<QString> names;
+                                std::vector<int32_t> parents;
+                                buildBoneNamesAndParents(m_cachedPuppetRig.bones, names, parents);
                                 m_physicsSpringInspector->setTargetOutput(activeOut);
-                                m_physicsSpringInspector->loadPuppetSkeleton(&physPuppet, objectId);
+                                const bool needsInit =
+                                    !m_physicsSpringInspector->hasObjectState(objectId) ||
+                                    (m_physicsSpringInspector->objectId() == objectId &&
+                                     m_physicsSpringInspector->boneCount() == 0u && !names.empty());
+                                if (needsInit) {
+                                    we_puppet_t physPuppet{};
+                                    std::vector<we_mdl_bone_t> bones = m_cachedPuppetRig.bones;
+                                    physPuppet.bone_count = static_cast<uint32_t>(bones.size());
+                                    physPuppet.bones = bones.empty() ? nullptr : bones.data();
+                                    m_physicsSpringInspector->loadPuppetSkeleton(&physPuppet,
+                                                                                 objectId);
+                                }
+                                m_physicsSpringInspector->setBoneList(names, parents, objectId);
+                            }
+                            if (auto *ipc = ipcClient();
+                                ipc && ipc->isConnected() && objectId >= 0 &&
+                                m_cachedObjectAlphas.find(objectId) == m_cachedObjectAlphas.end() &&
+                                !(m_cachedPuppetMesh.objectId == objectId &&
+                                  m_cachedPuppetMesh.vertices.size() >= 3u) &&
+                                m_pendingAlphaReadbackObjectIds.size() < 4u) {
+                                if (ipc->sendReadbackTexture(activeOut, objectId, 0u, 0u, 0u)) {
+                                    m_pendingAlphaReadbackObjectIds.push_back(objectId);
+                                }
                             }
                         } else if (kind == WE_NODE_PARTICLE) {
                             if (m_particleDesigner) {
@@ -1261,6 +1374,14 @@ void MainWindow::setupPanels()
                             m_previewViewport->setPuppetContourPins(pins, -1);
                         }
                     });
+            connect(panel, &PuppetMeshPanel::contoursExtracted, this,
+                    [this](int32_t objectId, const std::vector<ContourPreviewLoop> &loops) {
+                        if (m_previewViewport &&
+                            (objectId < 0 || m_previewViewport->puppetObjectId() < 0 ||
+                             m_previewViewport->puppetObjectId() == objectId)) {
+                            m_previewViewport->setPuppetContourPreviewLoops(loops);
+                        }
+                    });
             connect(
                 panel, &PuppetMeshPanel::exportMdlRequested, this,
                 [this](int32_t objectId, const QString &destPath) {
@@ -1286,11 +1407,17 @@ void MainWindow::setupPanels()
                     m_statusLabel->setText(msg);
                 }
             });
+            m_puppetMeshPanel = panel;
             if (m_activePuppetObjectId >= 0) {
                 panel->setTargetObjectId(m_activePuppetObjectId, m_activePuppetTexWidth,
                                          m_activePuppetTexHeight);
             }
-            m_puppetMeshPanel = panel;
+            if (auto it = m_cachedObjectAlphas.find(m_activePuppetObjectId);
+                it != m_cachedObjectAlphas.end()) {
+                it->second.pushed = false;
+            }
+            m_cachedPreviewAlpha.pushed = false;
+            hydratePuppetMeshPanel(panel);
             return panel;
         },
         Qt::LeftDockWidgetArea);
@@ -1304,6 +1431,10 @@ void MainWindow::setupPanels()
             connect(panel, &BoneRiggingPanel::boneSelected, this, [this](int32_t boneIndex) {
                 if (m_previewViewport) {
                     m_previewViewport->setSelectedPuppetBone(boneIndex);
+                    if (boneIndex >= 0) {
+                        m_previewViewport->setWeightBrushActiveBone(
+                            static_cast<uint32_t>(boneIndex));
+                    }
                 }
                 if (m_weightPaintPanel) {
                     m_weightPaintPanel->setActiveBone(boneIndex);
@@ -1312,6 +1443,42 @@ void MainWindow::setupPanels()
                     m_physicsSpringInspector->selectBoneIndex(boneIndex);
                 }
             });
+            connect(panel, &BoneRiggingPanel::bonesRemapped, this,
+                    [this](int32_t objectId, const std::vector<int32_t> &oldToNew) {
+                        if (oldToNew.empty()) {
+                            return;
+                        }
+                        if (m_cachedPuppetMesh.objectId == objectId) {
+                            remapCachedVertexBlendIndices(m_cachedPuppetMesh.vertices, oldToNew);
+                        }
+                        if (const auto modeIt = m_pendingDriveModes.find(objectId);
+                            modeIt != m_pendingDriveModes.end()) {
+                            std::unordered_map<int32_t, we_bone_drive_mode_t> remapped;
+                            for (const auto &[oldBoneIdx, mode] : modeIt->second) {
+                                if (oldBoneIdx >= 0 &&
+                                    static_cast<size_t>(oldBoneIdx) < oldToNew.size() &&
+                                    oldToNew[static_cast<size_t>(oldBoneIdx)] >= 0) {
+                                    remapped[oldToNew[static_cast<size_t>(oldBoneIdx)]] = mode;
+                                }
+                            }
+                            modeIt->second = std::move(remapped);
+                        }
+                        if (m_puppetMeshPanel) {
+                            m_puppetMeshPanel->remapVertexBlendIndices(objectId, oldToNew);
+                        }
+                        if (m_weightPaintPanel) {
+                            m_weightPaintPanel->remapBoneIndices(objectId, oldToNew);
+                        }
+                        if (m_dopeSheetTimeline) {
+                            m_dopeSheetTimeline->remapBoneIndices(objectId, oldToNew);
+                        }
+                        if (m_physicsSpringInspector) {
+                            m_physicsSpringInspector->remapBoneIndices(objectId, oldToNew);
+                        }
+                        if (m_previewViewport) {
+                            m_previewViewport->remapPuppetBoneIndices(objectId, oldToNew);
+                        }
+                    });
             connect(
                 panel, &BoneRiggingPanel::skeletonUpdated, this,
                 [this, panel](int32_t objectId, const BoneHierarchySnapshot &snapshot) {
@@ -1327,26 +1494,21 @@ void MainWindow::setupPanels()
                     }
                     if (m_physicsSpringInspector && !m_syncingBoneDriveMode) {
                         const QScopedValueRollback<bool> guard(m_syncingBoneDriveMode, true);
-                        we_puppet_t physPuppet{};
-                        std::vector<we_mdl_bone_t> physBones = snapshot.bones;
-                        physPuppet.bone_count = static_cast<uint32_t>(physBones.size());
-                        physPuppet.bones = physBones.empty() ? nullptr : physBones.data();
-                        m_physicsSpringInspector->setTargetOutput(resolveSelectedOutputsCsv());
-                        m_physicsSpringInspector->loadPuppetSkeleton(&physPuppet, objectId);
-
                         std::vector<QString> names;
                         std::vector<int32_t> parents;
-                        names.reserve(snapshot.bones.size());
-                        parents.reserve(snapshot.bones.size());
-                        for (size_t i = 0; i < snapshot.bones.size(); ++i) {
-                            QString bName = QString::fromUtf8(snapshot.bones[i].name).trimmed();
-                            if (bName.isEmpty()) {
-                                bName = QStringLiteral("Bone %1").arg(i);
-                            }
-                            names.push_back(bName);
-                            parents.push_back(snapshot.bones[i].parent == 0xFFFFFFFFu
-                                                  ? -1
-                                                  : static_cast<int32_t>(snapshot.bones[i].parent));
+                        buildBoneNamesAndParents(snapshot.bones, names, parents);
+                        m_physicsSpringInspector->setTargetOutput(resolveSelectedOutputsCsv());
+                        // Preserve existing or remapped spring configs when only topology updates.
+                        const bool needsInit =
+                            !m_physicsSpringInspector->hasObjectState(objectId) ||
+                            (m_physicsSpringInspector->objectId() == objectId &&
+                             m_physicsSpringInspector->boneCount() == 0u && !names.empty());
+                        if (needsInit) {
+                            we_puppet_t physPuppet{};
+                            std::vector<we_mdl_bone_t> physBones = snapshot.bones;
+                            physPuppet.bone_count = static_cast<uint32_t>(physBones.size());
+                            physPuppet.bones = physBones.empty() ? nullptr : physBones.data();
+                            m_physicsSpringInspector->loadPuppetSkeleton(&physPuppet, objectId);
                         }
                         m_physicsSpringInspector->setBoneList(names, parents, objectId);
                         m_physicsSpringInspector->setBoneDriveModes(snapshot.driveModes);
@@ -1422,19 +1584,39 @@ void MainWindow::setupPanels()
                         }
                     });
             connect(panel, &WeightPaintPanel::normalizeAllWeightsRequested, this,
-                    [this](int32_t objectId, uint64_t lockMaskLo, uint64_t lockMaskHi) {
+                    [this, panel](int32_t objectId, uint64_t lockMaskLo, uint64_t lockMaskHi) {
                         if (m_previewViewport && objectId >= 0) {
+                            static const std::vector<uint64_t> emptyLocks;
+                            m_previewViewport->setWeightLockedVertices(
+                                objectId, panel->respectLockedVertices() ? panel->lockedVertexBits()
+                                                                         : emptyLocks);
                             m_previewViewport->normalizeAllVertexWeights(
                                 objectId, std::array<uint64_t, 2>{lockMaskLo, lockMaskHi});
                         }
                     });
-            connect(panel, &WeightPaintPanel::brushParamsChanged, this, [this, panel]() {
-                if (m_previewViewport) {
-                    m_previewViewport->setWeightBrushParameters(
-                        panel->activeBrushOp(), panel->brushRadiusPx(), panel->brushStrength(),
-                        panel->targetWeightValue(), panel->lockedBoneMask());
+            connect(
+                panel, &WeightPaintPanel::vertexLocksChanged, this,
+                [this, panel](int32_t objectId, const std::vector<uint64_t> &lockedVertexBitset) {
+                    if (m_previewViewport) {
+                        static const std::vector<uint64_t> emptyLocks;
+                        m_previewViewport->setWeightLockedVertices(
+                            objectId,
+                            panel->respectLockedVertices() ? lockedVertexBitset : emptyLocks);
+                    }
+                });
+            connect(panel, &WeightPaintPanel::brushParamsChanged, this,
+                    [this, panel]() { syncWeightPaintBrushAndLocks(panel); });
+            if (auto *boneList = panel->findChild<QListWidget *>()) {
+                if (auto *selModel = boneList->selectionModel()) {
+                    connect(selModel, &QItemSelectionModel::currentRowChanged, this,
+                            [this](const QModelIndex &current, const QModelIndex &) {
+                                if (m_previewViewport && current.isValid() && current.row() >= 0) {
+                                    m_previewViewport->setWeightBrushActiveBone(
+                                        static_cast<uint32_t>(current.row()));
+                                }
+                            });
                 }
-            });
+            }
             connect(panel, &WeightPaintPanel::statusMessage, this, [this](const QString &msg) {
                 if (m_statusLabel) {
                     m_statusLabel->setText(msg);
@@ -1634,7 +1816,7 @@ void MainWindow::setupMenuBar()
         auto *dlg = new QFileDialog(
             this, QStringLiteral("Open Wallpaper"), QString(),
             QStringLiteral("Wallpaper Media (*.png *.jpg *.jpeg *.webp *.jxl *.avif *.svg *.mp4 "
-                           "*.webm *.gif *.glsl *.frag);;All Files (*)"));
+                           "*.webm *.gif *.glsl *.frag *.mdl);;All Files (*)"));
         dlg->setFileMode(QFileDialog::ExistingFile);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
         QPointer<MainWindow> self(this);
@@ -1644,6 +1826,11 @@ void MainWindow::setupMenuBar()
             }
             self->m_activeWallpaperPath = file;
             const QString ext = QFileInfo(file).suffix().toLower();
+            if (ext == QStringLiteral("mdl")) {
+                self->loadPuppetFromMdlFile(file,
+                                            std::max<int32_t>(0, self->m_activePuppetObjectId));
+                return;
+            }
             const bool isShader = (ext == QStringLiteral("glsl") || ext == QStringLiteral("frag") ||
                                    ext == QStringLiteral("comp"));
             QString boundedSource;
@@ -3423,9 +3610,57 @@ void MainWindow::wireInterPanelSignals()
                     ipc->sendPuppetPaintWeights(static_cast<uint32_t>(objectId), 1u, dirtyEntries);
                 }
             });
+
+        connect(m_previewViewport, &GpuPreviewViewport::previewImageChanged, this,
+                [this](const QImage &image) { syncSourceAlphaFromPreviewImage(image); });
     }
 
     if (auto *ipc = ipcClient()) {
+        connect(ipc, &IpcClient::textureReadbackReceived, this,
+                [this](const waywal_ipc_resp_readback_texture_t &resp, const QByteArray &data) {
+                    if (m_pendingAlphaReadbackObjectIds.empty()) {
+                        return;
+                    }
+                    const int32_t targetObjectId = m_pendingAlphaReadbackObjectIds.front();
+                    m_pendingAlphaReadbackObjectIds.pop_front();
+                    if (resp.status_code != 0u || resp.width == 0u || resp.height == 0u ||
+                        resp.width > WE_CDT_MAX_IMAGE_DIM || resp.height > WE_CDT_MAX_IMAGE_DIM ||
+                        data.isEmpty()) {
+                        return;
+                    }
+                    const uint64_t pixelCount =
+                        static_cast<uint64_t>(resp.width) * static_cast<uint64_t>(resp.height);
+                    if (pixelCount == 0u || pixelCount > WE_CDT_MAX_IMAGE_PIXELS ||
+                        static_cast<uint64_t>(data.size()) < pixelCount) {
+                        return;
+                    }
+                    const uint32_t bpp =
+                        static_cast<uint32_t>(static_cast<uint64_t>(data.size()) / pixelCount);
+                    if (bpp != 1u && bpp != 2u && bpp != 4u) {
+                        return;
+                    }
+                    std::vector<uint8_t> alpha(static_cast<size_t>(pixelCount));
+                    const auto *src = reinterpret_cast<const uint8_t *>(data.constData());
+                    for (uint64_t p = 0; p < pixelCount; ++p) {
+                        if (bpp == 4u) {
+                            alpha[p] = src[p * 4u + 3u];
+                        } else if (bpp == 2u) {
+                            alpha[p] = src[p * 2u + 1u];
+                        } else {
+                            alpha[p] = src[p];
+                        }
+                    }
+                    CachedAlphaBuffer &entry = m_cachedObjectAlphas[targetObjectId];
+                    entry.width = resp.width;
+                    entry.height = resp.height;
+                    entry.alpha = std::move(alpha);
+                    entry.pushed = false;
+                    if (m_puppetMeshPanel && m_activePuppetObjectId == targetObjectId &&
+                        m_puppetMeshPanel->lastResult().vertex_count == 0u) {
+                        m_puppetMeshPanel->setSourceAlpha(entry.alpha, entry.width, entry.height);
+                        entry.pushed = true;
+                    }
+                });
         connect(ipc, &IpcClient::puppetMeshAckReceived, this,
                 [this](const waywal_ipc_puppet_mesh_ack_t &resp) {
                     if (m_statusLabel) {
@@ -4023,11 +4258,15 @@ void MainWindow::setActivePuppetObjectContext(int32_t objectId, uint32_t texWidt
         m_activePuppetTexHeight = texHeight;
     }
     if (m_previewViewport) {
+        if (objectChanged) {
+            m_previewViewport->setPuppetContourPreviewLoops({});
+        }
         m_previewViewport->setPuppetObjectId(objectId);
     }
     if (m_puppetMeshPanel) {
         m_puppetMeshPanel->setTargetObjectId(objectId, m_activePuppetTexWidth,
                                              m_activePuppetTexHeight);
+        hydratePuppetMeshPanel(m_puppetMeshPanel);
     }
     if (objectChanged) {
         m_timelineHydratedObjectId = -1;
@@ -4035,6 +4274,240 @@ void MainWindow::setActivePuppetObjectContext(int32_t objectId, uint32_t texWidt
             hydrateWeightPaintPanel(m_weightPaintPanel);
         }
         if (m_dopeSheetTimeline) {
+            hydrateDopeSheetTimeline(m_dopeSheetTimeline);
+        }
+    }
+}
+
+void MainWindow::syncSourceAlphaFromPreviewImage(const QImage &image)
+{
+    if (image.isNull()) {
+        m_cachedPreviewAlpha = CachedAlphaBuffer{};
+        return;
+    }
+
+    CachedAlphaBuffer extracted;
+    if (!extractImageAlphaBuffer(image, extracted.width, extracted.height, extracted.alpha)) {
+        return;
+    }
+    extracted.pushed = false;
+    m_cachedPreviewAlpha = extracted;
+
+    if (m_activePuppetObjectId >= 0) {
+        CachedAlphaBuffer &objAlpha = m_cachedObjectAlphas[m_activePuppetObjectId];
+        objAlpha = extracted;
+        objAlpha.pushed = false;
+    }
+
+    if (m_puppetMeshPanel && m_puppetMeshPanel->lastResult().vertex_count == 0u) {
+        m_puppetMeshPanel->setSourceAlpha(m_cachedPreviewAlpha.alpha, m_cachedPreviewAlpha.width,
+                                          m_cachedPreviewAlpha.height);
+        m_cachedPreviewAlpha.pushed = true;
+        if (auto it = m_cachedObjectAlphas.find(m_activePuppetObjectId);
+            it != m_cachedObjectAlphas.end()) {
+            it->second.pushed = true;
+        }
+    }
+}
+
+void MainWindow::hydratePuppetMeshPanel(PuppetMeshPanel *panel)
+{
+    if (!panel || panel->lastResult().vertex_count > 0u) {
+        return;
+    }
+
+    std::vector<we_mdl_vertex_t> verts;
+    std::vector<uint16_t> indices;
+    if (m_cachedPuppetMesh.objectId == m_activePuppetObjectId &&
+        m_cachedPuppetMesh.vertices.size() >= 3u && m_cachedPuppetMesh.indices.size() >= 3u) {
+        verts = m_cachedPuppetMesh.vertices;
+        indices = m_cachedPuppetMesh.indices;
+    } else if (m_previewViewport && m_previewViewport->puppetObjectId() == m_activePuppetObjectId &&
+               m_previewViewport->gizmoOverlay().meshWireframe().vertices.size() >= 3u &&
+               m_previewViewport->gizmoOverlay().meshWireframe().indices.size() >= 3u) {
+        verts = m_previewViewport->gizmoOverlay().meshWireframe().vertices;
+        indices = m_previewViewport->gizmoOverlay().meshWireframe().indices;
+    }
+
+    if (!verts.empty() && !indices.empty()) {
+        we_puppet_t existing{};
+        existing.vertex_count = static_cast<uint32_t>(verts.size());
+        existing.vertices = verts.data();
+        existing.index_count = static_cast<uint32_t>(indices.size());
+        existing.triangle_count = static_cast<uint32_t>(indices.size() / 3u);
+        existing.indices = indices.data();
+        if (m_hasCachedPuppetRig && m_cachedPuppetRig.objectId == m_activePuppetObjectId &&
+            !m_cachedPuppetRig.bones.empty()) {
+            existing.bone_count = static_cast<uint32_t>(m_cachedPuppetRig.bones.size());
+            existing.bones = m_cachedPuppetRig.bones.data();
+        }
+        panel->loadExistingMesh(&existing);
+        return;
+    }
+
+    if (auto it = m_cachedObjectAlphas.find(m_activePuppetObjectId);
+        it != m_cachedObjectAlphas.end() && !it->second.alpha.empty()) {
+        if (!it->second.pushed) {
+            panel->setSourceAlpha(it->second.alpha, it->second.width, it->second.height);
+            it->second.pushed = true;
+        }
+        return;
+    }
+
+    if (!m_cachedPreviewAlpha.alpha.empty()) {
+        if (!m_cachedPreviewAlpha.pushed) {
+            panel->setSourceAlpha(m_cachedPreviewAlpha.alpha, m_cachedPreviewAlpha.width,
+                                  m_cachedPreviewAlpha.height);
+            m_cachedPreviewAlpha.pushed = true;
+        }
+        return;
+    }
+
+    if (m_previewViewport && !m_previewViewport->previewImage().isNull() &&
+        extractImageAlphaBuffer(m_previewViewport->previewImage(), m_cachedPreviewAlpha.width,
+                                m_cachedPreviewAlpha.height, m_cachedPreviewAlpha.alpha)) {
+        panel->setSourceAlpha(m_cachedPreviewAlpha.alpha, m_cachedPreviewAlpha.width,
+                              m_cachedPreviewAlpha.height);
+        m_cachedPreviewAlpha.pushed = true;
+    }
+}
+
+void MainWindow::syncWeightPaintBrushAndLocks(WeightPaintPanel *panel) const
+{
+    if (!panel || !m_previewViewport) {
+        return;
+    }
+    if (const auto *boneList = panel->findChild<QListWidget *>()) {
+        const int row = boneList->currentRow();
+        if (row >= 0) {
+            m_previewViewport->setWeightBrushActiveBone(static_cast<uint32_t>(row));
+        }
+    }
+    m_previewViewport->setWeightBrushParameters(panel->activeBrushOp(), panel->brushRadiusPx(),
+                                                panel->brushStrength(), panel->targetWeightValue(),
+                                                panel->lockedBoneMask(), panel->brushFalloff());
+    static const std::vector<uint64_t> emptyLocks;
+    m_previewViewport->setWeightLockedVertices(
+        m_activePuppetObjectId,
+        panel->respectLockedVertices() ? panel->lockedVertexBits() : emptyLocks);
+}
+
+bool MainWindow::loadPuppetFromMdlFile(const QString &filePath, int32_t objectId)
+{
+    if (filePath.isEmpty()) {
+        return false;
+    }
+    QFile f(filePath);
+    constexpr qint64 kMaxMdlBytes = 64LL * 1024LL * 1024LL;
+    if (!f.open(QIODevice::ReadOnly) || f.size() <= 0 || f.size() > kMaxMdlBytes) {
+        if (m_statusLabel) {
+            m_statusLabel->setText(QStringLiteral("Failed to open puppet MDL: %1").arg(filePath));
+        }
+        return false;
+    }
+    const QByteArray bytes = f.readAll();
+    we_puppet_t *puppet = we_puppet_parse_cpu(reinterpret_cast<const uint8_t *>(bytes.constData()),
+                                              static_cast<size_t>(bytes.size()));
+    if (!puppet) {
+        if (m_statusLabel) {
+            m_statusLabel->setText(QStringLiteral("Failed to parse puppet MDL: %1").arg(filePath));
+        }
+        return false;
+    }
+    loadExistingPuppetIntoPanels(objectId, puppet);
+    we_puppet_destroy(puppet);
+    if (m_statusLabel) {
+        m_statusLabel->setText(QStringLiteral("Loaded puppet MDL: %1").arg(filePath));
+    }
+    return true;
+}
+
+void MainWindow::loadExistingPuppetIntoPanels(int32_t objectId, const we_puppet_t *puppet,
+                                              uint32_t texWidth, uint32_t texHeight)
+{
+    if (!puppet || objectId < 0) {
+        return;
+    }
+
+    m_activePuppetObjectId = objectId;
+    if (texWidth > 0u) {
+        m_activePuppetTexWidth = texWidth;
+    }
+    if (texHeight > 0u) {
+        m_activePuppetTexHeight = texHeight;
+    }
+
+    m_cachedPuppetMesh = PuppetMeshSnapshot{};
+    m_cachedPuppetMesh.objectId = objectId;
+    if (puppet->vertices && puppet->vertex_count > 0u) {
+        const uint32_t vc = std::min<uint32_t>(puppet->vertex_count, WE_MDL_MAX_VERTICES);
+        m_cachedPuppetMesh.vertices.assign(puppet->vertices, puppet->vertices + vc);
+    }
+    if (puppet->indices && puppet->index_count >= 3u) {
+        const uint32_t ic = std::min<uint32_t>(puppet->index_count, WE_MDL_MAX_TRIANGLES * 3u);
+        m_cachedPuppetMesh.indices.assign(puppet->indices, puppet->indices + ic);
+    }
+
+    m_cachedPuppetRig = BoneHierarchySnapshot{};
+    m_cachedPuppetRig.objectId = objectId;
+    m_cachedPuppetRig.driveModes.fill(WE_BONE_DRIVE_FK);
+    if (puppet->rig_ctx) {
+        const auto *rigCtx = static_cast<const we_rig_pose_ctx_t *>(puppet->rig_ctx);
+        for (uint32_t b = 0u; b < WE_MDL_MAX_BONES; ++b) {
+            m_cachedPuppetRig.driveModes[b] = rigCtx->bone_drive_modes[b];
+        }
+        const uint32_t chainCount =
+            std::min<uint32_t>(rigCtx->ik_chain_count, WE_RIG_MAX_IK_CHAINS);
+        if (chainCount > 0u) {
+            m_cachedPuppetRig.ikChains.assign(rigCtx->ik_chains, rigCtx->ik_chains + chainCount);
+        }
+    }
+    if (puppet->bones && puppet->bone_count > 0u) {
+        const uint32_t bc = std::min<uint32_t>(puppet->bone_count, WE_MDL_MAX_BONES);
+        m_cachedPuppetRig.bones.assign(puppet->bones, puppet->bones + bc);
+        if (puppet->physics_ctx) {
+            for (uint32_t b = 0u; b < bc; ++b) {
+                if ((puppet->physics_ctx->configs[b].flags & WE_BONE_PHYS_ENABLED) != 0u) {
+                    m_cachedPuppetRig.driveModes[b] = WE_BONE_DRIVE_XPBD;
+                }
+            }
+        }
+    }
+    m_hasCachedPuppetRig = !m_cachedPuppetRig.bones.empty();
+
+    if (m_previewViewport) {
+        m_previewViewport->setPuppetContourPreviewLoops({});
+        m_previewViewport->setPuppetObjectId(objectId);
+        m_previewViewport->setPuppetMeshData(!m_cachedPuppetMesh.vertices.empty(),
+                                             m_cachedPuppetMesh.vertices,
+                                             m_cachedPuppetMesh.indices);
+        m_previewViewport->setPuppetSkeleton(m_cachedPuppetRig,
+                                             m_cachedPuppetRig.bones.empty() ? -1 : 0);
+    }
+    if (m_puppetMeshPanel) {
+        m_puppetMeshPanel->setTargetObjectId(objectId, m_activePuppetTexWidth,
+                                             m_activePuppetTexHeight);
+        m_puppetMeshPanel->loadExistingMesh(puppet);
+    }
+    if (m_boneRiggingPanel) {
+        hydrateBoneRiggingPanelFromSnapshot(m_boneRiggingPanel, m_cachedPuppetRig, commandBus(),
+                                            ipcClient(), m_syncingBoneDriveMode,
+                                            m_cachedPuppetRig.bones.empty() ? -1 : 0);
+    }
+    if (m_physicsSpringInspector) {
+        const QScopedValueRollback<bool> guard(m_syncingBoneDriveMode, true);
+        m_physicsSpringInspector->setTargetOutput(resolveSelectedOutputsCsv());
+        m_physicsSpringInspector->loadPuppetSkeleton(puppet, objectId);
+    }
+    if (m_weightPaintPanel) {
+        hydrateWeightPaintPanel(m_weightPaintPanel);
+    }
+    if (m_dopeSheetTimeline) {
+        if (puppet->anims && puppet->anim_count > 0u) {
+            m_dopeSheetTimeline->loadPuppetAnimations(puppet, objectId);
+            m_timelineHydratedObjectId = objectId;
+        } else {
+            m_timelineHydratedObjectId = -1;
             hydrateDopeSheetTimeline(m_dopeSheetTimeline);
         }
     }
@@ -4078,6 +4551,7 @@ void MainWindow::hydrateWeightPaintPanel(WeightPaintPanel *panel) const
     } else if (puppet.bone_count > 0u) {
         panel->setActiveBone(0);
     }
+    syncWeightPaintBrushAndLocks(panel);
 }
 
 void MainWindow::hydrateDopeSheetTimeline(DopeSheetTimelineWidget *timeline)

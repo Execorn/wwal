@@ -44,6 +44,7 @@ void PhysicsSpringInspectorWidget::initDefaultContext()
         m_ctx.configs[i].bone_index = i;
         we_physics_apply_preset(&m_ctx.configs[i], WE_PHYS_PRESET_CUSTOM);
         m_driveModes[i] = WE_BONE_DRIVE_FK;
+        m_lastPushedXpbd[i] = false;
     }
 }
 
@@ -528,9 +529,143 @@ void PhysicsSpringInspectorWidget::setupUi()
 /* Skeleton Loading & Bone Tree Population                                   */
 /* ========================================================================= */
 
+bool PhysicsSpringInspectorWidget::hasObjectState(int32_t sceneObjectId) const noexcept
+{
+    if (sceneObjectId < 0) {
+        return false;
+    }
+    return m_objectId == sceneObjectId ||
+           m_objectStates.find(sceneObjectId) != m_objectStates.end();
+}
+
+void PhysicsSpringInspectorWidget::saveActiveObjectState()
+{
+    if (m_objectId < 0) {
+        return;
+    }
+    PhysicsObjectState state;
+    state.ctx = m_ctx;
+    state.driveModes = m_driveModes;
+    state.lastPushedXpbd = m_lastPushedXpbd;
+    state.boneNames = m_boneNames;
+    state.boneParents = m_boneParents;
+    state.selectedBoneIndex = m_selectedBoneIndex;
+    m_objectStates[m_objectId] = std::move(state);
+}
+
+bool PhysicsSpringInspectorWidget::restoreObjectState(int32_t sceneObjectId)
+{
+    const auto it = m_objectStates.find(sceneObjectId);
+    if (it == m_objectStates.end()) {
+        return false;
+    }
+    m_ctx = it->second.ctx;
+    m_driveModes = it->second.driveModes;
+    m_lastPushedXpbd = it->second.lastPushedXpbd;
+    m_boneNames = it->second.boneNames;
+    m_boneParents = it->second.boneParents;
+    m_selectedBoneIndex = it->second.selectedBoneIndex;
+    return true;
+}
+
+void PhysicsSpringInspectorWidget::remapObjectState(PhysicsObjectState &state,
+                                                    const std::vector<int32_t> &oldToNew)
+{
+    if (oldToNew.empty()) {
+        return;
+    }
+
+    const size_t mapCount = std::min(oldToNew.size(), static_cast<size_t>(WE_MDL_MAX_BONES));
+    int32_t maxNew = -1;
+    for (size_t oldIdx = 0; oldIdx < mapCount; ++oldIdx) {
+        const int32_t mapped = oldToNew[oldIdx];
+        if (mapped >= 0 && mapped < static_cast<int32_t>(WE_MDL_MAX_BONES)) {
+            maxNew = std::max(maxNew, mapped);
+        }
+    }
+    const size_t newCount = (maxNew >= 0) ? static_cast<size_t>(maxNew + 1) : 0u;
+
+    we_puppet_physics_ctx_t nextCtx = state.ctx;
+    for (uint32_t i = 0; i < WE_MDL_MAX_BONES; ++i) {
+        nextCtx.configs[i] = {};
+        nextCtx.configs[i].bone_index = i;
+        we_physics_apply_preset(&nextCtx.configs[i], WE_PHYS_PRESET_CUSTOM);
+    }
+
+    std::array<we_bone_drive_mode_t, WE_MDL_MAX_BONES> nextModes{};
+    nextModes.fill(WE_BONE_DRIVE_FK);
+    std::array<bool, WE_MDL_MAX_BONES> nextLastPushed{};
+    nextLastPushed.fill(false);
+
+    const bool hadNames = !state.boneNames.empty();
+    std::vector<QString> nextNames(hadNames ? newCount : 0u);
+    std::vector<int32_t> nextParents(hadNames ? newCount : 0u, -1);
+
+    for (size_t oldIdx = 0; oldIdx < mapCount; ++oldIdx) {
+        const int32_t newIdx = oldToNew[oldIdx];
+        if (newIdx < 0 || newIdx >= static_cast<int32_t>(WE_MDL_MAX_BONES)) {
+            continue;
+        }
+        const size_t n = static_cast<size_t>(newIdx);
+        nextCtx.configs[n] = state.ctx.configs[oldIdx];
+        nextCtx.configs[n].bone_index = static_cast<uint32_t>(n);
+        nextModes[n] = state.driveModes[oldIdx];
+        nextLastPushed[n] = state.lastPushedXpbd[oldIdx];
+
+        if (hadNames && n < nextNames.size()) {
+            if (oldIdx < state.boneNames.size() && !state.boneNames[oldIdx].isEmpty()) {
+                nextNames[n] = state.boneNames[oldIdx];
+            } else {
+                nextNames[n] = QStringLiteral("Bone %1").arg(newIdx);
+            }
+            int32_t nextParent = -1;
+            if (oldIdx < state.boneParents.size()) {
+                const int32_t oldParent = state.boneParents[oldIdx];
+                if (oldParent >= 0 && static_cast<size_t>(oldParent) < mapCount) {
+                    const int32_t mappedParent = oldToNew[static_cast<size_t>(oldParent)];
+                    if (mappedParent >= 0 && mappedParent != newIdx &&
+                        static_cast<size_t>(mappedParent) < newCount) {
+                        nextParent = mappedParent;
+                    }
+                }
+            }
+            nextParents[n] = nextParent;
+        }
+    }
+
+    uint32_t activeCount = 0;
+    for (uint32_t i = 0; i < static_cast<uint32_t>(newCount) && i < WE_MDL_MAX_BONES; ++i) {
+        if ((nextCtx.configs[i].flags & WE_BONE_PHYS_ENABLED) != 0) {
+            ++activeCount;
+        }
+    }
+    nextCtx.active_bone_count = activeCount;
+
+    int32_t nextSelected = 0;
+    if (newCount > 0 && state.selectedBoneIndex >= 0 &&
+        static_cast<size_t>(state.selectedBoneIndex) < mapCount) {
+        const int32_t mappedSel = oldToNew[static_cast<size_t>(state.selectedBoneIndex)];
+        if (mappedSel >= 0 && static_cast<size_t>(mappedSel) < newCount) {
+            nextSelected = mappedSel;
+        }
+    }
+
+    state.ctx = nextCtx;
+    state.driveModes = nextModes;
+    state.lastPushedXpbd = nextLastPushed;
+    if (hadNames) {
+        state.boneNames = std::move(nextNames);
+        state.boneParents = std::move(nextParents);
+    }
+    state.selectedBoneIndex = nextSelected;
+}
+
 void PhysicsSpringInspectorWidget::loadPuppetSkeleton(const we_puppet_t *puppet,
                                                       int32_t sceneObjectId)
 {
+    if (m_objectId >= 0 && m_objectId != sceneObjectId) {
+        saveActiveObjectState();
+    }
     m_objectId = sceneObjectId;
 
     if (!puppet || puppet->bone_count == 0 || !puppet->bones) {
@@ -542,6 +677,7 @@ void PhysicsSpringInspectorWidget::loadPuppetSkeleton(const we_puppet_t *puppet,
         }
         initDefaultContext();
         syncUiFromSelectedBone();
+        saveActiveObjectState();
         return;
     }
 
@@ -569,9 +705,9 @@ void PhysicsSpringInspectorWidget::loadPuppetSkeleton(const we_puppet_t *puppet,
 
     for (uint32_t i = 0; i < WE_MDL_MAX_BONES; ++i) {
         m_ctx.configs[i].bone_index = i;
-        m_driveModes[i] = ((m_ctx.configs[i].flags & WE_BONE_PHYS_ENABLED) != 0)
-                              ? WE_BONE_DRIVE_XPBD
-                              : WE_BONE_DRIVE_FK;
+        const bool xpbdEnabled = (m_ctx.configs[i].flags & WE_BONE_PHYS_ENABLED) != 0;
+        m_driveModes[i] = xpbdEnabled ? WE_BONE_DRIVE_XPBD : WE_BONE_DRIVE_FK;
+        m_lastPushedXpbd[i] = xpbdEnabled;
     }
 
     populateBoneList(puppet);
@@ -584,12 +720,23 @@ void PhysicsSpringInspectorWidget::loadPuppetSkeleton(const we_puppet_t *puppet,
         }
     }
     selectBoneIndex(firstSelect);
+    saveActiveObjectState();
 }
 
 void PhysicsSpringInspectorWidget::setBoneList(const std::vector<QString> &names,
                                                const std::vector<int32_t> &parents,
                                                int32_t sceneObjectId)
 {
+    if (m_objectId >= 0 && m_objectId != sceneObjectId) {
+        saveActiveObjectState();
+    }
+    if (sceneObjectId != m_objectId) {
+        if (sceneObjectId < 0 || !restoreObjectState(sceneObjectId)) {
+            initDefaultContext();
+            m_selectedBoneIndex = 0;
+        }
+    }
+
     m_objectId = sceneObjectId;
     m_boneNames = names;
     m_boneParents = parents;
@@ -606,7 +753,62 @@ void PhysicsSpringInspectorWidget::setBoneList(const std::vector<QString> &names
             m_selectedBoneIndex = 0;
         }
         selectBoneIndex(m_selectedBoneIndex);
+    } else {
+        m_selectedBoneIndex = 0;
+        syncUiFromSelectedBone();
     }
+    saveActiveObjectState();
+}
+
+void PhysicsSpringInspectorWidget::remapBoneIndices(const QVector<int> &oldToNew)
+{
+    std::vector<int32_t> remap;
+    remap.reserve(static_cast<size_t>(oldToNew.size()));
+    for (int idx : oldToNew) {
+        remap.push_back(static_cast<int32_t>(idx));
+    }
+    remapBoneIndices(m_objectId, remap);
+}
+
+void PhysicsSpringInspectorWidget::remapBoneIndices(int32_t objectId,
+                                                    const std::vector<int32_t> &oldToNew)
+{
+    if (oldToNew.empty()) {
+        return;
+    }
+
+    if (objectId >= 0 && objectId != m_objectId) {
+        const auto it = m_objectStates.find(objectId);
+        if (it != m_objectStates.end()) {
+            remapObjectState(it->second, oldToNew);
+        }
+        return;
+    }
+
+    PhysicsObjectState active;
+    active.ctx = m_ctx;
+    active.driveModes = m_driveModes;
+    active.lastPushedXpbd = m_lastPushedXpbd;
+    active.boneNames = std::move(m_boneNames);
+    active.boneParents = std::move(m_boneParents);
+    active.selectedBoneIndex = m_selectedBoneIndex;
+
+    remapObjectState(active, oldToNew);
+
+    m_ctx = active.ctx;
+    m_driveModes = active.driveModes;
+    m_lastPushedXpbd = active.lastPushedXpbd;
+    m_boneNames = std::move(active.boneNames);
+    m_boneParents = std::move(active.boneParents);
+    m_selectedBoneIndex = active.selectedBoneIndex;
+
+    populateBoneList(nullptr);
+    if (!m_boneNames.empty()) {
+        selectBoneIndex(m_selectedBoneIndex);
+    } else {
+        syncUiFromSelectedBone();
+    }
+    saveActiveObjectState();
 }
 
 void PhysicsSpringInspectorWidget::setBoneDriveMode(int32_t boneIndex, we_bone_drive_mode_t mode)
@@ -620,10 +822,12 @@ void PhysicsSpringInspectorWidget::setBoneDriveMode(int32_t boneIndex, we_bone_d
     } else {
         m_ctx.configs[boneIndex].flags &= ~WE_BONE_PHYS_ENABLED;
     }
+    m_lastPushedXpbd[static_cast<size_t>(boneIndex)] = (mode == WE_BONE_DRIVE_XPBD);
     refreshBoneTreeStates();
     if (boneIndex == m_selectedBoneIndex) {
         syncUiFromSelectedBone();
     }
+    saveActiveObjectState();
 }
 
 void PhysicsSpringInspectorWidget::setBoneDriveModes(
@@ -631,14 +835,17 @@ void PhysicsSpringInspectorWidget::setBoneDriveModes(
 {
     m_driveModes = modes;
     for (uint32_t i = 0; i < WE_MDL_MAX_BONES; ++i) {
-        if (m_driveModes[i] == WE_BONE_DRIVE_XPBD) {
+        const bool xpbdEnabled = (m_driveModes[i] == WE_BONE_DRIVE_XPBD);
+        if (xpbdEnabled) {
             m_ctx.configs[i].flags |= WE_BONE_PHYS_ENABLED;
         } else {
             m_ctx.configs[i].flags &= ~WE_BONE_PHYS_ENABLED;
         }
+        m_lastPushedXpbd[i] = xpbdEnabled;
     }
     refreshBoneTreeStates();
     syncUiFromSelectedBone();
+    saveActiveObjectState();
 }
 
 we_bone_drive_mode_t PhysicsSpringInspectorWidget::boneDriveMode(int32_t boneIndex) const noexcept
@@ -647,6 +854,14 @@ we_bone_drive_mode_t PhysicsSpringInspectorWidget::boneDriveMode(int32_t boneInd
         return WE_BONE_DRIVE_FK;
     }
     return m_driveModes[static_cast<size_t>(boneIndex)];
+}
+
+bool PhysicsSpringInspectorWidget::lastPushedXpbd(int32_t boneIndex) const noexcept
+{
+    if (boneIndex < 0 || boneIndex >= static_cast<int32_t>(WE_MDL_MAX_BONES)) {
+        return false;
+    }
+    return m_lastPushedXpbd[static_cast<size_t>(boneIndex)];
 }
 
 QString PhysicsSpringInspectorWidget::boneDriveBadgeText(int32_t boneIndex, QColor &color) const
@@ -1179,13 +1394,16 @@ void PhysicsSpringInspectorWidget::onApplyPresetToDescendantsClicked()
             std::vector<std::pair<int32_t, we_bone_drive_mode_t>> modeChanges;
             for (const auto &d : m_deltas) {
                 if (d.boneIndex >= 0 && d.boneIndex < static_cast<int32_t>(WE_MDL_MAX_BONES)) {
-                    m_widget->m_ctx.configs[d.boneIndex] = useNew ? d.newCfg : d.oldCfg;
+                    const we_bone_sim_config_t &appliedCfg = useNew ? d.newCfg : d.oldCfg;
+                    m_widget->m_ctx.configs[d.boneIndex] = appliedCfg;
                     const we_bone_drive_mode_t targetMode =
                         useNew ? d.newDriveMode : d.oldDriveMode;
                     if (m_widget->m_driveModes[static_cast<size_t>(d.boneIndex)] != targetMode) {
                         m_widget->m_driveModes[static_cast<size_t>(d.boneIndex)] = targetMode;
                         modeChanges.emplace_back(d.boneIndex, targetMode);
                     }
+                    m_widget->m_lastPushedXpbd[static_cast<size_t>(d.boneIndex)] =
+                        (appliedCfg.flags & WE_BONE_PHYS_ENABLED) != 0;
                     if (d.boneIndex == m_widget->m_selectedBoneIndex) {
                         selectedModified = true;
                     }
@@ -1195,6 +1413,7 @@ void PhysicsSpringInspectorWidget::onApplyPresetToDescendantsClicked()
             if (selectedModified && !m_widget->m_updatingUi) {
                 m_widget->syncUiFromSelectedBone();
             }
+            m_widget->saveActiveObjectState();
             for (const auto &mc : modeChanges) {
                 emit m_widget->boneDriveModeChanged(m_objectId, mc.first, mc.second);
             }
@@ -1258,6 +1477,7 @@ void PhysicsSpringInspectorWidget::commitPhysicsChange(const we_bone_sim_config_
                     (self->m_ctx.configs[boneIndex].flags & WE_BONE_PHYS_ENABLED) != 0;
                 const bool nowXpbd = (cfg.flags & WE_BONE_PHYS_ENABLED) != 0;
                 self->m_ctx.configs[boneIndex] = cfg;
+                self->m_lastPushedXpbd[static_cast<size_t>(boneIndex)] = nowXpbd;
                 if (nowXpbd != prevXpbd) {
                     const we_bone_drive_mode_t nextMode =
                         nowXpbd ? WE_BONE_DRIVE_XPBD : WE_BONE_DRIVE_FK;
@@ -1271,6 +1491,7 @@ void PhysicsSpringInspectorWidget::commitPhysicsChange(const we_bone_sim_config_
             if (boneIndex == self->m_selectedBoneIndex && !self->m_updatingUi) {
                 self->syncUiFromSelectedBone();
             }
+            self->saveActiveObjectState();
             emit self->physicsParamsChanged(output, objectId, boneIndex, cfg, wind, cursor);
             self->sendIpcUpdate(output, objectId, boneIndex, cfg, wind, cursor);
         };
@@ -1283,6 +1504,7 @@ void PhysicsSpringInspectorWidget::commitPhysicsChange(const we_bone_sim_config_
         const bool prevXpbd = (oldCfg.flags & WE_BONE_PHYS_ENABLED) != 0;
         const bool nowXpbd = (newCfg.flags & WE_BONE_PHYS_ENABLED) != 0;
         m_ctx.configs[m_selectedBoneIndex] = newCfg;
+        m_lastPushedXpbd[static_cast<size_t>(m_selectedBoneIndex)] = nowXpbd;
         m_ctx.wind = newWind;
         m_ctx.cursor = newCursor;
         if (nowXpbd != prevXpbd) {
@@ -1292,6 +1514,7 @@ void PhysicsSpringInspectorWidget::commitPhysicsChange(const we_bone_sim_config_
         }
         refreshBoneTreeStates();
         syncUiFromSelectedBone();
+        saveActiveObjectState();
         emit physicsParamsChanged(m_targetOutput, m_objectId, m_selectedBoneIndex, newCfg, newWind,
                                   newCursor);
         sendIpcUpdate(m_targetOutput, m_objectId, m_selectedBoneIndex, newCfg, newWind, newCursor);
@@ -1305,6 +1528,10 @@ void PhysicsSpringInspectorWidget::sendIpcUpdate(const QString &output, int32_t 
                                                  const we_wind_field_t &wind,
                                                  const we_cursor_force_t &cursor)
 {
+    if (objectId == m_objectId && boneIndex >= 0 &&
+        boneIndex < static_cast<int32_t>(WE_MDL_MAX_BONES)) {
+        m_lastPushedXpbd[static_cast<size_t>(boneIndex)] = (cfg.flags & WE_BONE_PHYS_ENABLED) != 0;
+    }
     if (!m_ipcClient) {
         return;
     }
