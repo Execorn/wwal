@@ -12,6 +12,7 @@
 #include <QFrame>
 #include <QImage>
 #include <QLabel>
+#include <QPointer>
 #include <QPushButton>
 #include <QRadioButton>
 #include <QSlider>
@@ -23,11 +24,15 @@
 #include <QVector>
 #include <QWidget>
 
+#include <cstdint>
+
 namespace waywal::studio {
 
+class OklchColorDialog;
+
 /**
- * @brief Interactive color swatch widget showing color square, token name, and hex value.
- *        1-click copies the hex string to clipboard.
+ * @brief Interactive color swatch chip showing color square, token name, and hex value.
+ *        Supports 1-click and keyboard (Return/Space) hex clipboard copy.
  */
 class ColorSwatchChip : public QFrame {
     Q_OBJECT
@@ -45,19 +50,80 @@ class ColorSwatchChip : public QFrame {
     void copiedToClipboard(const QString &name, const QString &hex);
 
   protected:
+    // Lightweight constructor for custom-painted grids without per-chip child widgets or QSS.
+    explicit ColorSwatchChip(QWidget *parent = nullptr);
+
     void mousePressEvent(QMouseEvent *event) override;
+    void keyPressEvent(QKeyEvent *event) override;
+    void paintEvent(QPaintEvent *event) override;
 
   private:
     void refreshUi();
+    void activateCopy(const QPoint &globalPos);
 
     QString m_tokenName;
     color_rgba_t m_color{};
     QString m_hexString;
-
-    QWidget *m_colorBox{nullptr};
-    QLabel *m_nameLabel{nullptr};
-    QLabel *m_hexLabel{nullptr};
 };
+
+/**
+ * @brief Custom-painted, keyboard-accessible swatch grid replacing 62 styled child widgets.
+ *        Zero per-swatch QSS stylesheets; supports arrow navigation, 2px #38BDF8 focus ring,
+ *        Return/Space clipboard copy, and non-modal OkLCH editing on double-click or E/F2.
+ */
+class ColorSwatchGridWidget : public ColorSwatchChip {
+    Q_OBJECT
+
+  public:
+    struct SwatchEntry {
+        QString name;
+        color_rgba_t color{};
+        QString hex;
+    };
+
+    explicit ColorSwatchGridWidget(const QString &gridTitle, QWidget *parent = nullptr);
+    ~ColorSwatchGridWidget() override = default;
+
+    void setSwatches(const QVector<SwatchEntry> &entries);
+    [[nodiscard]] int swatchCount() const noexcept { return m_entries.size(); }
+    [[nodiscard]] int focusedIndex() const noexcept { return m_focusedIndex; }
+    [[nodiscard]] QRect tileRectForIndex(int index) const;
+
+    [[nodiscard]] QSize sizeHint() const override;
+    [[nodiscard]] QSize minimumSizeHint() const override;
+
+  Q_SIGNALS:
+    void swatchEditRequested(const QString &name, const color_rgba_t &color);
+
+  protected:
+    void paintEvent(QPaintEvent *event) override;
+    void resizeEvent(QResizeEvent *event) override;
+    void mouseMoveEvent(QMouseEvent *event) override;
+    void leaveEvent(QEvent *event) override;
+    void mousePressEvent(QMouseEvent *event) override;
+    void mouseDoubleClickEvent(QMouseEvent *event) override;
+    void keyPressEvent(QKeyEvent *event) override;
+    void focusInEvent(QFocusEvent *event) override;
+    void focusOutEvent(QFocusEvent *event) override;
+    bool event(QEvent *event) override;
+
+  private:
+    [[nodiscard]] int columnCountForWidth(int availWidth) const noexcept;
+    [[nodiscard]] int indexAtPos(const QPoint &pos) const noexcept;
+    void updateLayoutMetrics();
+    void ensureFocusedVisible();
+    void updateAccessibleFocus();
+    void triggerCopyAt(int index, const QPoint &globalPos);
+
+    QString m_gridTitle;
+    QVector<SwatchEntry> m_entries;
+    int m_focusedIndex{0};
+    int m_hoveredIndex{-1};
+    int m_columns{2};
+    int m_tileHeight{48};
+};
+
+class WcagStatusPill;
 
 /**
  * @brief Live WCAG 2.1 contrast ratio badge widget for foreground/background token pairs.
@@ -72,14 +138,17 @@ class WcagBadgeWidget : public QFrame {
     void updateRatio(const color_rgba_t &fg, const color_rgba_t &bg);
 
   private:
+    static color_rgba_t compositeOver(const color_rgba_t &fg, const color_rgba_t &bg);
     static double relativeLuminance(const color_rgba_t &c);
     static double computeContrastRatio(const color_rgba_t &fg, const color_rgba_t &bg);
 
     QString m_pairName;
     QLabel *m_nameLabel{nullptr};
     QLabel *m_ratioLabel{nullptr};
-    QLabel *m_aaBadge{nullptr};
-    QLabel *m_aaaBadge{nullptr};
+    WcagStatusPill *m_aaBadge{nullptr};
+    WcagStatusPill *m_aaaBadge{nullptr};
+    int m_lastPassAa{-1};
+    int m_lastPassAaa{-1};
 };
 
 /**
@@ -91,7 +160,7 @@ class WcagBadgeWidget : public QFrame {
  * - Seed 0..3 primary accent selector + custom seed color override
  * - All 9 Material Design 3 scheme variants
  * - [-1.0, +1.0] contrast slider with live WCAG 2.1 AA (4.5:1) & AAA (7.0:1) badges
- * - 32 Material Design 3 tokens, 16 ANSI colors, and 14 Catppuccin tokens swatch grid
+ * - 36 Material Design 3 tokens, 16 ANSI colors, and 14 Catppuccin tokens swatch grid
  * - Integrated DesktopPreviewMockup and TemplateExporter
  */
 class ThemeStudioWidget : public QWidget {
@@ -104,11 +173,17 @@ class ThemeStudioWidget : public QWidget {
     void loadWallpaper(const QString &filePath);
     void setWallpaperImage(const QImage &image, const QString &path = QString());
 
+    void setSolarCoordinates(double latitudeDeg, double longitudeDeg, bool hasCoordinates = true);
+    [[nodiscard]] bool hasSolarCoordinates() const noexcept { return m_hasSolarCoords; }
+    [[nodiscard]] double solarLatitude() const noexcept { return m_solarLatitude; }
+    [[nodiscard]] double solarLongitude() const noexcept { return m_solarLongitude; }
+
     [[nodiscard]] const waywal_palette_t &currentPalette() const { return m_palette; }
     [[nodiscard]] waywal_theme_mode_t themeMode() const { return m_mode; }
     [[nodiscard]] waywal_scheme_variant_t schemeVariant() const { return m_variant; }
     [[nodiscard]] float contrast() const { return m_contrast; }
     [[nodiscard]] uint8_t seedIndex() const { return m_seedIndex; }
+    [[nodiscard]] bool isSolarTimerActive() const noexcept { return m_solarTimer.isActive(); }
 
   public Q_SLOTS:
     void reextract();
@@ -131,10 +206,13 @@ class ThemeStudioWidget : public QWidget {
 
   protected:
     void resizeEvent(QResizeEvent *event) override;
+    void showEvent(QShowEvent *event) override;
+    void hideEvent(QHideEvent *event) override;
 
   private Q_SLOTS:
     void onSolarTimerTick();
     void onSwatchCopied(const QString &name, const QString &hex);
+    void onSwatchEditRequested(const QString &name, const color_rgba_t &color);
 
   private:
     void setupUi();
@@ -142,31 +220,42 @@ class ThemeStudioWidget : public QWidget {
     void setupWcagBadgesCard(QVBoxLayout *parentLayout);
     void setupSwatchesCard(QTabWidget *tabWidget);
 
+    void loadSolarConfigDefaultsIfNeeded();
     void applySolarScheduleEvaluation();
+    void applyCustomSeedColor(const QColor &chosen, const QString &sourceContext = QString());
+    void openSeedColorDialog(const QColor &initial, const QString &title,
+                             const QString &sourceContext);
     void updateSeedRadioSwatches();
     void updateWcagBadges();
     void updateSwatchGrids();
 
     static QColor toQColor(const color_rgba_t &c);
 
-    // Current State
     waywal_palette_t m_palette{};
     QImage m_sourceImage;
     QString m_wallpaperPath;
 
     waywal_theme_mode_t m_mode{WAYWAL_THEME_DARK};
     bool m_autoSolarSchedule{false};
+    bool m_hasSolarCoords{false};
+    bool m_solarConfigLoaded{false};
+    double m_solarLatitude{0.0};
+    double m_solarLongitude{0.0};
+    int32_t m_sunriseFallbackMin{390};
+    int32_t m_sunsetFallbackMin{1110};
+
     waywal_scheme_variant_t m_variant{WAYWAL_SCHEME_TONAL_SPOT};
     float m_contrast{0.0f};
     uint8_t m_seedIndex{0};
     bool m_hasSeedOverride{false};
     uint32_t m_seedOverrideRgb{0};
 
-    // UI Widgets
     QSplitter *m_mainSplitter{nullptr};
     DesktopPreviewMockup *m_mockup{nullptr};
     TemplateExporter *m_templateExporter{nullptr};
 
+    QPushButton *m_toggleLockBtn{nullptr};
+    QButtonGroup *m_modeGroup{nullptr};
     QPushButton *m_modeDarkBtn{nullptr};
     QPushButton *m_modeLightBtn{nullptr};
     QCheckBox *m_autoSolarCheck{nullptr};
@@ -188,11 +277,15 @@ class ThemeStudioWidget : public QWidget {
     QLabel *m_clipboardToastLabel{nullptr};
 
     QVector<WcagBadgeWidget *> m_wcagBadges;
-    QVector<ColorSwatchChip *> m_m3Chips;
-    QVector<ColorSwatchChip *> m_ansiChips;
-    QVector<ColorSwatchChip *> m_catppuccinChips;
+    ColorSwatchGridWidget *m_m3SwatchGrid{nullptr};
+    ColorSwatchGridWidget *m_ansiSwatchGrid{nullptr};
+    ColorSwatchGridWidget *m_catppuccinSwatchGrid{nullptr};
+
+    QPointer<OklchColorDialog> m_customSeedDialog;
+    QPointer<QWidget> m_activeWallpaperDialog;
 
     QTimer m_solarTimer;
+    QTimer m_toastTimer;
 };
 
 } // namespace waywal::studio
