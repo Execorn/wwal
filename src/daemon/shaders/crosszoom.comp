@@ -39,7 +39,7 @@ void main() {
         return;
     }
 
-    vec2 center = (u_center.x > 0.0 || u_center.y > 0.0) ? u_center : vec2(0.5);
+    vec2 center = (u_center.x >= 0.0 && u_center.y >= 0.0) ? u_center : vec2(0.5);
 
     float strength = (u_wave_amp > 0.001) ? u_wave_amp : 0.4;
     float peak = sin(u_progress * PI);

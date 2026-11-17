@@ -31,9 +31,10 @@ void main() {
         return;
     }
 
-    vec2 center = (u_center.x > 0.0 || u_center.y > 0.0) ? u_center : vec2(0.5);
+    vec2 center = (u_center.x >= 0.0 && u_center.y >= 0.0) ? u_center : vec2(0.5);
 
     float aspect = float(u_resolution.x) * inv_res.y;
+    float inv_aspect = float(u_resolution.y) * inv_res.x;
     vec2 raw_delta = uv - center;
     vec2 delta = vec2(raw_delta.x * aspect, raw_delta.y);
     float dist2 = dot(delta, delta);
@@ -55,20 +56,22 @@ void main() {
 
     float dist = sqrt(dist2);
     float freq = (u_wave_freq > 0.0) ? u_wave_freq : 32.0;
-    float amp = (u_wave_amp > 0.0) ? u_wave_amp : 0.04;
+    float amp = (u_wave_amp > 1e-5) ? u_wave_amp : 0.04;
     float inv_amp = 1.0 / amp;
 
     float diff = dist - current_radius;
     float env = smoothstep(0.0, 0.08, u_progress) * (1.0 - u_progress) * (1.0 - u_progress);
     float decay = env;
 
-    vec2 norm_dir = (dist > 0.0001) ? (raw_delta / dist) : vec2(0.0);
+    /* Compute unit direction in aspect-corrected space, then map X back to UV so pixel shifts stay circular. */
+    vec2 unit_dir = (dist > 0.0001) ? (delta / dist) : vec2(0.0);
+    vec2 uv_dir = vec2(unit_dir.x * inv_aspect, unit_dir.y);
 
     float window = 1.0 - smoothstep(0.0, wave_width, abs(diff));
     float wave = sin(diff * freq) * amp * decay * window;
     float crest = max(0.0, -wave * inv_amp) * decay * 0.22;
 
-    vec2 refracted_uv = clamp(uv + norm_dir * wave, 0.0, 1.0);
+    vec2 refracted_uv = clamp(uv + uv_dir * wave, 0.0, 1.0);
 
     /* Reveal incoming image inside the expanding shockwave */
     float split = smoothstep(current_radius - 0.02, current_radius + 0.02, dist);

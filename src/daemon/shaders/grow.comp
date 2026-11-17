@@ -29,7 +29,7 @@ void main() {
         return;
     }
 
-    vec2 center = (u_center.x > 0.0 || u_center.y > 0.0) ? u_center : vec2(0.5);
+    vec2 center = (u_center.x >= 0.0 && u_center.y >= 0.0) ? u_center : vec2(0.5);
     float aspect = float(u_resolution.x) * inv_res.y;
     vec2 delta = uv - center;
     delta.x *= aspect;

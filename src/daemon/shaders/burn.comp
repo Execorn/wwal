@@ -69,7 +69,7 @@ void main() {
     }
 
     float scale = (u_wave_freq > 0.0) ? u_wave_freq : 14.0;
-    float flame_width = (u_wave_amp > 0.0) ? u_wave_amp : 0.08;
+    float flame_width = (u_wave_amp > 1e-5) ? u_wave_amp : 0.08;
     float inv_flame_width = 1.0 / flame_width;
 
     float n = fbm(uv * scale);

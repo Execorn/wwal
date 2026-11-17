@@ -17,8 +17,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__
+#include <sched.h>
+#endif
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 void waywal_we_scene_forget_bo(we_scene_t *scene, const dmabuf_bo_t *bo)
 {
@@ -1015,6 +1022,726 @@ static void test_buffer_gated_transition_tick(void)
     printf("[TEST] test_buffer_gated_transition_tick PASSED.\n");
 }
 
+static void assert_opaque_argb(const uint32_t *buf, size_t n)
+{
+    for (size_t i = 0; i < n; ++i) {
+        assert((buf[i] & 0xFF000000U) == 0xFF000000U);
+    }
+}
+
+static double compute_rgb_psnr(const uint32_t *a, const uint32_t *b, size_t n)
+{
+    double sse = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t pa = a[i];
+        uint32_t pb = b[i];
+        int dr = (int)((pa >> 16) & 0xFFU) - (int)((pb >> 16) & 0xFFU);
+        int dg = (int)((pa >> 8) & 0xFFU) - (int)((pb >> 8) & 0xFFU);
+        int db = (int)(pa & 0xFFU) - (int)(pb & 0xFFU);
+        sse += (double)(dr * dr + dg * dg + db * db);
+    }
+    if (sse <= 0.0) {
+        return 999.0;
+    }
+    double mse = sse / (3.0 * (double)n);
+    return 10.0 * log10((255.0 * 255.0) / mse);
+}
+
+static void fill_parity_images(uint32_t *src_a, uint32_t *src_b, uint32_t w, uint32_t h)
+{
+    for (uint32_t y = 0; y < h; ++y) {
+        float fy = ((float)y + 0.5f) / (float)h;
+        for (uint32_t x = 0; x < w; ++x) {
+            float fx = ((float)x + 0.5f) / (float)w;
+            uint32_t ra = (uint32_t)(30.0f + 190.0f * fx + 20.0f * sinf(fy * 6.2831853f));
+            uint32_t ga = (uint32_t)(35.0f + 170.0f * fy + 25.0f * cosf(fx * 6.2831853f));
+            uint32_t ba = (uint32_t)(40.0f + 150.0f * (0.5f * (fx + fy)));
+            src_a[(size_t)y * w + x] =
+                0xFF000000U | ((ra & 0xFFU) << 16) | ((ga & 0xFFU) << 8) | (ba & 0xFFU);
+
+            uint32_t rb = (uint32_t)(210.0f - 160.0f * fx + 20.0f * cosf(fy * 6.2831853f));
+            uint32_t gb = (uint32_t)(200.0f - 140.0f * fy + 25.0f * sinf(fx * 6.2831853f));
+            uint32_t bb = (uint32_t)(60.0f + 160.0f * (1.0f - 0.5f * (fx + fy)));
+            src_b[(size_t)y * w + x] =
+                0xFF000000U | ((rb & 0xFFU) << 16) | ((gb & 0xFFU) << 8) | (bb & 0xFFU);
+        }
+    }
+}
+
+static void test_all_18_gpu_vs_cpu_parity(void)
+{
+    printf("[TEST] Running test_all_18_gpu_vs_cpu_parity...\n");
+
+    const struct {
+        waywal_transition_type_t type;
+        const char *name;
+    } effects[] = {
+        {WAYWAL_TRANSITION_FADE, "fade"},
+        {WAYWAL_TRANSITION_WIPE, "wipe"},
+        {WAYWAL_TRANSITION_GROW, "grow"},
+        {WAYWAL_TRANSITION_OUTER, "outer"},
+        {WAYWAL_TRANSITION_WAVE, "wave"},
+        {WAYWAL_TRANSITION_NOISE, "noise"},
+        {WAYWAL_TRANSITION_CROSSZOOM, "crosszoom"},
+        {WAYWAL_TRANSITION_SLIDE, "slide"},
+        {WAYWAL_TRANSITION_GLITCH, "glitch"},
+        {WAYWAL_TRANSITION_BURN, "burn"},
+        {WAYWAL_TRANSITION_RIPPLE, "ripple"},
+        {WAYWAL_TRANSITION_PIXELATE, "pixelate"},
+        {WAYWAL_TRANSITION_DOOM, "doom"},
+        {WAYWAL_TRANSITION_SWIRL, "swirl"},
+        {WAYWAL_TRANSITION_CUBE, "cube"},
+        {WAYWAL_TRANSITION_LUMA, "luma"},
+        {WAYWAL_TRANSITION_LIGHT_LEAK, "light_leak"},
+        {WAYWAL_TRANSITION_PAGE_CURL, "page_curl"},
+    };
+    const struct {
+        uint32_t w;
+        uint32_t h;
+        bool check_gpu;
+    } res_cases[] = {
+        {640U, 360U, true},
+        {840U, 360U, true},
+        {360U, 640U, true},
+        {323U, 241U, false},
+    };
+    const float progresses[] = {0.08f, 0.45f, 0.72f};
+
+    dmabuf_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    render_engine_t re;
+    memset(&re, 0, sizeof(re));
+    bool has_gpu = dmabuf_context_init(&ctx) && render_engine_init(&re, &ctx) && re.has_gpu_compute;
+    gpu_compute_ctx_t *gctx = has_gpu ? (gpu_compute_ctx_t *)re.gpu_ctx : NULL;
+
+    double min_psnr_overall = 999.0;
+    const char *min_psnr_name = "none";
+
+    for (size_t r = 0; r < sizeof(res_cases) / sizeof(res_cases[0]); ++r) {
+        uint32_t w = res_cases[r].w;
+        uint32_t h = res_cases[r].h;
+        size_t n = (size_t)w * h;
+        uint32_t *src_a = (uint32_t *)malloc(n * sizeof(uint32_t));
+        uint32_t *src_b = (uint32_t *)malloc(n * sizeof(uint32_t));
+        uint32_t *dst_cpu = (uint32_t *)malloc(n * sizeof(uint32_t));
+        uint32_t *dst_gpu = (uint32_t *)malloc(n * sizeof(uint32_t));
+        assert(src_a && src_b && dst_cpu && dst_gpu);
+        fill_parity_images(src_a, src_b, w, h);
+
+        uint32_t tex_old = 0, tex_new = 0, tex_target = 0, fbo = 0, cur_w = 0, cur_h = 0;
+        if (has_gpu && res_cases[r].check_gpu) {
+            assert(gpu_compute_prepare_shm(gctx, &tex_old, &tex_new, &tex_target, &fbo, &cur_w,
+                                           &cur_h, w, h, src_a, src_b));
+        }
+
+        for (size_t e = 0; e < sizeof(effects) / sizeof(effects[0]); ++e) {
+            for (size_t p_idx = 0; p_idx < sizeof(progresses) / sizeof(progresses[0]); ++p_idx) {
+                waywal_transition_params_t params = {
+                    .type = effects[e].type,
+                    .progress = progresses[p_idx],
+                    .angle_rad = 0.42f,
+                    .wave_freq = 16.0f,
+                    .wave_amp = 0.06f,
+                    .center_x = 0.5f,
+                    .center_y = 0.5f,
+                    .bezier = BEZIER_LINEAR,
+                };
+                assert(render_engine_execute_cpu_transition(dst_cpu, src_a, src_b, w, h,
+                                                            w * sizeof(uint32_t), &params));
+                assert_opaque_argb(dst_cpu, n);
+
+                if (has_gpu && res_cases[r].check_gpu) {
+                    assert(gpu_compute_dispatch_transition_shm(gctx, tex_old, tex_new, tex_target,
+                                                               fbo, w, h, &params, dst_gpu));
+                    assert_opaque_argb(dst_gpu, n);
+                    double psnr = compute_rgb_psnr(dst_cpu, dst_gpu, n);
+                    if (psnr < min_psnr_overall) {
+                        min_psnr_overall = psnr;
+                        min_psnr_name = effects[e].name;
+                    }
+                    if (psnr < 42.0) {
+                        fprintf(stderr, "PARITY FAIL %s (%ux%u p=%.2f): PSNR=%.2f dB (< 42.0)\n",
+                                effects[e].name, w, h, progresses[p_idx], psnr);
+                    }
+                    assert(psnr >= 42.0);
+                }
+            }
+        }
+
+        /* Verify deterministic RANDOM, SIMPLE, and CUSTOM paths produce opaque ARGB output. */
+        uint32_t *dst_rnd2 = (uint32_t *)malloc(n * sizeof(uint32_t));
+        assert(dst_rnd2);
+        waywal_transition_params_t p_rnd = {
+            .type = WAYWAL_TRANSITION_RANDOM,
+            .progress = 0.45f,
+            .angle_rad = 0.42f,
+            .wave_freq = 16.0f,
+            .wave_amp = 0.06f,
+            .center_x = 0.5f,
+            .center_y = 0.5f,
+            .bezier = BEZIER_LINEAR,
+        };
+        assert(render_engine_execute_cpu_transition(dst_cpu, src_a, src_b, w, h,
+                                                    w * sizeof(uint32_t), &p_rnd));
+        assert(render_engine_execute_cpu_transition(dst_rnd2, src_a, src_b, w, h,
+                                                    w * sizeof(uint32_t), &p_rnd));
+        assert_opaque_argb(dst_cpu, n);
+        assert(memcmp(dst_cpu, dst_rnd2, n * sizeof(uint32_t)) == 0);
+        p_rnd.type = WAYWAL_TRANSITION_SIMPLE;
+        assert(render_engine_execute_cpu_transition(dst_cpu, src_a, src_b, w, h,
+                                                    w * sizeof(uint32_t), &p_rnd));
+        assert_opaque_argb(dst_cpu, n);
+        p_rnd.type = WAYWAL_TRANSITION_CUSTOM;
+        assert(render_engine_execute_cpu_transition(dst_cpu, src_a, src_b, w, h,
+                                                    w * sizeof(uint32_t), &p_rnd));
+        assert_opaque_argb(dst_cpu, n);
+        free(dst_rnd2);
+
+        if (has_gpu && res_cases[r].check_gpu) {
+            gpu_compute_release_shm_res(gctx, &tex_old, &tex_new, &tex_target, &fbo);
+        }
+
+        free(dst_gpu);
+        free(dst_cpu);
+        free(src_b);
+        free(src_a);
+    }
+
+    if (re.gpu_ctx) {
+        render_engine_destroy(&re);
+    }
+    if (ctx.available) {
+        dmabuf_context_destroy(&ctx);
+    }
+
+    printf("[TEST] test_all_18_gpu_vs_cpu_parity PASSED (gpu=%s, min_psnr=%.2f dB on %s).\n",
+           has_gpu ? "verified" : "skipped", min_psnr_overall, min_psnr_name);
+}
+
+static void test_transition_aud_regressions(void)
+{
+    printf("[TEST] Running test_transition_aud_regressions...\n");
+
+    const uint32_t w = 640U;
+    const uint32_t h = 360U;
+    const size_t n = (size_t)w * h;
+    uint32_t *src_a = (uint32_t *)malloc(n * sizeof(uint32_t));
+    uint32_t *src_b = (uint32_t *)malloc(n * sizeof(uint32_t));
+    uint32_t *out0 = (uint32_t *)malloc(n * sizeof(uint32_t));
+    uint32_t *out_half = (uint32_t *)malloc(n * sizeof(uint32_t));
+    uint32_t *out_neg = (uint32_t *)malloc(n * sizeof(uint32_t));
+    uint32_t *out_gpu = (uint32_t *)malloc(n * sizeof(uint32_t));
+    assert(src_a && src_b && out0 && out_half && out_neg && out_gpu);
+    fill_parity_images(src_a, src_b, w, h);
+
+    dmabuf_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    render_engine_t re;
+    memset(&re, 0, sizeof(re));
+    bool has_gpu = dmabuf_context_init(&ctx) && render_engine_init(&re, &ctx) && re.has_gpu_compute;
+    gpu_compute_ctx_t *gctx = has_gpu ? (gpu_compute_ctx_t *)re.gpu_ctx : NULL;
+    uint32_t tex_old = 0, tex_new = 0, tex_target = 0, fbo = 0, cur_w = 0, cur_h = 0;
+    if (has_gpu) {
+        assert(gpu_compute_prepare_shm(gctx, &tex_old, &tex_new, &tex_target, &fbo, &cur_w, &cur_h,
+                                       w, h, src_a, src_b));
+    }
+
+    /* 1. Top-left (0.0, 0.0) center on all 5 centered transitions. */
+    const waywal_transition_type_t centered_types[] = {
+        WAYWAL_TRANSITION_GROW,   WAYWAL_TRANSITION_OUTER, WAYWAL_TRANSITION_CROSSZOOM,
+        WAYWAL_TRANSITION_RIPPLE, WAYWAL_TRANSITION_SWIRL,
+    };
+    for (size_t i = 0; i < sizeof(centered_types) / sizeof(centered_types[0]); ++i) {
+        waywal_transition_params_t p0 = {
+            .type = centered_types[i],
+            .progress = 0.45f,
+            .wave_freq = 16.0f,
+            .wave_amp = 0.06f,
+            .center_x = 0.0f,
+            .center_y = 0.0f,
+            .bezier = BEZIER_LINEAR,
+        };
+        waywal_transition_params_t ph = p0;
+        ph.center_x = 0.5f;
+        ph.center_y = 0.5f;
+        waywal_transition_params_t pn = p0;
+        pn.center_x = -1.0f;
+        pn.center_y = -1.0f;
+
+        assert(render_engine_execute_cpu_transition(out0, src_a, src_b, w, h, w * sizeof(uint32_t),
+                                                    &p0));
+        assert(render_engine_execute_cpu_transition(out_half, src_a, src_b, w, h,
+                                                    w * sizeof(uint32_t), &ph));
+        assert(render_engine_execute_cpu_transition(out_neg, src_a, src_b, w, h,
+                                                    w * sizeof(uint32_t), &pn));
+        assert(memcmp(out0, out_half, n * sizeof(uint32_t)) != 0);
+        assert(memcmp(out_neg, out_half, n * sizeof(uint32_t)) == 0);
+
+        if (has_gpu) {
+            assert(gpu_compute_dispatch_transition_shm(gctx, tex_old, tex_new, tex_target, fbo, w,
+                                                       h, &p0, out_gpu));
+            double psnr = compute_rgb_psnr(out0, out_gpu, n);
+            assert(psnr >= 42.0);
+            assert(gpu_compute_dispatch_transition_shm(gctx, tex_old, tex_new, tex_target, fbo, w,
+                                                       h, &ph, out_neg));
+            assert(memcmp(out_gpu, out_neg, n * sizeof(uint32_t)) != 0);
+        }
+    }
+
+    /* 2. PAGE_CURL angle_rad == 0.0f remains horizontal (distinct from 45 deg), while -999
+     * defaults. */
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            uint8_t v = (uint8_t)((x * 255U) / (w - 1U));
+            src_a[(size_t)y * w + x] = 0xFF000000U | ((uint32_t)v << 16) | 0x00004020U;
+            src_b[(size_t)y * w + x] = 0xFF000000U | (0x20U << 16) | ((uint32_t)v << 8) | 0xE0U;
+        }
+    }
+    if (has_gpu) {
+        assert(gpu_compute_prepare_shm(gctx, &tex_old, &tex_new, &tex_target, &fbo, &cur_w, &cur_h,
+                                       w, h, src_a, src_b));
+    }
+    waywal_transition_params_t curl0 = {
+        .type = WAYWAL_TRANSITION_PAGE_CURL,
+        .progress = 0.45f,
+        .angle_rad = 0.0f,
+        .bezier = BEZIER_LINEAR,
+    };
+    waywal_transition_params_t curl45 = curl0;
+    curl45.angle_rad = 0.78539816f;
+    waywal_transition_params_t curl_def = curl0;
+    curl_def.angle_rad = -999.0f;
+    assert(render_engine_execute_cpu_transition(out0, src_a, src_b, w, h, w * sizeof(uint32_t),
+                                                &curl0));
+    assert(render_engine_execute_cpu_transition(out_half, src_a, src_b, w, h, w * sizeof(uint32_t),
+                                                &curl45));
+    assert(render_engine_execute_cpu_transition(out_neg, src_a, src_b, w, h, w * sizeof(uint32_t),
+                                                &curl_def));
+    assert(memcmp(out0, out_half, n * sizeof(uint32_t)) != 0);
+    assert(memcmp(out_neg, out_half, n * sizeof(uint32_t)) == 0);
+    /* Horizontal curl (angle=0) on vertically constant inputs must be vertically invariant. */
+    assert(memcmp(&out0[(size_t)10U * w], &out0[(size_t)(h - 10U) * w], w * sizeof(uint32_t)) == 0);
+    if (has_gpu) {
+        assert(gpu_compute_dispatch_transition_shm(gctx, tex_old, tex_new, tex_target, fbo, w, h,
+                                                   &curl0, out_gpu));
+        assert(compute_rgb_psnr(out0, out_gpu, n) >= 42.0);
+    }
+
+    /* 3. Cardinal WIPE and WAVE cover [0, 1] without sqrt(2) edge clipping. */
+    for (size_t i = 0; i < n; ++i) {
+        src_a[i] = 0xFF101010U;
+        src_b[i] = 0xFFF0F0F0U;
+    }
+    if (has_gpu) {
+        assert(gpu_compute_prepare_shm(gctx, &tex_old, &tex_new, &tex_target, &fbo, &cur_w, &cur_h,
+                                       w, h, src_a, src_b));
+    }
+    const waywal_transition_type_t proj_types[] = {WAYWAL_TRANSITION_WIPE, WAYWAL_TRANSITION_WAVE};
+    for (size_t t = 0; t < 2U; ++t) {
+        waywal_transition_params_t p_early = {
+            .type = proj_types[t],
+            .progress = 0.08f,
+            .angle_rad = 0.0f,
+            .wave_freq = 16.0f,
+            .wave_amp = 0.06f,
+            .bezier = BEZIER_LINEAR,
+        };
+        waywal_transition_params_t p_mid_hi = p_early;
+        p_mid_hi.progress = 0.86f;
+        waywal_transition_params_t p_late = p_early;
+        p_late.progress = 0.96f;
+        assert(render_engine_execute_cpu_transition(out0, src_a, src_b, w, h, w * sizeof(uint32_t),
+                                                    &p_early));
+        assert(render_engine_execute_cpu_transition(out_neg, src_a, src_b, w, h,
+                                                    w * sizeof(uint32_t), &p_mid_hi));
+        assert(render_engine_execute_cpu_transition(out_half, src_a, src_b, w, h,
+                                                    w * sizeof(uint32_t), &p_late));
+        assert((out0[(size_t)(h / 2U) * w + 0U] & 0xFFU) > 0x20U);
+        assert((out_neg[(size_t)(h / 2U) * w + (w - 1U)] & 0xFFU) < 0x20U);
+        assert((out_half[(size_t)(h / 2U) * w + (w - 1U)] & 0xFFU) > 0x20U);
+        if (has_gpu) {
+            assert(gpu_compute_dispatch_transition_shm(gctx, tex_old, tex_new, tex_target, fbo, w,
+                                                       h, &p_early, out_gpu));
+            assert(compute_rgb_psnr(out0, out_gpu, n) >= 42.0);
+            assert(gpu_compute_dispatch_transition_shm(gctx, tex_old, tex_new, tex_target, fbo, w,
+                                                       h, &p_late, out_gpu));
+            assert(compute_rgb_psnr(out_half, out_gpu, n) >= 42.0);
+        }
+    }
+
+    /* 3b. LIGHT_LEAK peak highlight exceeds legacy 180 cap and matches GPU. */
+    for (size_t i = 0; i < n; ++i) {
+        src_a[i] = 0xFF606060U;
+        src_b[i] = 0xFF606060U;
+    }
+    if (has_gpu) {
+        assert(gpu_compute_prepare_shm(gctx, &tex_old, &tex_new, &tex_target, &fbo, &cur_w, &cur_h,
+                                       w, h, src_a, src_b));
+    }
+    waywal_transition_params_t p_leak = {
+        .type = WAYWAL_TRANSITION_LIGHT_LEAK,
+        .progress = 0.50f,
+        .bezier = BEZIER_LINEAR,
+    };
+    assert(render_engine_execute_cpu_transition(out0, src_a, src_b, w, h, w * sizeof(uint32_t),
+                                                &p_leak));
+    uint32_t peak_rgb = 0U;
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t px = out0[i];
+        uint32_t r = (px >> 16) & 0xFFU;
+        uint32_t g = (px >> 8) & 0xFFU;
+        uint32_t b = px & 0xFFU;
+        if (r > peak_rgb)
+            peak_rgb = r;
+        if (g > peak_rgb)
+            peak_rgb = g;
+        if (b > peak_rgb)
+            peak_rgb = b;
+    }
+    assert(peak_rgb > 200U);
+    if (has_gpu) {
+        assert(gpu_compute_dispatch_transition_shm(gctx, tex_old, tex_new, tex_target, fbo, w, h,
+                                                   &p_leak, out_gpu));
+        assert(compute_rgb_psnr(out0, out_gpu, n) >= 42.0);
+    }
+
+    /* 4. SLIDE angle=0 direction sign (uv - dir * p pushes A right, B enters left). */
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            uint8_t r = (uint8_t)(20U + (x * 200U) / (w - 1U));
+            src_a[(size_t)y * w + x] = 0xFF000000U | ((uint32_t)r << 16) | 0x00001010U;
+            src_b[(size_t)y * w + x] = 0xFF1010FFU;
+        }
+    }
+    if (has_gpu) {
+        assert(gpu_compute_prepare_shm(gctx, &tex_old, &tex_new, &tex_target, &fbo, &cur_w, &cur_h,
+                                       w, h, src_a, src_b));
+    }
+    waywal_transition_params_t p_slide = {
+        .type = WAYWAL_TRANSITION_SLIDE,
+        .progress = 0.25f,
+        .angle_rad = 0.0f,
+        .bezier = BEZIER_LINEAR,
+    };
+    assert(render_engine_execute_cpu_transition(out0, src_a, src_b, w, h, w * sizeof(uint32_t),
+                                                &p_slide));
+    /* At progress=0.25 with angle=0, x=w*0.10 is in incoming src_b (blue), x=w*0.50 is src_a. */
+    assert((out0[(size_t)(h / 2U) * w + (w / 10U)] & 0xFFU) > 0xD0U);
+    assert(((out0[(size_t)(h / 2U) * w + (w / 2U)] >> 16) & 0xFFU) >
+           (out0[(size_t)(h / 2U) * w + (w / 2U)] & 0xFFU));
+    if (has_gpu) {
+        assert(gpu_compute_dispatch_transition_shm(gctx, tex_old, tex_new, tex_target, fbo, w, h,
+                                                   &p_slide, out_gpu));
+        assert(compute_rgb_psnr(out0, out_gpu, n) >= 42.0);
+    }
+
+    /* 5. RIPPLE circular pixel isotropy on 21:9 (840x360) and early progress 0.05 parity. */
+    const uint32_t rw = 840U, rh = 360U;
+    const size_t rn = (size_t)rw * rh;
+    uint32_t *ra = (uint32_t *)malloc(rn * sizeof(uint32_t));
+    uint32_t *rb = (uint32_t *)malloc(rn * sizeof(uint32_t));
+    uint32_t *rcpu = (uint32_t *)malloc(rn * sizeof(uint32_t));
+    uint32_t *rgpu = (uint32_t *)malloc(rn * sizeof(uint32_t));
+    assert(ra && rb && rcpu && rgpu);
+    fill_parity_images(ra, rb, rw, rh);
+    waywal_transition_params_t p_rip = {
+        .type = WAYWAL_TRANSITION_RIPPLE,
+        .progress = 0.05f,
+        .wave_freq = 16.0f,
+        .wave_amp = 0.06f,
+        .center_x = 0.5f,
+        .center_y = 0.5f,
+        .bezier = BEZIER_LINEAR,
+    };
+    assert(
+        render_engine_execute_cpu_transition(rcpu, ra, rb, rw, rh, rw * sizeof(uint32_t), &p_rip));
+    if (has_gpu) {
+        assert(gpu_compute_prepare_shm(gctx, &tex_old, &tex_new, &tex_target, &fbo, &cur_w, &cur_h,
+                                       rw, rh, ra, rb));
+        assert(gpu_compute_dispatch_transition_shm(gctx, tex_old, tex_new, tex_target, fbo, rw, rh,
+                                                   &p_rip, rgpu));
+        assert(compute_rgb_psnr(rcpu, rgpu, rn) >= 42.0);
+        p_rip.progress = 0.45f;
+        assert(render_engine_execute_cpu_transition(rcpu, ra, rb, rw, rh, rw * sizeof(uint32_t),
+                                                    &p_rip));
+        assert(gpu_compute_dispatch_transition_shm(gctx, tex_old, tex_new, tex_target, fbo, rw, rh,
+                                                   &p_rip, rgpu));
+        assert(compute_rgb_psnr(rcpu, rgpu, rn) >= 42.0);
+
+        /* Verify isotropic radial displacement/crest parity along +X vs +Y pixel axes on 21:9. */
+        const float cxp = 0.5f * (float)rw;
+        const float cyp = 0.5f * (float)rh;
+        for (uint32_t y = 0; y < rh; ++y) {
+            for (uint32_t x = 0; x < rw; ++x) {
+                float dx = ((float)x + 0.5f) - cxp;
+                float dy = ((float)y + 0.5f) - cyp;
+                float r = sqrtf(dx * dx + dy * dy);
+                uint32_t c = (uint32_t)(30.0f + 180.0f * (0.5f + 0.5f * sinf(r * 0.12f)));
+                ra[(size_t)y * rw + x] = 0xFF000000U | (c << 16) | (c << 8) | c;
+                rb[(size_t)y * rw + x] = 0xFF808080U;
+            }
+        }
+        assert(gpu_compute_prepare_shm(gctx, &tex_old, &tex_new, &tex_target, &fbo, &cur_w, &cur_h,
+                                       rw, rh, ra, rb));
+        p_rip.progress = 0.35f;
+        assert(render_engine_execute_cpu_transition(rcpu, ra, rb, rw, rh, rw * sizeof(uint32_t),
+                                                    &p_rip));
+        assert(gpu_compute_dispatch_transition_shm(gctx, tex_old, tex_new, tex_target, fbo, rw, rh,
+                                                   &p_rip, rgpu));
+        for (uint32_t d = 20U; d <= 100U; d += 20U) {
+            uint32_t gx = rgpu[(size_t)(rh / 2U) * rw + (rw / 2U + d)] & 0xFFU;
+            uint32_t gy = rgpu[(size_t)(rh / 2U + d) * rw + (rw / 2U)] & 0xFFU;
+            uint32_t cxv = rcpu[(size_t)(rh / 2U) * rw + (rw / 2U + d)] & 0xFFU;
+            uint32_t cyv = rcpu[(size_t)(rh / 2U + d) * rw + (rw / 2U)] & 0xFFU;
+            assert(abs((int)gx - (int)gy) <= 2);
+            assert(abs((int)cxv - (int)cyv) <= 2);
+            assert(abs((int)cxv - (int)gx) <= 4);
+        }
+
+        gpu_compute_release_shm_res(gctx, &tex_old, &tex_new, &tex_target, &fbo);
+    } else if (tex_old || tex_new || tex_target || fbo) {
+        gpu_compute_release_shm_res(gctx, &tex_old, &tex_new, &tex_target, &fbo);
+    }
+
+    free(rgpu);
+    free(rcpu);
+    free(rb);
+    free(ra);
+    if (re.gpu_ctx) {
+        render_engine_destroy(&re);
+    }
+    if (ctx.available) {
+        dmabuf_context_destroy(&ctx);
+    }
+    free(out_gpu);
+    free(out_neg);
+    free(out_half);
+    free(out0);
+    free(src_b);
+    free(src_a);
+
+    printf("[TEST] test_transition_aud_regressions PASSED.\n");
+}
+
+static int cmp_double_asc(const void *a, const void *b)
+{
+    double x = *(const double *)a;
+    double y = *(const double *)b;
+    return (x > y) - (x < y);
+}
+
+static uint32_t *alloc_4k_thp_buffer(size_t elem_count)
+{
+    const size_t raw_bytes = elem_count * sizeof(uint32_t);
+    const size_t huge_align = (size_t)2U << 20;
+    const size_t huge_bytes = (raw_bytes + huge_align - 1U) & ~(huge_align - 1U);
+    uint32_t *ptr = (uint32_t *)aligned_alloc(huge_align, huge_bytes);
+#ifdef MADV_HUGEPAGE
+    if (ptr) {
+        madvise(ptr, huge_bytes, MADV_HUGEPAGE);
+        return ptr;
+    }
+#endif
+    if (ptr) {
+        return ptr;
+    }
+    const size_t fallback_bytes = (raw_bytes + 63U) & ~(size_t)63U;
+    return (uint32_t *)aligned_alloc(64U, fallback_bytes);
+}
+
+#if defined(__linux__) && defined(_OPENMP)
+static int pick_physical_core_cpus(int *out_cpus, int max_out, cpu_set_t *out_orig_mask)
+{
+    CPU_ZERO(out_orig_mask);
+    if (sched_getaffinity(0, sizeof(*out_orig_mask), out_orig_mask) != 0) {
+        return 0;
+    }
+    char seen[64][64];
+    int count = 0;
+    int limit = max_out < 64 ? max_out : 64;
+    for (int cpu = 0; cpu < CPU_SETSIZE && count < limit; ++cpu) {
+        if (!CPU_ISSET(cpu, out_orig_mask)) {
+            continue;
+        }
+        char path[128];
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list",
+                 cpu);
+        FILE *fp = fopen(path, "r");
+        if (!fp) {
+            continue;
+        }
+        char sib[64];
+        bool ok = (fgets(sib, sizeof(sib), fp) != NULL);
+        fclose(fp);
+        if (!ok) {
+            continue;
+        }
+        bool dup = false;
+        for (int i = 0; i < count; ++i) {
+            if (strcmp(seen[i], sib) == 0) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            snprintf(seen[count], sizeof(seen[count]), "%s", sib);
+            out_cpus[count++] = cpu;
+        }
+    }
+    return count;
+}
+#endif
+
+static void test_4k_swirl_perf_gate(void)
+{
+    printf("[TEST] Running test_4k_swirl_perf_gate (3840x2160)...\n");
+
+    const uint32_t w = 3840U;
+    const uint32_t h = 2160U;
+    const size_t n = (size_t)w * h;
+    uint32_t *src_a = alloc_4k_thp_buffer(n);
+    uint32_t *src_b = alloc_4k_thp_buffer(n);
+    uint32_t *dst = alloc_4k_thp_buffer(n);
+    assert(src_a && src_b && dst);
+
+    for (size_t i = 0; i < n; ++i) {
+        src_a[i] = 0xFF102030U + (uint32_t)(i & 0xFFU);
+        src_b[i] = 0xFF405060U + (uint32_t)((i * 3U) & 0xFFU);
+        dst[i] = 0U;
+    }
+
+    waywal_transition_params_t params = {
+        .type = WAYWAL_TRANSITION_SWIRL,
+        .progress = 0.50f,
+        .center_x = 0.5f,
+        .center_y = 0.5f,
+        .bezier = BEZIER_LINEAR,
+    };
+
+    int prev_threads = 1;
+    int max_threads = 1;
+#ifdef _OPENMP
+    prev_threads = omp_get_max_threads();
+    if (!getenv("OMP_NUM_THREADS")) {
+        int np = omp_get_num_procs();
+        int target_t = (np >= 6 && np <= 12) ? 6 : np;
+        if (target_t > prev_threads) {
+            omp_set_num_threads(target_t);
+        }
+    }
+    max_threads = omp_get_max_threads();
+#endif
+
+#if defined(__linux__) && defined(_OPENMP)
+    bool pinned_physical = false;
+    cpu_set_t orig_affinity;
+    if (max_threads >= 6 && !getenv("OMP_PROC_BIND") && !getenv("OMP_PLACES")) {
+        int phys_cpus[64];
+        int phys_count = pick_physical_core_cpus(phys_cpus, max_threads, &orig_affinity);
+        if (phys_count >= max_threads) {
+            pinned_physical = true;
+#pragma omp parallel num_threads(max_threads)
+            {
+                int tid = omp_get_thread_num();
+                if (tid < phys_count) {
+                    cpu_set_t one;
+                    CPU_ZERO(&one);
+                    CPU_SET(phys_cpus[tid], &one);
+                    sched_setaffinity(0, sizeof(one), &one);
+                }
+            }
+        }
+    }
+#endif
+
+    /* Warmup 2 frames before timed median across [0.10, 0.90]. */
+    assert(render_engine_execute_cpu_transition(dst, src_a, src_b, w, h, w * sizeof(uint32_t),
+                                                &params));
+    assert(render_engine_execute_cpu_transition(dst, src_a, src_b, w, h, w * sizeof(uint32_t),
+                                                &params));
+
+    enum { SWIRL_RUNS = 11 };
+    double times_ms[SWIRL_RUNS];
+    for (int i = 0; i < SWIRL_RUNS; ++i) {
+        params.progress = 0.10f + 0.80f * ((float)i / (float)(SWIRL_RUNS - 1));
+        uint64_t t0 = get_time_ns();
+        assert(render_engine_execute_cpu_transition(dst, src_a, src_b, w, h, w * sizeof(uint32_t),
+                                                    &params));
+        uint64_t t1 = get_time_ns();
+        times_ms[i] = (double)(t1 - t0) * 1e-6;
+    }
+
+    qsort(times_ms, SWIRL_RUNS, sizeof(double), cmp_double_asc);
+    double p50_ms = times_ms[SWIRL_RUNS / 2];
+    double min_ms = times_ms[0];
+    double max_ms = times_ms[SWIRL_RUNS - 1];
+    assert_opaque_argb(dst, 256U);
+
+    waywal_transition_params_t fade_params = {
+        .type = WAYWAL_TRANSITION_FADE,
+        .progress = 0.50f,
+        .bezier = BEZIER_LINEAR,
+    };
+    assert(render_engine_execute_cpu_transition(dst, src_a, src_b, w, h, w * sizeof(uint32_t),
+                                                &fade_params));
+    double fade_times_ms[SWIRL_RUNS];
+    for (int i = 0; i < SWIRL_RUNS; ++i) {
+        uint64_t t0 = get_time_ns();
+        assert(render_engine_execute_cpu_transition(dst, src_a, src_b, w, h, w * sizeof(uint32_t),
+                                                    &fade_params));
+        uint64_t t1 = get_time_ns();
+        fade_times_ms[i] = (double)(t1 - t0) * 1e-6;
+    }
+    qsort(fade_times_ms, SWIRL_RUNS, sizeof(double), cmp_double_asc);
+    double fade_p50_ms = fade_times_ms[SWIRL_RUNS / 2];
+
+    printf("[BENCH] 4K CPU swirl (3840x2160, p in [0.10, 0.90], OMP=%d): p50=%.3f ms, min=%.3f "
+           "ms, max=%.3f ms (fade p50=%.3f ms)\n",
+           max_threads, p50_ms, min_ms, max_ms, fade_p50_ms);
+    printf("[PERF-002] 4K swirl p50=%.3f ms, fade p50=%.3f ms (%.2fx fade)\n", p50_ms, fade_p50_ms,
+           fade_p50_ms > 0.0 ? (p50_ms / fade_p50_ms) : 0.0);
+    fflush(stdout);
+
+#if defined(__linux__) && defined(_OPENMP)
+    if (pinned_physical) {
+#pragma omp parallel num_threads(max_threads)
+        {
+            sched_setaffinity(0, sizeof(orig_affinity), &orig_affinity);
+        }
+    }
+#endif
+
+#ifdef _OPENMP
+    omp_set_num_threads(prev_threads);
+#else
+    (void)prev_threads;
+#endif
+
+    bool strict_perf = false;
+#if defined(WWAL_PERF_GATES)
+    const char *env = getenv("WWAL_STRICT_PERF_ASSERTS");
+    strict_perf = (env == NULL || strcmp(env, "0") != 0);
+#else
+    const char *env = getenv("WWAL_STRICT_PERF_ASSERTS");
+    strict_perf = (env != NULL && strcmp(env, "1") == 0);
+#endif
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer) ||                           \
+    defined(__SANITIZE_THREAD__) || __has_feature(thread_sanitizer)
+    strict_perf = false;
+#endif
+    if (strict_perf && max_threads >= 6) {
+        assert(p50_ms <= 2.20 * fade_p50_ms);
+        assert(p50_ms <= 7.50);
+    } else {
+        assert(p50_ms < 250.0);
+    }
+
+    free(dst);
+    free(src_b);
+    free(src_a);
+    printf("[TEST] test_4k_swirl_perf_gate PASSED.\n");
+}
+
 int main(void)
 {
     waywal_log_set_level(WAYWAL_LOG_LEVEL_WARN);
@@ -1027,9 +1754,12 @@ int main(void)
     test_cpu_transitions();
     test_gpu_compute_transitions();
     test_cube_widescreen_geometry_and_gpu_parity();
+    test_all_18_gpu_vs_cpu_parity();
+    test_transition_aud_regressions();
     test_gpu_compute_nonlinear_and_upload_static();
     test_builtin_shader_presets_gles31();
     test_buffer_gated_transition_tick();
+    test_4k_swirl_perf_gate();
 
     printf("\n>>> ALL TRANSITIONS UNIT TESTS PASSED SUCCESSFULLY! <<<\n\n");
     return 0;
