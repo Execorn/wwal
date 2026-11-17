@@ -10,6 +10,7 @@
 #include <QComboBox>
 #include <QDoubleSpinBox>
 #include <QListWidget>
+#include <QPointer>
 #include <QPushButton>
 #include <QString>
 #include <QWidget>
@@ -18,12 +19,14 @@
 
 namespace waywal::studio {
 
+class OklchColorDialog;
+
 class CameraLightingInspectorWidget : public QWidget {
     Q_OBJECT
 
   public:
     explicit CameraLightingInspectorWidget(QWidget *parent = nullptr);
-    ~CameraLightingInspectorWidget() override = default;
+    ~CameraLightingInspectorWidget() override;
 
     void setCommandBus(CommandBus *bus) noexcept { m_commandBus = bus; }
     [[nodiscard]] CommandBus *commandBus() const noexcept { return m_commandBus; }
@@ -57,6 +60,7 @@ class CameraLightingInspectorWidget : public QWidget {
     void onParallaxControlChanged();
     void onKeyframeSelectionChanged();
     void onAddKeyframeClicked();
+    void onUpdateKeyframeClicked();
     void onRemoveKeyframeClicked();
     void onClearKeyframesClicked();
     void onLightSlotChanged(int index);
@@ -66,16 +70,24 @@ class CameraLightingInspectorWidget : public QWidget {
     void onPickSkyColor();
 
   private:
+    enum class ColorTarget { LightSlot, Ambient, Sky };
+
     void setupUi();
     void syncUiFromModel();
     void syncLightUiFromSlot(uint32_t slot);
     void updateKeyframeList();
     void updateColorButtonSwatches();
+    void closeActiveColorDialog();
+    void openAsyncColorDialog(const QString &title, ColorTarget target, uint32_t lightSlot);
     void commitChange(const we_camera3d_t &newCam, const we_lighting_uniforms_t &newLights);
+    void emitStateUpdated(const QString &output, const we_camera3d_t &cam,
+                          const we_lighting_uniforms_t &lights);
     void sendIpcUpdate(const QString &output, const we_camera3d_t &cam,
                        const we_lighting_uniforms_t &lights);
     static void populateDefaults(we_camera3d_t &cam, we_lighting_uniforms_t &lights);
     static void sanitizeAndEvaluateCamera(we_camera3d_t &cam);
+    static void sanitizeLighting(we_lighting_uniforms_t &lights,
+                                 bool clampUnusedSlotsToDisabled = false);
 
     QString m_targetOutput;
     we_camera3d_t m_camera{};
@@ -85,6 +97,7 @@ class CameraLightingInspectorWidget : public QWidget {
 
     CommandBus *m_commandBus{nullptr};
     IpcClient *m_ipcClient{nullptr};
+    QPointer<OklchColorDialog> m_activeColorDialog;
 
     // Camera Controls
     QComboBox *m_projModeCombo{nullptr};
@@ -116,7 +129,10 @@ class CameraLightingInspectorWidget : public QWidget {
     QCheckBox *m_pathEnableCheck{nullptr};
     QComboBox *m_loopModeCombo{nullptr};
     QDoubleSpinBox *m_kfTimeSpin{nullptr};
+    QDoubleSpinBox *m_kfApertureSpin{nullptr};
+    QDoubleSpinBox *m_kfTensionSpin{nullptr};
     QPushButton *m_addKfBtn{nullptr};
+    QPushButton *m_updateKfBtn{nullptr};
     QPushButton *m_removeKfBtn{nullptr};
     QPushButton *m_clearKfBtn{nullptr};
     QListWidget *m_keyframeList{nullptr};

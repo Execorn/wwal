@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "property_inspector_widget.hpp"
+#include "studio/core/preset_store.hpp"
 
 #include <QApplication>
 #include <QDateTime>
 #include <QDir>
 #include <QFileDialog>
-#include <QFile>
 #include <QFileInfo>
+#include <QFontMetrics>
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QInputDialog>
@@ -14,19 +15,147 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMenu>
-#include <QMessageBox>
 #include <QPointer>
 #include <QRegularExpression>
 #include <QScopedValueRollback>
 #include <QScrollBar>
 #include <QSet>
-#include <QStandardPaths>
 #include <QTextStream>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <limits>
+#include <memory>
 
 namespace waywal::studio {
+
+namespace {
+
+[[nodiscard]] float sanitizeFiniteFloat(float v, float fallback = 0.0f) noexcept
+{
+    return std::isfinite(v) ? v : fallback;
+}
+
+class SetTextPropertyCommand final : public ICommand {
+  public:
+    using ApplyFn =
+        std::function<void(const QString &output, const QString &name, const QString &text)>;
+
+    SetTextPropertyCommand(QString output, QString name, QString oldText, QString newText,
+                           bool coalescible, ApplyFn applyFn)
+        : m_output(std::move(output)), m_name(std::move(name)), m_oldText(std::move(oldText)),
+          m_newText(std::move(newText)), m_coalescible(coalescible), m_applyFn(std::move(applyFn)),
+          m_timestamp(std::chrono::steady_clock::now())
+    {
+    }
+
+    void execute() override
+    {
+        if (m_applyFn) {
+            m_applyFn(m_output, m_name, m_newText);
+        }
+    }
+
+    void undo() override
+    {
+        if (m_applyFn) {
+            m_applyFn(m_output, m_name, m_oldText);
+        }
+    }
+
+    QString describe() const override
+    {
+        return QStringLiteral("Edit text property '%1'").arg(m_name);
+    }
+
+    bool mergeWith(const ICommand *other) override
+    {
+        if (!m_coalescible) {
+            return false;
+        }
+        const auto *next = dynamic_cast<const SetTextPropertyCommand *>(other);
+        if (!next || !next->m_coalescible || next->m_name != m_name || next->m_output != m_output) {
+            return false;
+        }
+        const auto dt =
+            std::chrono::duration_cast<std::chrono::milliseconds>(next->m_timestamp - m_timestamp);
+        if (dt.count() > 500) {
+            return false;
+        }
+        m_newText = next->m_newText;
+        m_timestamp = next->m_timestamp;
+        return true;
+    }
+
+    [[nodiscard]] size_t memoryFootprint() const override
+    {
+        return sizeof(*this) + static_cast<size_t>(m_output.size() + m_name.size() +
+                                                   m_oldText.size() + m_newText.size()) *
+                                   sizeof(char16_t);
+    }
+
+  private:
+    QString m_output;
+    QString m_name;
+    QString m_oldText;
+    QString m_newText;
+    bool m_coalescible{false};
+    ApplyFn m_applyFn;
+    std::chrono::steady_clock::time_point m_timestamp;
+};
+
+class SetShaderComboCommand final : public ICommand {
+  public:
+    using ApplyFn = std::function<void(const QString &output, int32_t objectId, uint32_t passIndex,
+                                       const QString &comboName, int comboIdx, int32_t comboValue)>;
+
+    SetShaderComboCommand(QString output, int32_t objectId, uint32_t passIndex, QString comboName,
+                          int oldIdx, int32_t oldVal, int newIdx, int32_t newVal, ApplyFn applyFn)
+        : m_output(std::move(output)), m_objectId(objectId), m_passIndex(passIndex),
+          m_comboName(std::move(comboName)), m_oldIdx(oldIdx), m_oldVal(oldVal), m_newIdx(newIdx),
+          m_newVal(newVal), m_applyFn(std::move(applyFn))
+    {
+    }
+
+    void execute() override
+    {
+        if (m_applyFn) {
+            m_applyFn(m_output, m_objectId, m_passIndex, m_comboName, m_newIdx, m_newVal);
+        }
+    }
+
+    void undo() override
+    {
+        if (m_applyFn) {
+            m_applyFn(m_output, m_objectId, m_passIndex, m_comboName, m_oldIdx, m_oldVal);
+        }
+    }
+
+    QString describe() const override
+    {
+        return QStringLiteral("Set shader combo '%1'").arg(m_comboName);
+    }
+
+    bool mergeWith(const ICommand *other) override
+    {
+        (void)other;
+        return false;
+    }
+
+  private:
+    QString m_output;
+    int32_t m_objectId{-1};
+    uint32_t m_passIndex{0};
+    QString m_comboName;
+    int m_oldIdx{0};
+    int32_t m_oldVal{0};
+    int m_newIdx{0};
+    int32_t m_newVal{0};
+    ApplyFn m_applyFn;
+};
+
+} // namespace
 
 // =============================================================================
 // PropertyRowWidget Implementation
@@ -35,21 +164,86 @@ namespace waywal::studio {
 PropertyRowWidget::PropertyRowWidget(const InspectorProperty &prop, QWidget *parent)
     : QWidget(parent), m_prop(prop)
 {
+    if (!m_prop.hasRange) {
+        const size_t n = std::max<size_t>(1u, m_prop.numComponents);
+        m_prop.minValues.resize(n, 0.0f);
+        m_prop.maxValues.resize(n, 1.0f);
+        for (size_t i = 0; i < n; ++i) {
+            const float defVal = (i < m_prop.defaultValues.size())
+                                     ? sanitizeFiniteFloat(m_prop.defaultValues[i])
+                                     : 0.0f;
+            const float curVal = (i < m_prop.currentValues.size())
+                                     ? sanitizeFiniteFloat(m_prop.currentValues[i])
+                                     : defVal;
+            const float lo = std::min({0.0f, defVal, curVal});
+            const float hi = std::max({1.0f, defVal, curVal});
+            m_prop.minValues[i] = (lo < 0.0f) ? (lo * 2.0f) : 0.0f;
+            m_prop.maxValues[i] = (hi > 1.0f) ? (hi * 2.0f) : 1.0f;
+        }
+    }
     setupUi();
+}
+
+PropertyRowWidget::~PropertyRowWidget() { closeActiveColorDialog(); }
+
+void PropertyRowWidget::closeActiveColorDialog()
+{
+    if (!m_activeColorDialog) {
+        return;
+    }
+    QPointer<OklchColorDialog> dlg = m_activeColorDialog;
+    m_activeColorDialog.clear();
+    dlg->disconnect(this);
+    dlg->close();
+    dlg->deleteLater();
+}
+
+void PropertyRowWidget::updateColorSwatchVisual(const QColor &col)
+{
+    if (!m_colorSwatchBtn) {
+        return;
+    }
+    m_colorSwatchBtn->setStyleSheet(
+        QStringLiteral(
+            "QPushButton { background-color: %1; border: 1px solid #334155; border-radius: 4px; "
+            "min-width: 36px; min-height: 28px; } "
+            "QPushButton:focus { border: 2px solid #38BDF8; }")
+            .arg(col.name(QColor::HexRgb)));
 }
 
 void PropertyRowWidget::componentRange(int index, float &outMin, float &outMax) const noexcept
 {
-    outMin = (m_prop.hasRange && index >= 0 && index < static_cast<int>(m_prop.minValues.size()))
-                 ? m_prop.minValues[static_cast<size_t>(index)]
-                 : 0.0f;
-    const float defVal = (index >= 0 && index < static_cast<int>(m_prop.defaultValues.size()))
-                             ? m_prop.defaultValues[static_cast<size_t>(index)]
-                             : 1.0f;
-    outMax = (m_prop.hasRange && index >= 0 && index < static_cast<int>(m_prop.maxValues.size()))
-                 ? m_prop.maxValues[static_cast<size_t>(index)]
-                 : (defVal > 1.0f ? defVal * 2.0f : 1.0f);
-    if (outMax <= outMin) {
+    const float rawMin =
+        (index >= 0 && index < static_cast<int>(m_prop.minValues.size()))
+            ? sanitizeFiniteFloat(m_prop.minValues[static_cast<size_t>(index)], 0.0f)
+            : 0.0f;
+    const float defVal =
+        (index >= 0 && index < static_cast<int>(m_prop.defaultValues.size()))
+            ? sanitizeFiniteFloat(m_prop.defaultValues[static_cast<size_t>(index)], 1.0f)
+            : 1.0f;
+    const float rawMax =
+        (index >= 0 && index < static_cast<int>(m_prop.maxValues.size()))
+            ? sanitizeFiniteFloat(m_prop.maxValues[static_cast<size_t>(index)], 1.0f)
+            : (defVal > 1.0f ? defVal * 2.0f : 1.0f);
+
+    if (m_prop.hasRange) {
+        outMin = rawMin;
+        outMax = rawMax;
+    } else {
+        const float curVal =
+            (index >= 0 && index < static_cast<int>(m_prop.currentValues.size()))
+                ? sanitizeFiniteFloat(m_prop.currentValues[static_cast<size_t>(index)], defVal)
+                : defVal;
+        const float lo = std::min({rawMin, 0.0f, defVal, curVal});
+        const float hi = std::max({rawMax, 1.0f, defVal, curVal});
+        outMin = (lo < 0.0f) ? std::min(rawMin, lo) : 0.0f;
+        outMax = std::max(rawMax, hi);
+    }
+
+    if (!std::isfinite(outMin)) {
+        outMin = 0.0f;
+    }
+    if (!std::isfinite(outMax) || outMax <= outMin) {
         outMax = outMin + 1.0f;
     }
 }
@@ -57,23 +251,34 @@ void PropertyRowWidget::componentRange(int index, float &outMin, float &outMax) 
 void PropertyRowWidget::setupUi()
 {
     auto *rowLayout = new QHBoxLayout(this);
-    rowLayout->setContentsMargins(2, 2, 2, 2);
-    rowLayout->setSpacing(4);
+    rowLayout->setContentsMargins(2, 3, 2, 3);
+    rowLayout->setSpacing(6);
+
+    const QFontMetrics fm(font());
+    const int controlMinHeight = std::max(28, fm.height() + 10);
 
     // Property Label
     QString displayLabel = !m_prop.label.isEmpty() ? m_prop.label : m_prop.name;
     m_labelWidget = new QLabel(displayLabel, this);
-    m_labelWidget->setMinimumWidth(60);
-    m_labelWidget->setMaximumWidth(92);
+    m_labelWidget->setMinimumWidth(64);
+    m_labelWidget->setMaximumWidth(104);
     m_labelWidget->setWordWrap(true);
-    m_labelWidget->setStyleSheet("font-size: 10.5px; color: #c6d0f5;");
+    m_labelWidget->setStyleSheet("font-size: 11px; color: #F1F5F9;");
     m_labelWidget->setToolTip(
-        QString("<b>Uniform:</b> %1<br><b>Category:</b> %2").arg(m_prop.name).arg(m_prop.category));
+        QString("<b>Uniform:</b> %1<br><b>Category:</b> %2").arg(m_prop.name, m_prop.category));
     rowLayout->addWidget(m_labelWidget);
 
     auto *controlLayout = new QHBoxLayout();
     controlLayout->setContentsMargins(0, 0, 0, 0);
-    controlLayout->setSpacing(4);
+    controlLayout->setSpacing(6);
+
+    const QString inputCss =
+        QStringLiteral("background-color: #12141A; color: #F1F5F9; border: 1px solid #2D3340; "
+                       "border-radius: 4px; padding: 2px 6px; font-size: 12px;");
+    const QString spinCss = QStringLiteral(
+        "QDoubleSpinBox, QSpinBox { background-color: #12141A; color: #F1F5F9; "
+        "border: 1px solid #2D3340; border-radius: 4px; padding: 2px 4px; font-size: 12px; } "
+        "QDoubleSpinBox:focus, QSpinBox:focus { border: 2px solid #38BDF8; }");
 
     switch (m_prop.kind) {
     case InspectorProperty::Kind::Float: {
@@ -81,7 +286,7 @@ void PropertyRowWidget::setupUi()
         float maxVal = 1.0f;
         componentRange(0, minVal, maxVal);
 
-        float stepVal = m_prop.step > 0.0001f ? m_prop.step : 0.01f;
+        float stepVal = (std::isfinite(m_prop.step) && m_prop.step > 0.0001f) ? m_prop.step : 0.01f;
         int decimals = 2;
         if (stepVal < 0.001f)
             decimals = 4;
@@ -90,21 +295,30 @@ void PropertyRowWidget::setupUi()
 
         auto *slider = new QSlider(Qt::Horizontal, this);
         slider->setRange(0, 1000);
-        slider->setMinimumWidth(34);
-        float cur =
-            m_prop.currentValues.empty() ? m_prop.defaultValues[0] : m_prop.currentValues[0];
-        int sliderPos =
+        slider->setMinimumWidth(36);
+        slider->setMinimumHeight(controlMinHeight);
+        const float fallbackDef =
+            !m_prop.defaultValues.empty() ? sanitizeFiniteFloat(m_prop.defaultValues[0]) : 0.0f;
+        const float cur = m_prop.currentValues.empty()
+                              ? fallbackDef
+                              : sanitizeFiniteFloat(m_prop.currentValues[0], fallbackDef);
+        const int sliderPos =
             static_cast<int>(std::round(((cur - minVal) / (maxVal - minVal)) * 1000.0f));
         slider->setValue(std::clamp(sliderPos, 0, 1000));
 
         auto *spin = new QDoubleSpinBox(this);
-        spin->setRange(minVal, maxVal);
+        if (m_prop.hasRange) {
+            spin->setRange(minVal, maxVal);
+        } else {
+            spin->setRange(-1000000.0, 1000000.0);
+        }
         spin->setSingleStep(stepVal);
         spin->setDecimals(decimals);
+        spin->setKeyboardTracking(false);
         spin->setValue(cur);
-        spin->setFixedWidth(56);
-        spin->setFixedHeight(20);
-        spin->setStyleSheet("font-size: 10px; padding: 1px 2px;");
+        spin->setMinimumWidth(std::max(64, fm.horizontalAdvance(QStringLiteral("-999.99")) + 22));
+        spin->setMinimumHeight(controlMinHeight);
+        spin->setStyleSheet(spinCss);
 
         m_sliders.push_back(slider);
         m_spinBoxes.push_back(spin);
@@ -123,48 +337,60 @@ void PropertyRowWidget::setupUi()
     case InspectorProperty::Kind::Vec2:
     case InspectorProperty::Kind::Vec3:
     case InspectorProperty::Kind::Vec4: {
-        uint32_t count = m_prop.numComponents;
+        const uint32_t count = std::clamp<uint32_t>(m_prop.numComponents, 1u, 4u);
         const char *compNames[4] = {"X:", "Y:", "Z:", "W:"};
 
         auto *vecStack = new QVBoxLayout();
         vecStack->setContentsMargins(0, 0, 0, 0);
-        vecStack->setSpacing(2);
+        vecStack->setSpacing(4);
 
+        const int spinMinW = std::max(60, fm.horizontalAdvance(QStringLiteral("-999.99")) + 20);
         for (uint32_t i = 0; i < count; ++i) {
             float minVal = 0.0f;
             float maxVal = 1.0f;
             componentRange(static_cast<int>(i), minVal, maxVal);
-            float stepVal = m_prop.step > 0.0001f ? m_prop.step : 0.01f;
+            const float stepVal =
+                (std::isfinite(m_prop.step) && m_prop.step > 0.0001f) ? m_prop.step : 0.01f;
 
             auto *subLayout = new QHBoxLayout();
             subLayout->setContentsMargins(0, 0, 0, 0);
-            subLayout->setSpacing(3);
+            subLayout->setSpacing(4);
             auto *cLabel = new QLabel(compNames[i], this);
-            cLabel->setFixedWidth(14);
-            cLabel->setStyleSheet("color: #a5adce; font-weight: bold; font-size: 9.5px;");
+            cLabel->setMinimumWidth(std::max(18, fm.horizontalAdvance(QStringLiteral("W:")) + 2));
+            cLabel->setStyleSheet("color: #94A3B8; font-weight: bold; font-size: 11px;");
 
             auto *slider = new QSlider(Qt::Horizontal, this);
             slider->setRange(0, 1000);
-            slider->setMinimumWidth(28);
-            float cur = (i < m_prop.currentValues.size()) ? m_prop.currentValues[i]
-                                                          : m_prop.defaultValues[i];
-            int sliderPos =
+            slider->setMinimumWidth(32);
+            slider->setMinimumHeight(controlMinHeight);
+            const float fallbackDef = (i < m_prop.defaultValues.size())
+                                          ? sanitizeFiniteFloat(m_prop.defaultValues[i])
+                                          : 0.0f;
+            const float cur = (i < m_prop.currentValues.size())
+                                  ? sanitizeFiniteFloat(m_prop.currentValues[i], fallbackDef)
+                                  : fallbackDef;
+            const int sliderPos =
                 static_cast<int>(std::round(((cur - minVal) / (maxVal - minVal)) * 1000.0f));
             slider->setValue(std::clamp(sliderPos, 0, 1000));
 
             auto *spin = new QDoubleSpinBox(this);
-            spin->setRange(minVal, maxVal);
+            if (m_prop.hasRange) {
+                spin->setRange(minVal, maxVal);
+            } else {
+                spin->setRange(-1000000.0, 1000000.0);
+            }
             spin->setSingleStep(stepVal);
             spin->setDecimals(2);
+            spin->setKeyboardTracking(false);
             spin->setValue(cur);
-            spin->setFixedWidth(54);
-            spin->setFixedHeight(20);
-            spin->setStyleSheet("font-size: 10px; padding: 1px 2px;");
+            spin->setMinimumWidth(spinMinW);
+            spin->setMinimumHeight(controlMinHeight);
+            spin->setStyleSheet(spinCss);
 
             m_sliders.push_back(slider);
             m_spinBoxes.push_back(spin);
 
-            int compIdx = static_cast<int>(i);
+            const int compIdx = static_cast<int>(i);
             connect(slider, &QSlider::valueChanged, this,
                     [this, compIdx](int val) { onSliderValueChanged(compIdx, val); });
 
@@ -182,7 +408,11 @@ void PropertyRowWidget::setupUi()
 
     case InspectorProperty::Kind::Bool: {
         m_checkBox = new QCheckBox(tr("Enabled"), this);
-        bool checked = (!m_prop.currentValues.empty() && m_prop.currentValues[0] > 0.5f);
+        m_checkBox->setMinimumHeight(controlMinHeight);
+        m_checkBox->setStyleSheet(
+            "QCheckBox { color: #F1F5F9; font-size: 12px; spacing: 6px; } "
+            "QCheckBox:focus { outline: 2px solid #38BDF8; border-radius: 4px; }");
+        const bool checked = (!m_prop.currentValues.empty() && m_prop.currentValues[0] > 0.5f);
         m_checkBox->setChecked(checked);
         connect(m_checkBox, &QCheckBox::toggled, this, &PropertyRowWidget::onBoolToggled);
         controlLayout->addWidget(m_checkBox);
@@ -192,13 +422,27 @@ void PropertyRowWidget::setupUi()
 
     case InspectorProperty::Kind::Int: {
         m_intSpinBox = new QSpinBox(this);
-        int minVal = m_prop.hasRange ? static_cast<int>(m_prop.minValues[0]) : 0;
-        int maxVal = m_prop.hasRange ? static_cast<int>(m_prop.maxValues[0]) : 100;
+        int minVal = -1000000;
+        int maxVal = 1000000;
+        if (m_prop.hasRange && !m_prop.minValues.empty() && !m_prop.maxValues.empty() &&
+            std::isfinite(m_prop.minValues[0]) && std::isfinite(m_prop.maxValues[0]) &&
+            m_prop.maxValues[0] > m_prop.minValues[0]) {
+            minVal = static_cast<int>(std::lround(m_prop.minValues[0]));
+            maxVal = static_cast<int>(std::lround(m_prop.maxValues[0]));
+        }
         m_intSpinBox->setRange(minVal, maxVal);
-        int cur = !m_prop.currentValues.empty() ? static_cast<int>(m_prop.currentValues[0])
-                                                : static_cast<int>(m_prop.defaultValues[0]);
+        m_intSpinBox->setKeyboardTracking(false);
+        const int defInt =
+            !m_prop.defaultValues.empty()
+                ? static_cast<int>(std::lround(sanitizeFiniteFloat(m_prop.defaultValues[0])))
+                : 0;
+        const int cur = !m_prop.currentValues.empty()
+                            ? static_cast<int>(std::lround(sanitizeFiniteFloat(
+                                  m_prop.currentValues[0], static_cast<float>(defInt))))
+                            : defInt;
         m_intSpinBox->setValue(cur);
-        m_intSpinBox->setFixedHeight(20);
+        m_intSpinBox->setMinimumHeight(controlMinHeight);
+        m_intSpinBox->setStyleSheet(spinCss);
         connect(m_intSpinBox, qOverload<int>(&QSpinBox::valueChanged), this,
                 &PropertyRowWidget::onIntSpinChanged);
         controlLayout->addWidget(m_intSpinBox);
@@ -208,7 +452,12 @@ void PropertyRowWidget::setupUi()
 
     case InspectorProperty::Kind::Combo: {
         m_comboBox = new QComboBox(this);
-        m_comboBox->setMinimumWidth(64);
+        m_comboBox->setMinimumWidth(68);
+        m_comboBox->setMinimumHeight(controlMinHeight);
+        m_comboBox->setStyleSheet(
+            "QComboBox { background-color: #12141A; color: #F1F5F9; border: 1px solid #2D3340; "
+            "border-radius: 4px; padding: 2px 6px; font-size: 12px; } "
+            "QComboBox:focus { border: 2px solid #38BDF8; }");
         for (const auto &opt : m_prop.comboOptions) {
             m_comboBox->addItem(opt);
         }
@@ -222,25 +471,28 @@ void PropertyRowWidget::setupUi()
     }
 
     case InspectorProperty::Kind::Color: {
-        float r = (m_prop.currentValues.size() > 0) ? m_prop.currentValues[0] : 1.0f;
-        float g = (m_prop.currentValues.size() > 1) ? m_prop.currentValues[1] : 1.0f;
-        float b = (m_prop.currentValues.size() > 2) ? m_prop.currentValues[2] : 1.0f;
-        QColor curCol = QColor::fromRgbF(std::clamp(r, 0.0f, 1.0f), std::clamp(g, 0.0f, 1.0f),
-                                         std::clamp(b, 0.0f, 1.0f));
+        if (m_prop.currentValues.size() < 3) {
+            m_prop.currentValues.resize(3, 1.0f);
+        }
+        const float r = std::clamp(sanitizeFiniteFloat(m_prop.currentValues[0], 1.0f), 0.0f, 1.0f);
+        const float g = std::clamp(sanitizeFiniteFloat(m_prop.currentValues[1], 1.0f), 0.0f, 1.0f);
+        const float b = std::clamp(sanitizeFiniteFloat(m_prop.currentValues[2], 1.0f), 0.0f, 1.0f);
+        const QColor curCol = QColor::fromRgbF(r, g, b);
 
         m_colorSwatchBtn = new QPushButton(this);
-        m_colorSwatchBtn->setFixedSize(36, 24);
+        m_colorSwatchBtn->setMinimumSize(36, controlMinHeight);
         m_colorSwatchBtn->setCursor(Qt::PointingHandCursor);
         m_colorSwatchBtn->setToolTip(tr("Click to choose color"));
-        m_colorSwatchBtn->setStyleSheet(
-            QString("background-color: %1; border: 1px solid #2c3240; border-radius: 4px;")
-                .arg(curCol.name(QColor::HexRgb)));
+        updateColorSwatchVisual(curCol);
 
         m_hexEdit = new QLineEdit(curCol.name(QColor::HexRgb).toUpper(), this);
         m_hexEdit->setMaxLength(7);
-        m_hexEdit->setFixedWidth(68);
-        m_hexEdit->setFixedHeight(24);
-        m_hexEdit->setStyleSheet("font-size: 11px; padding: 2px 4px;");
+        m_hexEdit->setMinimumWidth(
+            std::max(72, fm.horizontalAdvance(QStringLiteral("#FFFFFF")) + 16));
+        m_hexEdit->setMinimumHeight(controlMinHeight);
+        m_hexEdit->setStyleSheet(
+            QStringLiteral("QLineEdit { %1 } QLineEdit:focus { border: 2px solid #38BDF8; }")
+                .arg(inputCss));
 
         connect(m_colorSwatchBtn, &QPushButton::clicked, this,
                 &PropertyRowWidget::onColorButtonClicked);
@@ -254,7 +506,11 @@ void PropertyRowWidget::setupUi()
 
     case InspectorProperty::Kind::Text: {
         m_textEdit = new QLineEdit(m_prop.textValue, this);
-        m_textEdit->setMinimumWidth(60);
+        m_textEdit->setMinimumWidth(68);
+        m_textEdit->setMinimumHeight(controlMinHeight);
+        m_textEdit->setStyleSheet(
+            QStringLiteral("QLineEdit { %1 } QLineEdit:focus { border: 2px solid #38BDF8; }")
+                .arg(inputCss));
         connect(m_textEdit, &QLineEdit::textEdited, this, &PropertyRowWidget::onTextEdited);
         controlLayout->addWidget(m_textEdit, 1);
         break;
@@ -272,14 +528,16 @@ void PropertyRowWidget::setupUi()
         m_audioBadgeButton = new QToolButton(this);
         m_audioBadgeButton->setObjectName(QStringLiteral("AudioBadge_%1").arg(m_prop.name));
         m_audioBadgeButton->setText(tr("Audio"));
-        m_audioBadgeButton->setFixedSize(40, 22);
+        const int badgeW = std::max(48, fm.horizontalAdvance(tr("Audio")) + 14);
+        m_audioBadgeButton->setMinimumSize(badgeW, controlMinHeight);
         m_audioBadgeButton->setToolTip(tr("Bind this uniform to live PipeWire Bark audio"));
         setAudioBound(m_audioBound);
         connect(m_audioBadgeButton, &QToolButton::clicked, this, [this]() {
             const float baseline =
                 !m_prop.currentValues.empty()
-                    ? m_prop.currentValues[0]
-                    : (!m_prop.defaultValues.empty() ? m_prop.defaultValues[0] : 0.0f);
+                    ? sanitizeFiniteFloat(m_prop.currentValues[0])
+                    : (!m_prop.defaultValues.empty() ? sanitizeFiniteFloat(m_prop.defaultValues[0])
+                                                     : 0.0f);
             emit audioBindingRequested(m_prop.name, baseline);
         });
         rowLayout->addWidget(m_audioBadgeButton);
@@ -288,12 +546,14 @@ void PropertyRowWidget::setupUi()
     // Reset-to-default button
     m_resetButton = new QToolButton(this);
     m_resetButton->setText(tr("Reset"));
-    m_resetButton->setFixedSize(44, 22);
+    const int resetW = std::max(48, fm.horizontalAdvance(tr("Reset")) + 14);
+    m_resetButton->setMinimumSize(resetW, controlMinHeight);
     m_resetButton->setToolTip(tr("Reset this parameter to default value"));
     m_resetButton->setStyleSheet(
-        "QToolButton { color: #94a3b8; font-size: 10px; background: #20242e; border: 1px solid "
-        "#2c3240; border-radius: 4px; padding: 1px 4px; } "
-        "QToolButton:hover { color: #f1f5f9; background: #2a303d; }");
+        "QToolButton { color: #94A3B8; font-size: 11px; background: #20242E; border: 1px solid "
+        "#2D3340; border-radius: 4px; padding: 2px 6px; } "
+        "QToolButton:hover { color: #F1F5F9; background: #2A303D; } "
+        "QToolButton:focus { border: 2px solid #38BDF8; }");
     connect(m_resetButton, &QToolButton::clicked, this, &PropertyRowWidget::resetToDefault);
     rowLayout->addWidget(m_resetButton);
 }
@@ -303,21 +563,39 @@ void PropertyRowWidget::syncSliderSpin(int index, float val, bool emitSignal)
     if (index < 0 || index >= static_cast<int>(m_prop.currentValues.size()))
         return;
 
+    const float finiteVal = sanitizeFiniteFloat(val);
     float minVal = 0.0f;
     float maxVal = 1.0f;
     componentRange(index, minVal, maxVal);
 
+    if (!m_prop.hasRange) {
+        // Expand visual slider bounds cleanly when external updates exceed the initial range.
+        if (finiteVal < minVal) {
+            minVal = (finiteVal < 0.0f) ? finiteVal * 1.5f : finiteVal;
+            if (static_cast<size_t>(index) < m_prop.minValues.size()) {
+                m_prop.minValues[static_cast<size_t>(index)] = minVal;
+            }
+        }
+        if (finiteVal > maxVal) {
+            maxVal = (finiteVal > 0.0f) ? finiteVal * 1.5f : finiteVal + 1.0f;
+            if (static_cast<size_t>(index) < m_prop.maxValues.size()) {
+                m_prop.maxValues[static_cast<size_t>(index)] = maxVal;
+            }
+        }
+    }
+
     {
         const QScopedValueRollback<bool> guard(m_updating, true);
-        m_prop.currentValues[static_cast<size_t>(index)] = val;
+        m_prop.currentValues[static_cast<size_t>(index)] = finiteVal;
 
         if (index < static_cast<int>(m_sliders.size())) {
-            int sliderPos =
-                static_cast<int>(std::round(((val - minVal) / (maxVal - minVal)) * 1000.0f));
+            const float span = std::max(1e-6f, maxVal - minVal);
+            const int sliderPos =
+                static_cast<int>(std::round(((finiteVal - minVal) / span) * 1000.0f));
             m_sliders[static_cast<size_t>(index)]->setValue(std::clamp(sliderPos, 0, 1000));
         }
         if (index < static_cast<int>(m_spinBoxes.size())) {
-            m_spinBoxes[static_cast<size_t>(index)]->setValue(val);
+            m_spinBoxes[static_cast<size_t>(index)]->setValue(finiteVal);
         }
     }
 
@@ -366,7 +644,7 @@ void PropertyRowWidget::onIntSpinChanged(int val)
 
 void PropertyRowWidget::onComboIndexChanged(int idx)
 {
-    if (m_updating)
+    if (m_updating || idx < 0)
         return;
     m_prop.comboIndex = idx;
     if (m_prop.currentValues.empty())
@@ -377,50 +655,92 @@ void PropertyRowWidget::onComboIndexChanged(int idx)
 
 void PropertyRowWidget::onColorButtonClicked()
 {
-    float r = (m_prop.currentValues.size() > 0) ? m_prop.currentValues[0] : 1.0f;
-    float g = (m_prop.currentValues.size() > 1) ? m_prop.currentValues[1] : 1.0f;
-    float b = (m_prop.currentValues.size() > 2) ? m_prop.currentValues[2] : 1.0f;
-    QColor initCol = QColor::fromRgbF(std::clamp(r, 0.0f, 1.0f), std::clamp(g, 0.0f, 1.0f),
-                                      std::clamp(b, 0.0f, 1.0f));
+    closeActiveColorDialog();
 
-    OklchColorDialog dlg(initCol, this);
-    dlg.setWindowTitle(
+    const float r = (m_prop.currentValues.size() > 0)
+                        ? std::clamp(sanitizeFiniteFloat(m_prop.currentValues[0], 1.0f), 0.0f, 1.0f)
+                        : 1.0f;
+    const float g = (m_prop.currentValues.size() > 1)
+                        ? std::clamp(sanitizeFiniteFloat(m_prop.currentValues[1], 1.0f), 0.0f, 1.0f)
+                        : 1.0f;
+    const float b = (m_prop.currentValues.size() > 2)
+                        ? std::clamp(sanitizeFiniteFloat(m_prop.currentValues[2], 1.0f), 0.0f, 1.0f)
+                        : 1.0f;
+    const QColor initCol = QColor::fromRgbF(r, g, b);
+
+    auto *dlg = new OklchColorDialog(initCol, this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose, true);
+    dlg->setModal(false);
+    dlg->setWindowTitle(
         tr("Pick Color - %1").arg(m_prop.label.isEmpty() ? m_prop.name : m_prop.label));
+    m_activeColorDialog = dlg;
 
-    // Connect live changes to stream parameters while dragging in color picker
-    connect(&dlg, &OklchColorDialog::colorChanged, this, [this](const QColor &newCol) {
-        if (m_prop.currentValues.size() < 3)
-            m_prop.currentValues.resize(3);
-        m_prop.currentValues[0] = newCol.redF();
-        m_prop.currentValues[1] = newCol.greenF();
-        m_prop.currentValues[2] = newCol.blueF();
+    QPointer<PropertyRowWidget> self(this);
+    QPointer<OklchColorDialog> dlgPtr(dlg);
 
-        if (m_colorSwatchBtn) {
-            m_colorSwatchBtn->setStyleSheet(
-                QString("background-color: %1; border: 1px solid #2c3240; border-radius: 4px;")
-                    .arg(newCol.name(QColor::HexRgb)));
+    connect(dlg, &OklchColorDialog::colorChanged, this, [self, dlgPtr](const QColor &newCol) {
+        if (!self || !dlgPtr || self->m_activeColorDialog != dlgPtr) {
+            return;
         }
-        if (m_hexEdit) {
-            m_hexEdit->setText(newCol.name(QColor::HexRgb).toUpper());
+        if (self->m_prop.currentValues.size() < 3) {
+            self->m_prop.currentValues.resize(3, 1.0f);
         }
-        emitChange();
+        self->m_prop.currentValues[0] = std::clamp(static_cast<float>(newCol.redF()), 0.0f, 1.0f);
+        self->m_prop.currentValues[1] = std::clamp(static_cast<float>(newCol.greenF()), 0.0f, 1.0f);
+        self->m_prop.currentValues[2] = std::clamp(static_cast<float>(newCol.blueF()), 0.0f, 1.0f);
+
+        self->updateColorSwatchVisual(newCol);
+        if (self->m_hexEdit) {
+            self->m_hexEdit->setText(newCol.name(QColor::HexRgb).toUpper());
+        }
+        self->emitChange();
     });
 
-    if (dlg.exec() == QDialog::Rejected) {
-        // Restore initial color on cancel
-        m_prop.currentValues[0] = initCol.redF();
-        m_prop.currentValues[1] = initCol.greenF();
-        m_prop.currentValues[2] = initCol.blueF();
-        if (m_colorSwatchBtn) {
-            m_colorSwatchBtn->setStyleSheet(
-                QString("background-color: %1; border: 1px solid #2c3240; border-radius: 4px;")
-                    .arg(initCol.name(QColor::HexRgb)));
+    connect(dlg, &QDialog::accepted, this, [self, dlgPtr]() {
+        if (!self || !dlgPtr) {
+            return;
         }
-        if (m_hexEdit) {
-            m_hexEdit->setText(initCol.name(QColor::HexRgb).toUpper());
+        if (self->m_activeColorDialog == dlgPtr) {
+            self->m_activeColorDialog.clear();
         }
-        emitChange();
-    }
+        const QColor finalCol = dlgPtr->currentColor();
+        if (self->m_prop.currentValues.size() < 3) {
+            self->m_prop.currentValues.resize(3, 1.0f);
+        }
+        self->m_prop.currentValues[0] = std::clamp(static_cast<float>(finalCol.redF()), 0.0f, 1.0f);
+        self->m_prop.currentValues[1] =
+            std::clamp(static_cast<float>(finalCol.greenF()), 0.0f, 1.0f);
+        self->m_prop.currentValues[2] =
+            std::clamp(static_cast<float>(finalCol.blueF()), 0.0f, 1.0f);
+        self->updateColorSwatchVisual(finalCol);
+        if (self->m_hexEdit) {
+            self->m_hexEdit->setText(finalCol.name(QColor::HexRgb).toUpper());
+        }
+        self->emitChange();
+    });
+
+    connect(dlg, &QDialog::rejected, this, [self, dlgPtr, initCol]() {
+        if (!self) {
+            return;
+        }
+        if (self->m_activeColorDialog == dlgPtr) {
+            self->m_activeColorDialog.clear();
+        }
+        if (self->m_prop.currentValues.size() < 3) {
+            self->m_prop.currentValues.resize(3, 1.0f);
+        }
+        self->m_prop.currentValues[0] = std::clamp(static_cast<float>(initCol.redF()), 0.0f, 1.0f);
+        self->m_prop.currentValues[1] =
+            std::clamp(static_cast<float>(initCol.greenF()), 0.0f, 1.0f);
+        self->m_prop.currentValues[2] = std::clamp(static_cast<float>(initCol.blueF()), 0.0f, 1.0f);
+        self->updateColorSwatchVisual(initCol);
+        if (self->m_hexEdit) {
+            self->m_hexEdit->setText(initCol.name(QColor::HexRgb).toUpper());
+        }
+        self->emitChange();
+    });
+
+    dlg->show();
 }
 
 void PropertyRowWidget::onHexEdited(const QString &text)
@@ -431,18 +751,14 @@ void PropertyRowWidget::onHexEdited(const QString &text)
     if (!cleaned.startsWith('#'))
         cleaned.prepend('#');
     if (QColor::isValidColorName(cleaned)) {
-        QColor col(cleaned);
+        const QColor col(cleaned);
         if (m_prop.currentValues.size() < 3)
-            m_prop.currentValues.resize(3);
-        m_prop.currentValues[0] = col.redF();
-        m_prop.currentValues[1] = col.greenF();
-        m_prop.currentValues[2] = col.blueF();
+            m_prop.currentValues.resize(3, 1.0f);
+        m_prop.currentValues[0] = std::clamp(static_cast<float>(col.redF()), 0.0f, 1.0f);
+        m_prop.currentValues[1] = std::clamp(static_cast<float>(col.greenF()), 0.0f, 1.0f);
+        m_prop.currentValues[2] = std::clamp(static_cast<float>(col.blueF()), 0.0f, 1.0f);
 
-        if (m_colorSwatchBtn) {
-            m_colorSwatchBtn->setStyleSheet(
-                QString("background-color: %1; border: 1px solid #2c3240; border-radius: 4px;")
-                    .arg(col.name(QColor::HexRgb)));
-        }
+        updateColorSwatchVisual(col);
         emitChange();
     }
 }
@@ -452,8 +768,9 @@ void PropertyRowWidget::onTextEdited(const QString &text)
     if (m_updating)
         return;
     m_prop.textValue = text;
-    // Dispatches notification for text properties
-    emitChange();
+    m_nextTextEditCoalescible = true;
+    emit textValueChanged(m_prop.name, text);
+    m_nextTextEditCoalescible = false;
 }
 
 void PropertyRowWidget::emitChange()
@@ -463,36 +780,46 @@ void PropertyRowWidget::emitChange()
 
 void PropertyRowWidget::updateValues(const std::vector<float> &vals, bool emitSignal)
 {
+    if (m_prop.kind == InspectorProperty::Kind::Text) {
+        return;
+    }
+
+    std::vector<float> sanitized = vals;
+    for (size_t i = 0; i < sanitized.size(); ++i) {
+        const float def =
+            (i < m_prop.defaultValues.size()) ? sanitizeFiniteFloat(m_prop.defaultValues[i]) : 0.0f;
+        sanitized[i] = sanitizeFiniteFloat(sanitized[i], def);
+    }
+
     {
         const QScopedValueRollback<bool> guard(m_updating, true);
-        m_prop.currentValues = vals;
+        m_prop.currentValues = sanitized;
 
-        if (m_prop.kind == InspectorProperty::Kind::Float && !vals.empty()) {
-            syncSliderSpin(0, vals[0], false);
-        } else if (m_prop.kind == InspectorProperty::Kind::Bool && !vals.empty()) {
+        if (m_prop.kind == InspectorProperty::Kind::Float && !sanitized.empty()) {
+            syncSliderSpin(0, sanitized[0], false);
+        } else if (m_prop.kind == InspectorProperty::Kind::Bool && !sanitized.empty()) {
             if (m_checkBox)
-                m_checkBox->setChecked(vals[0] > 0.5f);
-        } else if (m_prop.kind == InspectorProperty::Kind::Int && !vals.empty()) {
+                m_checkBox->setChecked(sanitized[0] > 0.5f);
+        } else if (m_prop.kind == InspectorProperty::Kind::Int && !sanitized.empty()) {
             if (m_intSpinBox)
-                m_intSpinBox->setValue(static_cast<int>(vals[0]));
-        } else if (m_prop.kind == InspectorProperty::Kind::Combo && !vals.empty()) {
-            if (m_comboBox)
-                m_comboBox->setCurrentIndex(static_cast<int>(vals[0]));
-        } else if (m_prop.kind == InspectorProperty::Kind::Color && vals.size() >= 3) {
-            QColor col =
-                QColor::fromRgbF(std::clamp(vals[0], 0.0f, 1.0f), std::clamp(vals[1], 0.0f, 1.0f),
-                                 std::clamp(vals[2], 0.0f, 1.0f));
-            if (m_colorSwatchBtn) {
-                m_colorSwatchBtn->setStyleSheet(
-                    QString("background-color: %1; border: 1px solid #2c3240; border-radius: 4px;")
-                        .arg(col.name(QColor::HexRgb)));
+                m_intSpinBox->setValue(static_cast<int>(std::lround(sanitized[0])));
+        } else if (m_prop.kind == InspectorProperty::Kind::Combo && !sanitized.empty()) {
+            const int idx = static_cast<int>(std::lround(sanitized[0]));
+            if (m_comboBox && idx >= 0 && idx < m_comboBox->count()) {
+                m_prop.comboIndex = idx;
+                m_comboBox->setCurrentIndex(idx);
             }
+        } else if (m_prop.kind == InspectorProperty::Kind::Color && sanitized.size() >= 3) {
+            const QColor col = QColor::fromRgbF(std::clamp(sanitized[0], 0.0f, 1.0f),
+                                                std::clamp(sanitized[1], 0.0f, 1.0f),
+                                                std::clamp(sanitized[2], 0.0f, 1.0f));
+            updateColorSwatchVisual(col);
             if (m_hexEdit) {
                 m_hexEdit->setText(col.name(QColor::HexRgb).toUpper());
             }
         } else {
-            for (size_t i = 0; i < vals.size() && i < m_sliders.size(); ++i) {
-                syncSliderSpin(static_cast<int>(i), vals[i], false);
+            for (size_t i = 0; i < sanitized.size() && i < m_sliders.size(); ++i) {
+                syncSliderSpin(static_cast<int>(i), sanitized[i], false);
             }
         }
     }
@@ -502,7 +829,34 @@ void PropertyRowWidget::updateValues(const std::vector<float> &vals, bool emitSi
     }
 }
 
-void PropertyRowWidget::resetToDefault() { updateValues(m_prop.defaultValues); }
+void PropertyRowWidget::updateTextValue(const QString &text, bool emitSignal)
+{
+    if (m_prop.kind != InspectorProperty::Kind::Text) {
+        return;
+    }
+
+    {
+        const QScopedValueRollback<bool> guard(m_updating, true);
+        m_prop.textValue = text;
+        if (m_textEdit && m_textEdit->text() != text) {
+            m_textEdit->setText(text);
+        }
+    }
+
+    m_nextTextEditCoalescible = false;
+    if (emitSignal) {
+        emit textValueChanged(m_prop.name, text);
+    }
+}
+
+void PropertyRowWidget::resetToDefault()
+{
+    if (m_prop.kind == InspectorProperty::Kind::Text) {
+        updateTextValue(m_prop.defaultTextValue, true);
+        return;
+    }
+    updateValues(m_prop.defaultValues);
+}
 
 void PropertyRowWidget::setFilterVisible(bool visible) { setVisible(visible); }
 
@@ -514,14 +868,16 @@ void PropertyRowWidget::setAudioBound(bool bound)
     }
     if (bound) {
         m_audioBadgeButton->setStyleSheet(
-            "QToolButton { color: #12141a; font-size: 9.5px; font-weight: bold; background: "
-            "#38bdf8; border: 1px solid #38bdf8; border-radius: 4px; padding: 1px 4px; } "
-            "QToolButton:hover { background: #7dd3fc; }");
+            "QToolButton { color: #0F172A; font-size: 11px; font-weight: bold; background: "
+            "#38BDF8; border: 1px solid #38BDF8; border-radius: 4px; padding: 2px 6px; } "
+            "QToolButton:hover { background: #7DD3FC; } "
+            "QToolButton:focus { border: 2px solid #F1F5F9; }");
     } else {
         m_audioBadgeButton->setStyleSheet(
-            "QToolButton { color: #94a3b8; font-size: 9.5px; background: #181b22; border: 1px "
-            "solid #2c3240; border-radius: 4px; padding: 1px 4px; } "
-            "QToolButton:hover { color: #38bdf8; border-color: #38bdf8; }");
+            "QToolButton { color: #94A3B8; font-size: 11px; background: #181B22; border: 1px "
+            "solid #2D3340; border-radius: 4px; padding: 2px 6px; } "
+            "QToolButton:hover { color: #38BDF8; border-color: #38BDF8; } "
+            "QToolButton:focus { border: 2px solid #38BDF8; }");
     }
 }
 
@@ -535,8 +891,23 @@ PropertyInspectorWidget::PropertyInspectorWidget(QWidget *parent) : QWidget(pare
     populateDefaultSceneParameters();
 }
 
+PropertyInspectorWidget::~PropertyInspectorWidget() { closeActivePresetPopups(); }
+
 void PropertyInspectorWidget::setupUi()
 {
+    setStyleSheet(
+        "PropertyInspectorWidget { background-color: #12141A; color: #F1F5F9; font-size: 12px; } "
+        "QLineEdit { background-color: #12141A; color: #F1F5F9; border: 1px solid #2D3340; "
+        "border-radius: 4px; padding: 3px 8px; font-size: 12px; } "
+        "QLineEdit:focus { border: 2px solid #38BDF8; } "
+        "QPushButton { background-color: #20242E; color: #F1F5F9; border: 1px solid #2D3340; "
+        "padding: 4px 10px; border-radius: 5px; font-size: 12px; } "
+        "QPushButton:hover { background-color: #2A303D; } "
+        "QPushButton:focus { border: 2px solid #38BDF8; }");
+
+    const QFontMetrics fm(font());
+    const int btnMinH = std::max(28, fm.height() + 10);
+
     auto *rootLayout = new QVBoxLayout(this);
     rootLayout->setContentsMargins(10, 8, 10, 8);
     rootLayout->setSpacing(8);
@@ -544,7 +915,7 @@ void PropertyInspectorWidget::setupUi()
     // --- Header Card ---
     auto *headerWidget = new QWidget(this);
     headerWidget->setStyleSheet(
-        "background: #181b22; border: 1px solid #2c3240; border-radius: 6px;");
+        "background: #181B22; border: 1px solid #2D3340; border-radius: 6px;");
     auto *headerLayout = new QVBoxLayout(headerWidget);
     headerLayout->setContentsMargins(10, 8, 10, 8);
     headerLayout->setSpacing(4);
@@ -554,11 +925,11 @@ void PropertyInspectorWidget::setupUi()
     m_titleLabel = new QLabel(m_currentTitle, headerWidget);
     m_titleLabel->setMinimumWidth(60);
     m_titleLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-    m_titleLabel->setStyleSheet("font-size: 13px; font-weight: bold; color: #f1f5f9;");
+    m_titleLabel->setStyleSheet("font-size: 13px; font-weight: bold; color: #F1F5F9;");
 
     m_typeBadge = new QLabel(m_currentType, headerWidget);
-    m_typeBadge->setStyleSheet("background: #0284c7; color: #ffffff; font-weight: bold; "
-                               "border-radius: 4px; padding: 2px 8px; font-size: 10px;");
+    m_typeBadge->setStyleSheet("background: #0284C7; color: #F8FAFC; font-weight: bold; "
+                               "border-radius: 4px; padding: 2px 8px; font-size: 11px;");
 
     topRow->addWidget(m_titleLabel, 1);
     topRow->addWidget(m_typeBadge, 0);
@@ -567,7 +938,7 @@ void PropertyInspectorWidget::setupUi()
     m_authorLabel = new QLabel(headerWidget);
     m_authorLabel->setMinimumWidth(50);
     m_authorLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-    m_authorLabel->setStyleSheet("color: #94a3b8; font-size: 11px;");
+    m_authorLabel->setStyleSheet("color: #94A3B8; font-size: 11px;");
     m_authorLabel->setVisible(false);
     headerLayout->addWidget(m_authorLabel);
 
@@ -577,7 +948,7 @@ void PropertyInspectorWidget::setupUi()
     m_filterEdit = new QLineEdit(this);
     m_filterEdit->setPlaceholderText(tr("Filter parameters..."));
     m_filterEdit->setClearButtonEnabled(true);
-    m_filterEdit->setFixedHeight(26);
+    m_filterEdit->setMinimumHeight(btnMinH);
     connect(m_filterEdit, &QLineEdit::textChanged, this,
             &PropertyInspectorWidget::onFilterTextChanged);
     rootLayout->addWidget(m_filterEdit);
@@ -587,31 +958,27 @@ void PropertyInspectorWidget::setupUi()
     toolBar->setSpacing(8);
 
     m_btnSavePreset = new QPushButton(tr("Save"), this);
-    m_btnSavePreset->setFixedHeight(26);
+    m_btnSavePreset->setMinimumSize(std::max(56, fm.horizontalAdvance(tr("Save")) + 20), btnMinH);
     m_btnSavePreset->setToolTip(tr("Save current parameters as a named preset"));
-    m_btnSavePreset->setStyleSheet(
-        "background: #20242e; color: #f1f5f9; border: 1px solid #2c3240; padding: 4px 10px; "
-        "border-radius: 5px; font-size: 11px;");
     connect(m_btnSavePreset, &QPushButton::clicked, this,
             &PropertyInspectorWidget::onSavePresetClicked);
     toolBar->addWidget(m_btnSavePreset, 1);
 
     m_btnLoadPreset = new QPushButton(tr("Load"), this);
-    m_btnLoadPreset->setFixedHeight(26);
+    m_btnLoadPreset->setMinimumSize(std::max(56, fm.horizontalAdvance(tr("Load")) + 20), btnMinH);
     m_btnLoadPreset->setToolTip(tr("Load parameters from a saved preset"));
-    m_btnLoadPreset->setStyleSheet(
-        "background: #20242e; color: #f1f5f9; border: 1px solid #2c3240; padding: 4px 10px; "
-        "border-radius: 5px; font-size: 11px;");
     connect(m_btnLoadPreset, &QPushButton::clicked, this,
             &PropertyInspectorWidget::onLoadPresetClicked);
     toolBar->addWidget(m_btnLoadPreset, 1);
 
     m_btnResetAll = new QPushButton(tr("Reset"), this);
-    m_btnResetAll->setFixedHeight(26);
+    m_btnResetAll->setMinimumSize(std::max(56, fm.horizontalAdvance(tr("Reset")) + 20), btnMinH);
     m_btnResetAll->setToolTip(tr("Reset all parameters to their default values"));
     m_btnResetAll->setStyleSheet(
-        "background: #20242e; color: #f87171; border: 1px solid #2c3240; padding: 4px 10px; "
-        "border-radius: 5px; font-size: 11px;");
+        "QPushButton { background: #20242E; color: #FCA5A5; border: 1px solid #2D3340; "
+        "padding: 4px 10px; border-radius: 5px; font-size: 12px; } "
+        "QPushButton:hover { background: #2A303D; } "
+        "QPushButton:focus { border: 2px solid #38BDF8; }");
     connect(m_btnResetAll, &QPushButton::clicked, this,
             &PropertyInspectorWidget::resetAllToDefaults);
     toolBar->addWidget(m_btnResetAll, 1);
@@ -762,6 +1129,8 @@ void PropertyInspectorWidget::clear()
 {
     m_properties.clear();
     m_rowWidgets.clear();
+    m_categorySections.clear();
+    m_emptyFilterLabel = nullptr;
 
     QLayoutItem *item = nullptr;
     while ((item = m_containerLayout->takeAt(0)) != nullptr) {
@@ -799,8 +1168,8 @@ void PropertyInspectorWidget::setWallpaperEngineProject(const we_project_t &proj
 
     m_titleLabel->setText(m_currentTitle);
     m_typeBadge->setText(m_currentType);
-    m_typeBadge->setStyleSheet("background: #a6d189; color: #1e1e2e; font-weight: bold; "
-                               "border-radius: 3px; padding: 2px 6px; font-size: 11px;");
+    m_typeBadge->setStyleSheet("background: #A6D189; color: #0F172A; font-weight: bold; "
+                               "border-radius: 4px; padding: 2px 8px; font-size: 11px;");
 
     for (uint32_t i = 0; i < proj.prop_count && i < WE_MAX_USER_PROPS; ++i) {
         const we_user_prop_t &p = proj.props[i];
@@ -811,7 +1180,8 @@ void PropertyInspectorWidget::setWallpaperEngineProject(const we_project_t &proj
         if (prop.label.isEmpty())
             prop.label = prop.name;
         prop.category = deduceCategory(prop.name, prop.label);
-        prop.numComponents = p.num_components > 0 ? p.num_components : 1;
+        prop.numComponents =
+            std::clamp<uint32_t>(p.num_components > 0 ? p.num_components : 1u, 1u, 4u);
 
         prop.currentValues.resize(prop.numComponents);
         prop.defaultValues.resize(prop.numComponents);
@@ -819,31 +1189,36 @@ void PropertyInspectorWidget::setWallpaperEngineProject(const we_project_t &proj
         prop.maxValues.resize(prop.numComponents, 1.0f);
 
         for (uint32_t c = 0; c < prop.numComponents; ++c) {
-            prop.currentValues[c] = p.val[c];
-            prop.defaultValues[c] = p.val[c];
+            const float finiteVal = sanitizeFiniteFloat(p.val[c]);
+            prop.currentValues[c] = finiteVal;
+            prop.defaultValues[c] = finiteVal;
         }
 
         switch (p.type) {
-        case WE_PROP_FLOAT:
+        case WE_PROP_FLOAT: {
             prop.kind = InspectorProperty::Kind::Float;
-            if (prop.defaultValues[0] > 1.0f) {
-                prop.maxValues[0] = std::max(10.0f, prop.defaultValues[0] * 2.0f);
-            }
+            const float def = prop.defaultValues[0];
+            prop.minValues[0] = (def < 0.0f) ? std::min(-1.0f, def * 2.0f) : 0.0f;
+            prop.maxValues[0] = (def > 1.0f) ? std::max(10.0f, def * 2.0f) : 1.0f;
             break;
+        }
         case WE_PROP_BOOL:
             prop.kind = InspectorProperty::Kind::Bool;
             break;
-        case WE_PROP_INT:
+        case WE_PROP_INT: {
             prop.kind = InspectorProperty::Kind::Int;
-            prop.maxValues[0] = std::max(100.0f, prop.defaultValues[0] * 2.0f);
+            const float def = prop.defaultValues[0];
+            prop.minValues[0] = (def < 0.0f) ? std::min(-10.0f, def * 2.0f) : 0.0f;
+            prop.maxValues[0] = (def > 0.0f) ? std::max(100.0f, def * 2.0f) : 100.0f;
             break;
+        }
         case WE_PROP_COLOR:
             prop.kind = InspectorProperty::Kind::Color;
             prop.numComponents = 3;
-            if (prop.currentValues.size() < 3)
-                prop.currentValues.resize(3, 1.0f);
-            if (prop.defaultValues.size() < 3)
-                prop.defaultValues.resize(3, 1.0f);
+            prop.currentValues.resize(3, 1.0f);
+            prop.defaultValues.resize(3, 1.0f);
+            prop.minValues.resize(3, 0.0f);
+            prop.maxValues.resize(3, 1.0f);
             break;
         case WE_PROP_TEXT:
             prop.kind = InspectorProperty::Kind::Text;
@@ -887,8 +1262,9 @@ void PropertyInspectorWidget::setShaderMetadata(const waywal_shader_meta_t &meta
         if (prop.label.isEmpty())
             prop.label = prop.name;
         prop.category = deduceCategory(prop.name, prop.label);
-        prop.numComponents = u.num_components > 0 ? u.num_components : 1;
-        prop.step = u.step > 0.0001f ? u.step : 0.01f;
+        prop.numComponents =
+            std::clamp<uint32_t>(u.num_components > 0 ? u.num_components : 1u, 1u, 4u);
+        prop.step = (std::isfinite(u.step) && u.step > 0.0001f) ? u.step : 0.01f;
         prop.hasRange = u.has_range;
 
         prop.currentValues.resize(prop.numComponents);
@@ -897,10 +1273,11 @@ void PropertyInspectorWidget::setShaderMetadata(const waywal_shader_meta_t &meta
         prop.maxValues.resize(prop.numComponents);
 
         for (uint32_t c = 0; c < prop.numComponents; ++c) {
-            prop.currentValues[c] = u.default_val[c];
-            prop.defaultValues[c] = u.default_val[c];
-            prop.minValues[c] = u.min_val[c];
-            prop.maxValues[c] = u.max_val[c];
+            const float def = sanitizeFiniteFloat(u.default_val[c]);
+            prop.currentValues[c] = def;
+            prop.defaultValues[c] = def;
+            prop.minValues[c] = sanitizeFiniteFloat(u.min_val[c], def < 0.0f ? def * 2.0f : 0.0f);
+            prop.maxValues[c] = sanitizeFiniteFloat(u.max_val[c], def > 1.0f ? def * 2.0f : 1.0f);
         }
 
         switch (u.type) {
@@ -924,6 +1301,11 @@ void PropertyInspectorWidget::setShaderMetadata(const waywal_shader_meta_t &meta
             break;
         case WAYWAL_UNIFORM_TYPE_COLOR:
             prop.kind = InspectorProperty::Kind::Color;
+            prop.numComponents = 3;
+            prop.currentValues.resize(3, 1.0f);
+            prop.defaultValues.resize(3, 1.0f);
+            prop.minValues.resize(3, 0.0f);
+            prop.maxValues.resize(3, 1.0f);
             break;
         }
 
@@ -1028,7 +1410,8 @@ void PropertyInspectorWidget::setShaderMetadata(const waywal_shader_meta_t &meta
                a.numComponents == b.numComponents && a.hasRange == b.hasRange &&
                a.minValues == b.minValues && a.maxValues == b.maxValues &&
                std::abs(a.step - b.step) < 1e-6f && a.isShaderCombo == b.isShaderCombo &&
-               a.comboOptions == b.comboOptions && a.comboValues == b.comboValues;
+               a.comboOptions == b.comboOptions && a.comboValues == b.comboValues &&
+               a.defaultTextValue == b.defaultTextValue;
     };
 
     if (m_currentId == nextId && m_currentType == nextType &&
@@ -1054,9 +1437,13 @@ void PropertyInspectorWidget::setShaderMetadata(const waywal_shader_meta_t &meta
     const bool sameShader = (m_currentId == nextId && m_currentType == nextType);
     QSet<QString> preservedAudio;
     QHash<QString, std::vector<float>> preservedValues;
+    QHash<QString, QString> preservedTextValues;
     if (sameShader) {
         for (const auto &existing : m_properties) {
             preservedValues.insert(existing.name, existing.currentValues);
+            if (existing.kind == InspectorProperty::Kind::Text) {
+                preservedTextValues.insert(existing.name, existing.textValue);
+            }
         }
     }
     for (auto it = m_rowWidgets.constBegin(); it != m_rowWidgets.constEnd(); ++it) {
@@ -1076,8 +1463,8 @@ void PropertyInspectorWidget::setShaderMetadata(const waywal_shader_meta_t &meta
 
     m_titleLabel->setText(m_currentTitle);
     m_typeBadge->setText(m_currentType);
-    m_typeBadge->setStyleSheet("background: #ef9f76; color: #1e1e2e; font-weight: bold; "
-                               "border-radius: 3px; padding: 2px 6px; font-size: 11px;");
+    m_typeBadge->setStyleSheet("background: #EF9F76; color: #0F172A; font-weight: bold; "
+                               "border-radius: 4px; padding: 2px 8px; font-size: 11px;");
 
     if (!author.isEmpty()) {
         m_authorLabel->setText(tr("Author: %1").arg(author));
@@ -1090,7 +1477,14 @@ void PropertyInspectorWidget::setShaderMetadata(const waywal_shader_meta_t &meta
                 const auto &oldVals = preservedValues.value(prop.name);
                 if (oldVals.size() == prop.currentValues.size()) {
                     prop.currentValues = oldVals;
+                    if (prop.kind == InspectorProperty::Kind::Combo && !oldVals.empty()) {
+                        prop.comboIndex = static_cast<int>(std::lround(oldVals[0]));
+                    }
                 }
+            }
+            if (prop.kind == InspectorProperty::Kind::Text &&
+                preservedTextValues.contains(prop.name)) {
+                prop.textValue = preservedTextValues.value(prop.name);
             }
         }
     }
@@ -1150,6 +1544,12 @@ bool PropertyInspectorWidget::loadShaderFile(const QString &shaderPath)
                 ? QString()
                 : QString::fromUtf8(QJsonDocument(comboArr).toJson(QJsonDocument::Compact));
         setShaderMetadata(meta, comboJson);
+        if (meta.title[0] == '\0') {
+            const QString fileBase = QFileInfo(shaderPath).completeBaseName();
+            if (!fileBase.isEmpty()) {
+                m_currentId = PresetStore::sanitizeId(fileBase);
+            }
+        }
         return true;
     }
     return false;
@@ -1166,12 +1566,13 @@ void PropertyInspectorWidget::rebuildPropertyUi()
         delete item;
     }
     m_rowWidgets.clear();
+    m_categorySections.clear();
+    m_emptyFilterLabel = nullptr;
 
     if (m_properties.empty()) {
-        auto *emptyLabel =
-            new QLabel(tr("<i>No editable parameters found.</i>"), m_containerWidget);
+        auto *emptyLabel = new QLabel(tr("No editable parameters found."), m_containerWidget);
         emptyLabel->setAlignment(Qt::AlignCenter);
-        emptyLabel->setStyleSheet("color: #737994; padding: 24px; font-size: 13px;");
+        emptyLabel->setStyleSheet("color: #94A3B8; padding: 24px; font-size: 13px;");
         m_containerLayout->addWidget(emptyLabel);
         return;
     }
@@ -1192,30 +1593,42 @@ void PropertyInspectorWidget::rebuildPropertyUi()
 
         auto *group = new QGroupBox(cleanTitle, m_containerWidget);
         group->setStyleSheet(
-            "QGroupBox { font-weight: bold; font-size: 11px; border: 1px solid #2c3240; "
-            "border-radius: 6px; "
-            "margin-top: 8px; padding-top: 10px; background: #181b22; } "
+            "QGroupBox { font-weight: bold; font-size: 11px; border: 1px solid #2D3340; "
+            "border-radius: 6px; margin-top: 8px; padding-top: 10px; background: #181B22; "
+            "color: #F1F5F9; } "
             "QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; "
-            "left: 10px; top: 0px; padding: 0px 6px 2px 6px; color: #38bdf8; }");
+            "left: 10px; top: 0px; padding: 0px 6px 2px 6px; color: #38BDF8; }");
 
         auto *groupLayout = new QVBoxLayout(group);
         groupLayout->setContentsMargins(8, 6, 8, 6);
         groupLayout->setSpacing(6);
 
+        QList<PropertyRowWidget *> sectionRows;
         for (const auto &p : propList) {
             auto *row = new PropertyRowWidget(p, group);
             connect(row, &PropertyRowWidget::valueChanged, this,
                     &PropertyInspectorWidget::onRowValueChanged);
+            connect(row, &PropertyRowWidget::textValueChanged, this,
+                    &PropertyInspectorWidget::onRowTextValueChanged);
             connect(row, &PropertyRowWidget::audioBindingRequested, this,
                     &PropertyInspectorWidget::audioBindingRequested);
             m_rowWidgets[p.name] = row;
+            sectionRows.append(row);
             groupLayout->addWidget(row);
         }
 
+        m_categorySections.append({group, sectionRows});
         m_containerLayout->addWidget(group);
     }
 
+    m_emptyFilterLabel = new QLabel(tr("No matching parameters found."), m_containerWidget);
+    m_emptyFilterLabel->setAlignment(Qt::AlignCenter);
+    m_emptyFilterLabel->setStyleSheet("color: #94A3B8; padding: 20px; font-size: 12px;");
+    m_emptyFilterLabel->setVisible(false);
+    m_containerLayout->addWidget(m_emptyFilterLabel);
+
     m_containerLayout->addStretch(1);
+    applyFilter();
 }
 
 std::vector<float> PropertyInspectorWidget::propertyValues(const QString &name) const
@@ -1228,41 +1641,90 @@ std::vector<float> PropertyInspectorWidget::propertyValues(const QString &name) 
     return {};
 }
 
+QString PropertyInspectorWidget::propertyTextValue(const QString &name) const
+{
+    for (const auto &prop : m_properties) {
+        if (prop.name == name) {
+            return prop.textValue;
+        }
+    }
+    return {};
+}
+
+void PropertyInspectorWidget::applyShaderComboChange(const QString &output, int32_t objectId,
+                                                     uint32_t passIndex, const QString &name,
+                                                     int comboIdx, int32_t comboValue)
+{
+    for (auto &prop : m_properties) {
+        if (prop.name == name) {
+            prop.comboIndex = comboIdx;
+            prop.currentValues = {static_cast<float>(comboIdx)};
+            break;
+        }
+    }
+    if (auto it = m_rowWidgets.find(name); it != m_rowWidgets.end() && *it) {
+        (*it)->updateValues({static_cast<float>(comboIdx)}, false);
+    }
+    emit shaderComboChanged(output, objectId, passIndex, name, comboValue);
+    emit uniformDefaultEdited(name, QString::number(comboValue));
+}
+
 void PropertyInspectorWidget::onRowValueChanged(const QString &name,
                                                 const std::vector<float> &values, uint32_t count)
 {
     std::vector<float> oldValues;
     bool isShaderCombo = false;
-    int32_t comboValue = 0;
+    int oldComboIdx = 0;
+    int newComboIdx = 0;
+    int32_t oldComboValue = 0;
+    int32_t newComboValue = 0;
     InspectorProperty::Kind propKind = InspectorProperty::Kind::Float;
 
     for (auto &prop : m_properties) {
         if (prop.name == name) {
-            oldValues = prop.currentValues;
-            prop.currentValues = values;
-            isShaderCombo = prop.isShaderCombo;
             propKind = prop.kind;
+            if (propKind == InspectorProperty::Kind::Text) {
+                return;
+            }
+            oldValues = prop.currentValues;
+            isShaderCombo = prop.isShaderCombo;
             if (isShaderCombo && !values.empty()) {
-                const int idx = static_cast<int>(std::lround(values[0]));
-                prop.comboIndex = idx;
-                if (idx >= 0 && idx < static_cast<int>(prop.comboValues.size())) {
-                    comboValue = prop.comboValues[static_cast<size_t>(idx)];
+                oldComboIdx = prop.comboIndex;
+                newComboIdx = static_cast<int>(std::lround(values[0]));
+                if (oldComboIdx >= 0 && oldComboIdx < static_cast<int>(prop.comboValues.size())) {
+                    oldComboValue = prop.comboValues[static_cast<size_t>(oldComboIdx)];
                 } else {
-                    comboValue = idx;
+                    oldComboValue = oldComboIdx;
+                }
+                if (newComboIdx >= 0 && newComboIdx < static_cast<int>(prop.comboValues.size())) {
+                    newComboValue = prop.comboValues[static_cast<size_t>(newComboIdx)];
+                } else {
+                    newComboValue = newComboIdx;
                 }
             }
+            prop.currentValues = values;
             break;
         }
     }
 
     if (isShaderCombo) {
-        if (m_ipcClient) {
-            m_ipcClient->sendSetShaderCombo(m_targetOutput, m_targetObjectId, m_targetPassIndex,
-                                            name, comboValue, 0u);
+        if (m_commandBus) {
+            QPointer<PropertyInspectorWidget> self(this);
+            auto cmd = std::make_unique<SetShaderComboCommand>(
+                m_targetOutput, m_targetObjectId, m_targetPassIndex, name, oldComboIdx,
+                oldComboValue, newComboIdx, newComboValue,
+                [self](const QString &out, int32_t objId, uint32_t passIdx, const QString &nm,
+                       int cIdx, int32_t cVal) {
+                    if (!self) {
+                        return;
+                    }
+                    self->applyShaderComboChange(out, objId, passIdx, nm, cIdx, cVal);
+                });
+            m_commandBus->execute(std::move(cmd));
+        } else {
+            applyShaderComboChange(m_targetOutput, m_targetObjectId, m_targetPassIndex, name,
+                                   newComboIdx, newComboValue);
         }
-        emit shaderComboChanged(m_targetOutput, m_targetObjectId, m_targetPassIndex, name,
-                                comboValue);
-        emit uniformDefaultEdited(name, QString::number(comboValue));
         return;
     }
 
@@ -1284,6 +1746,51 @@ void PropertyInspectorWidget::onRowValueChanged(const QString &name,
             }
             emit uniformDefaultEdited(name, parts.join(QLatin1Char(' ')));
         }
+    }
+}
+
+void PropertyInspectorWidget::onRowTextValueChanged(const QString &name, const QString &text)
+{
+    QString oldText;
+    bool found = false;
+    for (auto &prop : m_properties) {
+        if (prop.name == name && prop.kind == InspectorProperty::Kind::Text) {
+            oldText = prop.textValue;
+            prop.textValue = text;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        return;
+    }
+
+    if (m_commandBus) {
+        bool coalescible = false;
+        if (auto *row = qobject_cast<PropertyRowWidget *>(sender())) {
+            coalescible = row->consumeTextEditCoalescible();
+        }
+        QPointer<PropertyInspectorWidget> self(this);
+        auto cmd = std::make_unique<SetTextPropertyCommand>(
+            m_targetOutput, name, oldText, text, coalescible,
+            [self](const QString &, const QString &nm, const QString &txt) {
+                if (!self) {
+                    return;
+                }
+                for (auto &prop : self->m_properties) {
+                    if (prop.name == nm && prop.kind == InspectorProperty::Kind::Text) {
+                        prop.textValue = txt;
+                        break;
+                    }
+                }
+                if (auto it = self->m_rowWidgets.find(nm); it != self->m_rowWidgets.end() && *it) {
+                    (*it)->updateTextValue(txt, false);
+                }
+                emit self->uniformDefaultEdited(nm, txt);
+            });
+        m_commandBus->execute(std::move(cmd));
+    } else {
+        emit uniformDefaultEdited(name, text);
     }
 }
 
@@ -1326,90 +1833,155 @@ void PropertyInspectorWidget::dispatchUniform(const QString &name,
     }
 }
 
+void PropertyInspectorWidget::applyFilter()
+{
+    const QString query = m_filterEdit ? m_filterEdit->text().trimmed().toLower() : QString();
+    bool anySectionVisible = false;
+
+    for (const auto &section : m_categorySections) {
+        QGroupBox *group = section.first;
+        bool anyRowVisible = false;
+        for (PropertyRowWidget *row : section.second) {
+            if (!row) {
+                continue;
+            }
+            const InspectorProperty &p = row->property();
+            const bool match =
+                query.isEmpty() || p.name.toLower().contains(query) ||
+                p.label.toLower().contains(query) || p.category.toLower().contains(query) ||
+                (p.kind == InspectorProperty::Kind::Text && p.textValue.toLower().contains(query));
+            row->setFilterVisible(match);
+            if (match) {
+                anyRowVisible = true;
+            }
+        }
+        if (group) {
+            group->setVisible(anyRowVisible);
+        }
+        if (anyRowVisible) {
+            anySectionVisible = true;
+        }
+    }
+
+    if (m_emptyFilterLabel) {
+        m_emptyFilterLabel->setVisible(!m_properties.empty() && !anySectionVisible);
+    }
+}
+
 void PropertyInspectorWidget::onFilterTextChanged(const QString &text)
 {
-    QString query = text.trimmed().toLower();
-    for (auto it = m_rowWidgets.begin(); it != m_rowWidgets.end(); ++it) {
-        PropertyRowWidget *row = it.value();
-        const InspectorProperty &p = row->property();
-        bool match = query.isEmpty() || p.name.toLower().contains(query) ||
-                     p.label.toLower().contains(query) || p.category.toLower().contains(query);
-        row->setFilterVisible(match);
+    (void)text;
+    applyFilter();
+}
+
+void PropertyInspectorWidget::closeActivePresetPopups()
+{
+    if (m_activePresetMenu) {
+        QPointer<QMenu> menu = m_activePresetMenu;
+        m_activePresetMenu.clear();
+        menu->disconnect(this);
+        menu->close();
+        menu->deleteLater();
+    }
+    if (m_savePresetDialog) {
+        QPointer<QInputDialog> dlg = m_savePresetDialog;
+        m_savePresetDialog.clear();
+        dlg->disconnect(this);
+        dlg->close();
+        dlg->deleteLater();
+    }
+    if (m_loadPresetDialog) {
+        QPointer<QFileDialog> dlg = m_loadPresetDialog;
+        m_loadPresetDialog.clear();
+        dlg->disconnect(this);
+        dlg->close();
+        dlg->deleteLater();
     }
 }
 
 QString PropertyInspectorWidget::resolvePresetDir() const
 {
-    QString xdgConfig = QString::fromUtf8(qgetenv("XDG_CONFIG_HOME"));
-    if (xdgConfig.isEmpty()) {
-        xdgConfig = QDir::homePath() + "/.config";
+    QString dir;
+    if (m_presetStore) {
+        dir = m_presetStore->presetDirectory();
+    } else {
+        PresetStore fallbackStore(QString(), nullptr);
+        dir = fallbackStore.presetDirectory();
     }
-    QString dir = xdgConfig + QStringLiteral("/wwal/presets");
-    QDir().mkpath(dir);
+    if (!dir.isEmpty()) {
+        QDir().mkpath(dir);
+    }
     return dir;
 }
 
 bool PropertyInspectorWidget::savePreset(const QString &presetName)
 {
-    QString name = presetName;
-    if (name.isEmpty()) {
-        bool ok = false;
-        name = QInputDialog::getText(this, tr("Save Preset"), tr("Enter a name for this preset:"),
-                                     QLineEdit::Normal, m_currentId + "_preset", &ok);
-        if (!ok || name.trimmed().isEmpty()) {
-            return false;
-        }
-    }
-
-    QString safeId = name.toLower().replace(QRegularExpression("[^a-z0-9_]+"), "_");
-    QString presetDir = resolvePresetDir();
-    QString filePath = presetDir + "/" + safeId + ".toml";
-
-    QFile file(filePath);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
-        emit statusMessage(tr("Failed to save preset: cannot open file %1").arg(filePath));
+    const QString trimmedName = presetName.trimmed();
+    if (trimmedName.isEmpty()) {
+        openSavePresetDialog();
         return false;
     }
 
-    QTextStream out(&file);
-    out << "# WayWal Parameter Preset\n";
-    out << "[preset]\n";
-    out << "id = \"" << safeId << "\"\n";
-    out << "target_project = \"" << m_currentId << "\"\n";
-    out << "title = \"" << QString(m_currentTitle).replace('"', "\\\"") << "\"\n";
-    out << "created_at = \"" << QDateTime::currentDateTimeUtc().toString(Qt::ISODate) << "\"\n\n";
+    PresetStore *store = m_presetStore;
+    PresetStore fallbackStore(QString(), nullptr);
+    if (!store) {
+        store = &fallbackStore;
+    }
 
-    out << "[uniforms]\n";
+    const QString safeId = PresetStore::sanitizeId(trimmedName);
+    WallpaperPreset preset{};
+    if (store->hasPreset(safeId)) {
+        (void)store->loadPreset(safeId, preset);
+    }
+
+    preset.id = safeId;
+    if (preset.title.isEmpty()) {
+        preset.title = m_currentTitle.isEmpty() ? trimmedName : m_currentTitle;
+    }
+    preset.extraProperties[QStringLiteral("target_project")] = m_currentId;
+
     for (const auto &p : m_properties) {
-        if (p.kind == InspectorProperty::Kind::Color && p.currentValues.size() >= 3) {
-            out << p.name << " = [" << QString::number(p.currentValues[0], 'f', 6) << ", "
-                << QString::number(p.currentValues[1], 'f', 6) << ", "
-                << QString::number(p.currentValues[2], 'f', 6) << "]\n";
-        } else if (p.numComponents > 1) {
-            out << p.name << " = [";
-            for (size_t i = 0; i < p.currentValues.size(); ++i) {
-                if (i > 0)
-                    out << ", ";
-                out << QString::number(p.currentValues[i], 'f', 6);
+        auto valAt = [&p](size_t idx, float fallback = 0.0f) -> float {
+            if (idx < p.currentValues.size()) {
+                return sanitizeFiniteFloat(p.currentValues[idx], fallback);
             }
-            out << "]\n";
+            if (idx < p.defaultValues.size()) {
+                return sanitizeFiniteFloat(p.defaultValues[idx], fallback);
+            }
+            return fallback;
+        };
+
+        if (p.kind == InspectorProperty::Kind::Color) {
+            preset.uniforms[p.name] = UniformValue::fromColor(QColor::fromRgbF(
+                std::clamp(valAt(0, 1.0f), 0.0f, 1.0f), std::clamp(valAt(1, 1.0f), 0.0f, 1.0f),
+                std::clamp(valAt(2, 1.0f), 0.0f, 1.0f),
+                p.currentValues.size() >= 4 ? std::clamp(valAt(3, 1.0f), 0.0f, 1.0f) : 1.0f));
+        } else if (p.kind == InspectorProperty::Kind::Vec2) {
+            preset.uniforms[p.name] = UniformValue::fromVec2(valAt(0), valAt(1));
+        } else if (p.kind == InspectorProperty::Kind::Vec3) {
+            preset.uniforms[p.name] = UniformValue::fromVec3(valAt(0), valAt(1), valAt(2));
+        } else if (p.kind == InspectorProperty::Kind::Vec4) {
+            preset.uniforms[p.name] =
+                UniformValue::fromVec4(valAt(0), valAt(1), valAt(2), valAt(3));
         } else if (p.kind == InspectorProperty::Kind::Bool) {
-            out << p.name << " = "
-                << (!p.currentValues.empty() && p.currentValues[0] > 0.5f ? "true" : "false")
-                << "\n";
+            preset.uniforms[p.name] = UniformValue::fromBool(valAt(0) > 0.5f);
         } else if (p.kind == InspectorProperty::Kind::Int ||
                    p.kind == InspectorProperty::Kind::Combo) {
-            out << p.name << " = "
-                << static_cast<int>(!p.currentValues.empty() ? p.currentValues[0] : 0.0f) << "\n";
+            preset.uniforms[p.name] =
+                UniformValue::fromInt(static_cast<int32_t>(std::lround(valAt(0))));
         } else if (p.kind == InspectorProperty::Kind::Text) {
-            out << p.name << " = \"" << QString(p.textValue).replace('"', "\\\"") << "\"\n";
+            preset.uniforms[p.name] = UniformValue::fromString(p.textValue);
         } else {
-            float val = !p.currentValues.empty() ? p.currentValues[0] : 0.0f;
-            out << p.name << " = " << QString::number(val, 'f', 6) << "\n";
+            preset.uniforms[p.name] = UniformValue::fromFloat(valAt(0));
         }
     }
 
-    file.close();
+    if (!store->savePreset(preset)) {
+        emit statusMessage(tr("Failed to save preset: %1").arg(safeId));
+        return false;
+    }
+
+    const QString filePath = store->resolvePresetFilePath(safeId);
     emit presetSaved(safeId, filePath);
     emit statusMessage(tr("Preset saved to %1").arg(filePath));
     return true;
@@ -1417,83 +1989,128 @@ bool PropertyInspectorWidget::savePreset(const QString &presetName)
 
 bool PropertyInspectorWidget::loadPreset(const QString &presetPathOrName)
 {
-    QString filePath = presetPathOrName;
-    if (!QFileInfo::exists(filePath)) {
-        filePath = resolvePresetDir() + "/" + presetPathOrName;
-        if (!filePath.endsWith(".toml"))
-            filePath += ".toml";
-    }
-
-    QFile file(filePath);
-    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        emit statusMessage(tr("Failed to load preset: file not found %1").arg(filePath));
+    const QString trimmed = presetPathOrName.trimmed();
+    if (trimmed.isEmpty()) {
         return false;
     }
 
-    QTextStream in(&file);
-    bool inUniforms = false;
+    WallpaperPreset loaded{};
+    QString presetId;
+    QString filePath;
 
-    while (!in.atEnd()) {
-        QString line = in.readLine().trimmed();
-        if (line.isEmpty() || line.startsWith('#'))
-            continue;
-
-        if (line.startsWith('[')) {
-            inUniforms = (line == "[uniforms]");
-            continue;
+    if (QDir::isAbsolutePath(trimmed)) {
+        const QFileInfo fi(trimmed);
+        if (!fi.exists() || !fi.isFile() || fi.isSymLink() ||
+            fi.suffix().compare(QStringLiteral("toml"), Qt::CaseInsensitive) != 0) {
+            emit statusMessage(tr("Failed to load preset: invalid path %1").arg(trimmed));
+            return false;
         }
+        presetId = fi.completeBaseName();
+        filePath = fi.absoluteFilePath();
+        PresetStore customStore(fi.absolutePath(), nullptr);
+        if (!customStore.loadPreset(presetId, loaded)) {
+            emit statusMessage(tr("Failed to load preset: %1").arg(filePath));
+            return false;
+        }
+    } else {
+        if (trimmed.contains(QLatin1Char('/')) || trimmed.contains(QLatin1Char('\\')) ||
+            trimmed.contains(QStringLiteral(".."))) {
+            emit statusMessage(tr("Rejected unsafe preset identifier: %1").arg(trimmed));
+            return false;
+        }
+        QString baseName = trimmed;
+        if (baseName.endsWith(QStringLiteral(".toml"), Qt::CaseInsensitive)) {
+            baseName.chop(5);
+        }
+        presetId = PresetStore::sanitizeId(baseName);
 
-        if (inUniforms) {
-            int eqIdx = line.indexOf('=');
-            if (eqIdx <= 0)
-                continue;
-
-            QString key = line.left(eqIdx).trimmed();
-            QString valStr = line.mid(eqIdx + 1).trimmed();
-
-            if (!m_rowWidgets.contains(key))
-                continue;
-            PropertyRowWidget *row = m_rowWidgets[key];
-
-            std::vector<float> parsedVals;
-            if (valStr.startsWith('[') && valStr.endsWith(']')) {
-                QString inner = valStr.mid(1, valStr.length() - 2);
-                QStringList parts = inner.split(',', Qt::SkipEmptyParts);
-                for (const auto &p : parts) {
-                    bool ok = false;
-                    float f = p.trimmed().toFloat(&ok);
-                    if (ok)
-                        parsedVals.push_back(f);
-                }
-            } else if (valStr == "true") {
-                parsedVals.push_back(1.0f);
-            } else if (valStr == "false") {
-                parsedVals.push_back(0.0f);
-            } else {
-                bool ok = false;
-                float f = valStr.toFloat(&ok);
-                if (ok) {
-                    parsedVals.push_back(f);
-                }
-            }
-
-            if (!parsedVals.empty()) {
-                row->updateValues(parsedVals);
-            }
+        PresetStore *store = m_presetStore;
+        PresetStore fallbackStore(QString(), nullptr);
+        if (!store) {
+            store = &fallbackStore;
+        }
+        filePath = store->resolvePresetFilePath(presetId);
+        if (!store->loadPreset(presetId, loaded)) {
+            emit statusMessage(tr("Failed to load preset: file not found %1").arg(filePath));
+            return false;
         }
     }
 
-    file.close();
-    QString presetId = QFileInfo(filePath).baseName();
+    for (const auto &[key, uval] : loaded.uniforms) {
+        PropertyRowWidget *row = m_rowWidgets.value(key, nullptr);
+        if (!row) {
+            continue;
+        }
+        const InspectorProperty &prop = row->property();
+        if (prop.kind == InspectorProperty::Kind::Text) {
+            if (uval.type == UniformValue::Type::String) {
+                row->updateTextValue(uval.stringVal, true);
+            }
+            continue;
+        }
+
+        std::vector<float> parsedVals;
+        switch (uval.type) {
+        case UniformValue::Type::Float:
+            parsedVals.push_back(sanitizeFiniteFloat(uval.floats[0]));
+            break;
+        case UniformValue::Type::Int:
+            parsedVals.push_back(static_cast<float>(uval.intVal));
+            break;
+        case UniformValue::Type::Bool:
+            parsedVals.push_back(uval.boolVal ? 1.0f : 0.0f);
+            break;
+        case UniformValue::Type::Vec2:
+            parsedVals = {sanitizeFiniteFloat(uval.floats[0]), sanitizeFiniteFloat(uval.floats[1])};
+            break;
+        case UniformValue::Type::Vec3:
+            parsedVals = {sanitizeFiniteFloat(uval.floats[0]), sanitizeFiniteFloat(uval.floats[1]),
+                          sanitizeFiniteFloat(uval.floats[2])};
+            break;
+        case UniformValue::Type::Vec4:
+            if (prop.kind == InspectorProperty::Kind::Color) {
+                parsedVals = {std::clamp(sanitizeFiniteFloat(uval.floats[0]), 0.0f, 1.0f),
+                              std::clamp(sanitizeFiniteFloat(uval.floats[1]), 0.0f, 1.0f),
+                              std::clamp(sanitizeFiniteFloat(uval.floats[2]), 0.0f, 1.0f)};
+            } else {
+                parsedVals = {
+                    sanitizeFiniteFloat(uval.floats[0]), sanitizeFiniteFloat(uval.floats[1]),
+                    sanitizeFiniteFloat(uval.floats[2]), sanitizeFiniteFloat(uval.floats[3])};
+            }
+            break;
+        case UniformValue::Type::Color:
+            parsedVals = {std::clamp(sanitizeFiniteFloat(uval.floats[0]), 0.0f, 1.0f),
+                          std::clamp(sanitizeFiniteFloat(uval.floats[1]), 0.0f, 1.0f),
+                          std::clamp(sanitizeFiniteFloat(uval.floats[2]), 0.0f, 1.0f)};
+            break;
+        case UniformValue::Type::String:
+            break;
+        }
+
+        if (!parsedVals.empty()) {
+            row->updateValues(parsedVals, true);
+        }
+    }
+
     emit presetLoaded(presetId, filePath);
-    emit statusMessage(tr("Preset loaded: %1").arg(presetId));
+    const QString targetProject = loaded.extraProperties.contains(QStringLiteral("target_project"))
+                                      ? loaded.extraProperties.at(QStringLiteral("target_project"))
+                                      : QString();
+    if (!targetProject.isEmpty() && m_currentId != QStringLiteral("default") &&
+        targetProject != m_currentId) {
+        emit statusMessage(tr("Preset loaded: %1 (from %2)").arg(presetId, targetProject));
+    } else {
+        emit statusMessage(tr("Preset loaded: %1").arg(presetId));
+    }
     return true;
 }
 
 void PropertyInspectorWidget::resetAllToDefaults()
 {
     for (auto it = m_rowWidgets.begin(); it != m_rowWidgets.end(); ++it) {
-        it.value()->resetToDefault();
+        if (it.value()) {
+            it.value()->resetToDefault();
+        }
     }
     emit resetToDefaultsTriggered();
     emit statusMessage(tr("All parameters reset to default values."));
@@ -1501,42 +2118,137 @@ void PropertyInspectorWidget::resetAllToDefaults()
 
 QStringList PropertyInspectorWidget::listAvailablePresets() const
 {
-    QDir dir(resolvePresetDir());
-    return dir.entryList({"*.toml"}, QDir::Files, QDir::Time);
+    if (m_presetStore) {
+        return m_presetStore->listPresetIds();
+    }
+    PresetStore fallbackStore(QString(), nullptr);
+    return fallbackStore.listPresetIds();
 }
 
-void PropertyInspectorWidget::onSavePresetClicked() { savePreset(); }
+void PropertyInspectorWidget::openSavePresetDialog()
+{
+    if (m_savePresetDialog) {
+        QPointer<QInputDialog> prev = m_savePresetDialog;
+        m_savePresetDialog.clear();
+        prev->disconnect(this);
+        prev->close();
+        prev->deleteLater();
+    }
+
+    auto *dlg = new QInputDialog(this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose, true);
+    dlg->setModal(false);
+    dlg->setWindowTitle(tr("Save Preset"));
+    dlg->setLabelText(tr("Enter a name for this preset:"));
+    dlg->setInputMode(QInputDialog::TextInput);
+    dlg->setTextValue(m_currentId + QStringLiteral("_preset"));
+    m_savePresetDialog = dlg;
+
+    QPointer<PropertyInspectorWidget> self(this);
+    QPointer<QInputDialog> dlgPtr(dlg);
+    connect(dlg, &QInputDialog::textValueSelected, this, [self, dlgPtr](const QString &name) {
+        if (!self) {
+            return;
+        }
+        if (self->m_savePresetDialog == dlgPtr) {
+            self->m_savePresetDialog.clear();
+        }
+        if (!name.trimmed().isEmpty()) {
+            self->savePreset(name);
+        }
+    });
+    connect(dlg, &QDialog::rejected, this, [self, dlgPtr]() {
+        if (self && self->m_savePresetDialog == dlgPtr) {
+            self->m_savePresetDialog.clear();
+        }
+    });
+
+    dlg->show();
+}
+
+void PropertyInspectorWidget::openLoadPresetBrowseDialog()
+{
+    if (m_loadPresetDialog) {
+        QPointer<QFileDialog> prev = m_loadPresetDialog;
+        m_loadPresetDialog.clear();
+        prev->disconnect(this);
+        prev->close();
+        prev->deleteLater();
+    }
+
+    auto *dlg =
+        new QFileDialog(this, tr("Load Preset"), resolvePresetDir(), tr("TOML Files (*.toml)"));
+    dlg->setFileMode(QFileDialog::ExistingFile);
+    dlg->setAcceptMode(QFileDialog::AcceptOpen);
+    dlg->setAttribute(Qt::WA_DeleteOnClose, true);
+    dlg->setModal(false);
+    m_loadPresetDialog = dlg;
+
+    QPointer<PropertyInspectorWidget> self(this);
+    QPointer<QFileDialog> dlgPtr(dlg);
+    connect(dlg, &QFileDialog::fileSelected, this, [self, dlgPtr](const QString &filePath) {
+        if (!self) {
+            return;
+        }
+        if (self->m_loadPresetDialog == dlgPtr) {
+            self->m_loadPresetDialog.clear();
+        }
+        if (!filePath.isEmpty()) {
+            self->loadPreset(filePath);
+        }
+    });
+    connect(dlg, &QDialog::rejected, this, [self, dlgPtr]() {
+        if (self && self->m_loadPresetDialog == dlgPtr) {
+            self->m_loadPresetDialog.clear();
+        }
+    });
+
+    dlg->show();
+}
+
+void PropertyInspectorWidget::onSavePresetClicked() { openSavePresetDialog(); }
 
 void PropertyInspectorWidget::onLoadPresetClicked()
 {
-    QStringList presets = listAvailablePresets();
+    if (m_activePresetMenu) {
+        QPointer<QMenu> prev = m_activePresetMenu;
+        m_activePresetMenu.clear();
+        prev->disconnect(this);
+        prev->close();
+        prev->deleteLater();
+    }
+
+    const QStringList presets = listAvailablePresets();
     if (presets.isEmpty()) {
-        QString filePath = QFileDialog::getOpenFileName(this, tr("Load Preset"), resolvePresetDir(),
-                                                        tr("TOML Files (*.toml)"));
-        if (!filePath.isEmpty()) {
-            loadPreset(filePath);
-        }
+        openLoadPresetBrowseDialog();
         return;
     }
 
     auto *menu = new QMenu(this);
-    for (const auto &presetFile : presets) {
-        QString id = QFileInfo(presetFile).baseName();
-        auto *action = menu->addAction(id);
-        connect(action, &QAction::triggered, this,
-                [this, presetFile]() { loadPreset(presetFile); });
+    menu->setAttribute(Qt::WA_DeleteOnClose, true);
+    m_activePresetMenu = menu;
+
+    QPointer<PropertyInspectorWidget> self(this);
+    for (const QString &presetId : presets) {
+        auto *action = menu->addAction(presetId);
+        connect(action, &QAction::triggered, this, [self, presetId]() {
+            if (self) {
+                self->loadPreset(presetId);
+            }
+        });
     }
     menu->addSeparator();
     auto *browseAction = menu->addAction(tr("Browse other..."));
-    connect(browseAction, &QAction::triggered, this, [this]() {
-        QString filePath = QFileDialog::getOpenFileName(this, tr("Load Preset"), resolvePresetDir(),
-                                                        tr("TOML Files (*.toml)"));
-        if (!filePath.isEmpty()) {
-            loadPreset(filePath);
+    connect(browseAction, &QAction::triggered, this, [self]() {
+        if (self) {
+            self->openLoadPresetBrowseDialog();
         }
     });
 
-    menu->exec(m_btnLoadPreset->mapToGlobal(QPoint(0, m_btnLoadPreset->height())));
+    const QPoint anchor = m_btnLoadPreset
+                              ? m_btnLoadPreset->mapToGlobal(QPoint(0, m_btnLoadPreset->height()))
+                              : mapToGlobal(QPoint(0, 0));
+    menu->popup(anchor);
 }
 
 } // namespace waywal::studio

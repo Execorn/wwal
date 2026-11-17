@@ -15,7 +15,10 @@
 #include <QGroupBox>
 #include <QLabel>
 #include <QLineEdit>
+#include <QList>
 #include <QMap>
+#include <QPair>
+#include <QPointer>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSlider>
@@ -29,6 +32,10 @@
 #include <array>
 #include <memory>
 #include <vector>
+
+class QFileDialog;
+class QInputDialog;
+class QMenu;
 
 namespace waywal::studio {
 
@@ -71,17 +78,26 @@ class PropertyRowWidget : public QWidget {
 
   public:
     explicit PropertyRowWidget(const InspectorProperty &prop, QWidget *parent = nullptr);
-    ~PropertyRowWidget() override = default;
+    ~PropertyRowWidget() override;
 
     [[nodiscard]] const InspectorProperty &property() const noexcept { return m_prop; }
     [[nodiscard]] bool isAudioBound() const noexcept { return m_audioBound; }
+    [[nodiscard]] QString textValue() const noexcept { return m_prop.textValue; }
+    [[nodiscard]] bool consumeTextEditCoalescible() noexcept
+    {
+        const bool v = m_nextTextEditCoalescible;
+        m_nextTextEditCoalescible = false;
+        return v;
+    }
     void updateValues(const std::vector<float> &vals, bool emitSignal = true);
+    void updateTextValue(const QString &text, bool emitSignal = true);
     void resetToDefault();
     void setFilterVisible(bool visible);
     void setAudioBound(bool bound);
 
   signals:
     void valueChanged(const QString &name, const std::vector<float> &values, uint32_t count);
+    void textValueChanged(const QString &name, const QString &text);
     void audioBindingRequested(const QString &uniformName, float currentBaseline);
 
   private slots:
@@ -96,12 +112,16 @@ class PropertyRowWidget : public QWidget {
 
   private:
     void setupUi();
+    void closeActiveColorDialog();
+    void updateColorSwatchVisual(const QColor &col);
     void componentRange(int index, float &outMin, float &outMax) const noexcept;
     void syncSliderSpin(int index, float val, bool emitSignal = true);
     void emitChange();
 
     InspectorProperty m_prop;
     bool m_updating{false};
+    bool m_nextTextEditCoalescible{false};
+    QPointer<OklchColorDialog> m_activeColorDialog;
 
     QLabel *m_labelWidget{nullptr};
     QToolButton *m_audioBadgeButton{nullptr};
@@ -122,14 +142,14 @@ class PropertyRowWidget : public QWidget {
 /**
  * @brief Dynamic live inspector for Wallpaper Engine scenes and Shadertoy GLSL shaders.
  * Supports auto-generated controls, 60/144 Hz parameter streaming via CommandBus & IpcClient,
- * and preset loading/saving in ~/.config/wwal/presets/<id>.toml.
+ * and preset loading/saving in $XDG_CONFIG_HOME/wwal/presets/<id>.toml.
  */
 class PropertyInspectorWidget : public QWidget {
     Q_OBJECT
 
   public:
     explicit PropertyInspectorWidget(QWidget *parent = nullptr);
-    ~PropertyInspectorWidget() override = default;
+    ~PropertyInspectorWidget() override;
 
     // --- Data Loaders ---
     void setWallpaperEngineProject(const we_project_t &proj);
@@ -166,6 +186,7 @@ class PropertyInspectorWidget : public QWidget {
         return m_rowWidgets.value(name, nullptr);
     }
     [[nodiscard]] std::vector<float> propertyValues(const QString &name) const;
+    [[nodiscard]] QString propertyTextValue(const QString &name) const;
 
     // --- Preset Actions ---
     bool savePreset(const QString &presetName = QString());
@@ -187,6 +208,7 @@ class PropertyInspectorWidget : public QWidget {
 
   private slots:
     void onRowValueChanged(const QString &name, const std::vector<float> &values, uint32_t count);
+    void onRowTextValueChanged(const QString &name, const QString &text);
     void onFilterTextChanged(const QString &text);
     void onSavePresetClicked();
     void onLoadPresetClicked();
@@ -195,8 +217,14 @@ class PropertyInspectorWidget : public QWidget {
     void setupUi();
     void populateDefaultSceneParameters();
     void rebuildPropertyUi();
+    void applyFilter();
+    void openSavePresetDialog();
+    void openLoadPresetBrowseDialog();
+    void closeActivePresetPopups();
     void dispatchUniform(const QString &name, const std::vector<float> &oldVals,
                          const std::vector<float> &newVals, uint32_t count);
+    void applyShaderComboChange(const QString &output, int32_t objectId, uint32_t passIndex,
+                                const QString &name, int comboIdx, int32_t comboValue);
     [[nodiscard]] QString resolvePresetDir() const;
     [[nodiscard]] QString deduceCategory(const QString &name, const QString &label) const;
 
@@ -211,11 +239,17 @@ class PropertyInspectorWidget : public QWidget {
 
     std::vector<InspectorProperty> m_properties;
     QMap<QString, PropertyRowWidget *> m_rowWidgets;
+    QList<QPair<QGroupBox *, QList<PropertyRowWidget *>>> m_categorySections;
+    QLabel *m_emptyFilterLabel{nullptr};
 
     // Injected Services
     CommandBus *m_commandBus{nullptr};
     IpcClient *m_ipcClient{nullptr};
     PresetStore *m_presetStore{nullptr};
+
+    QPointer<QMenu> m_activePresetMenu;
+    QPointer<QInputDialog> m_savePresetDialog;
+    QPointer<QFileDialog> m_loadPresetDialog;
 
     // UI Widgets
     QLabel *m_titleLabel{nullptr};
