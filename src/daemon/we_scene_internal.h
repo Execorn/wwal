@@ -5,46 +5,6 @@
 #include "waywal/we_json.h"
 #include "waywal/we_scene.h"
 
-static inline void jval_free(we_jval_t *v) { we_jval_free(v); }
-
-static inline we_jval_t *json_parse_root(const char *src, size_t len)
-{
-    return we_json_parse_root(src, len);
-}
-
-static inline const we_jval_t *jobj_get(const we_jval_t *obj, const char *key)
-{
-    return we_jobj_get(obj, key);
-}
-
-static inline const char *jval_str(const we_jval_t *v, const char *def)
-{
-    return we_jval_str(v, def);
-}
-
-static inline const we_user_prop_t *project_find_prop(const we_project_t *proj, const char *key)
-{
-    return we_project_find_prop(proj, key);
-}
-
-static inline uint32_t jval_floats(const we_jval_t *v, const we_project_t *proj, float *out,
-                                   uint32_t max_n, char *out_user_prop, size_t prop_cap)
-{
-    return we_jval_floats(v, proj, out, max_n, out_user_prop, prop_cap);
-}
-
-static inline float jval_float(const we_jval_t *v, const we_project_t *proj, float def,
-                               char *out_user_prop, size_t prop_cap)
-{
-    return we_jval_float(v, proj, def, out_user_prop, prop_cap);
-}
-
-static inline bool jval_bool_resolved(const we_jval_t *v, const we_project_t *proj, bool def,
-                                      char *out_user_prop, size_t prop_cap)
-{
-    return we_jval_bool_resolved(v, proj, def, out_user_prop, prop_cap);
-}
-
 void sync_layer_from_obj(const we_scene_object_t *obj, we_script_layer_state_t *ls);
 void sync_obj_from_layer(we_scene_object_t *obj, const we_script_layer_state_t *ls);
 void sync_scene_layers_to_vm(const we_scene_t *scene, we_script_t *vm);
@@ -58,5 +18,12 @@ bool we_audio_decode_memory(const uint8_t *data, size_t size, float **out_stereo
                             size_t *out_frame_count);
 bool we_audio_decode_pkg_file(we_pkg_t *pkg, const char *vfs_dir, const char *rel_path,
                               float **out_stereo_f32, size_t *out_frame_count);
+
+bool we_scene_add_overflow_effect_fbo(we_scene_t *scene, we_effect_t *eff, const char *name,
+                                      uint32_t scale);
+uint32_t we_scene_effect_total_fbo_count(const we_scene_t *scene, const we_effect_t *eff);
+we_rt_fbo_t *we_scene_effect_get_fbo(we_scene_t *scene, we_effect_t *eff, uint32_t index);
+const we_rt_fbo_t *we_scene_effect_get_fbo_const(const we_scene_t *scene, const we_effect_t *eff,
+                                                 uint32_t index);
 
 #endif /* WAYWAL_WE_SCENE_INTERNAL_H */

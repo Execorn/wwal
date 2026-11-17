@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "waywal/we_builtin_effects.h"
+#include "waywal/we_tex.h"
 
 #include <ctype.h>
 #include <sched.h>
@@ -9,69 +10,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-static size_t we_lz4_decompress_block(const uint8_t *src, size_t src_len, char *dst, size_t dst_cap)
-{
-    if (!src || !dst || dst_cap == 0)
-        return 0;
-    const uint8_t *ip = src, *const ip_end = src + src_len;
-    uint8_t *op = (uint8_t *)dst, *const op_end = (uint8_t *)dst + dst_cap - 1;
-    while (ip < ip_end) {
-        uint8_t token = *ip++;
-        size_t lit_len = token >> 4;
-        if (lit_len == 15) {
-            while (ip < ip_end && *ip == 255) {
-                lit_len += 255;
-                ip++;
-            }
-            if (ip >= ip_end)
-                return 0;
-            lit_len += *ip++;
-        }
-        if ((size_t)(op_end - op) < lit_len || (size_t)(ip_end - ip) < lit_len)
-            return 0;
-        memcpy(op, ip, lit_len);
-        op += lit_len;
-        ip += lit_len;
-        if (ip >= ip_end)
-            break;
-        if ((size_t)(ip_end - ip) < 2u)
-            return 0;
-        uint16_t offset = (uint16_t)(ip[0] | (ip[1] << 8));
-        ip += 2;
-        if (offset == 0 || (size_t)(op - (uint8_t *)dst) < offset)
-            return 0;
-        size_t match_len = (token & 0x0F) + 4;
-        if (match_len == 19) {
-            while (ip < ip_end && *ip == 255) {
-                match_len += 255;
-                ip++;
-            }
-            if (ip >= ip_end)
-                return 0;
-            match_len += *ip++;
-        }
-        if ((size_t)(op_end - op) < match_len)
-            return 0;
-        const uint8_t *match = op - offset;
-        /* Disjoint 8-byte copies avoid byte-at-a-time hazards when offset >= 8 and tail slack
-         * covers up to 7 overshoot bytes before clamping op back to end_match. */
-        if (offset >= 8u && (size_t)(op_end - op) >= match_len + 8u) {
-            uint8_t *end_match = op + match_len;
-            do {
-                memcpy(op, match, 8u);
-                op += 8u;
-                match += 8u;
-            } while (op < end_match);
-            op = end_match;
-        } else {
-            for (size_t i = 0; i < match_len; i++)
-                *op++ = *match++;
-        }
-    }
-    *op = '\0';
-    return (size_t)(op - (uint8_t *)dst);
-}
 
 /* Compressed LZ4 rodata archive of all 50 effect shaders */
 static const uint8_t s_we_builtin_lz4_blob[26223] = {
@@ -3036,44 +2974,94 @@ size_t we_builtin_effect_decompress_glsl(we_builtin_effect_id_t id, char *out_bu
     return we_builtin_effect_decompress_stage(id, true, out_buf, out_buf_cap);
 }
 
+static size_t extract_builtin_stage_impl(const we_builtin_effect_desc_t *desc, bool is_frag,
+                                         char *out_buf, size_t out_buf_cap, char **out_alloc)
+{
+    if (!desc) {
+        return 0;
+    }
+    if (desc->lz4_compressed_offset > sizeof(s_we_builtin_lz4_blob) ||
+        desc->lz4_compressed_size > sizeof(s_we_builtin_lz4_blob) - desc->lz4_compressed_offset ||
+        desc->uncompressed_glsl_size < 4u || desc->uncompressed_glsl_size > 1048576u) {
+        return 0;
+    }
+
+    char stack_temp[8192];
+    char *heap_temp = NULL;
+    char *temp = stack_temp;
+    size_t temp_cap = desc->uncompressed_glsl_size;
+    if (temp_cap > sizeof(stack_temp)) {
+        heap_temp = (char *)malloc(temp_cap);
+        if (!heap_temp) {
+            return 0;
+        }
+        temp = heap_temp;
+    }
+
+    int decomp_i = we_lz4_decompress_safe(s_we_builtin_lz4_blob + desc->lz4_compressed_offset,
+                                          desc->lz4_compressed_size, (uint8_t *)temp, temp_cap);
+    if (decomp_i < 4 || (size_t)decomp_i != desc->uncompressed_glsl_size) {
+        free(heap_temp);
+        return 0;
+    }
+    size_t decomp = (size_t)decomp_i;
+
+    uint32_t vert_len = (uint32_t)((uint8_t)temp[0] | ((uint8_t)temp[1] << 8) |
+                                   ((uint8_t)temp[2] << 16) | ((uint8_t)temp[3] << 24));
+    if ((size_t)vert_len > decomp - 4u) {
+        free(heap_temp);
+        return 0;
+    }
+
+    const char *stage_src = is_frag ? (temp + 4u + vert_len) : (temp + 4u);
+    size_t stage_len = is_frag ? (decomp - (4u + vert_len)) : (size_t)vert_len;
+
+    if (out_alloc) {
+        char *cached = (char *)malloc(stage_len + 1u);
+        if (!cached) {
+            free(heap_temp);
+            return 0;
+        }
+        memcpy(cached, stage_src, stage_len);
+        cached[stage_len] = '\0';
+        *out_alloc = cached;
+        free(heap_temp);
+        return stage_len;
+    }
+
+    if (!out_buf || stage_len + 1u > out_buf_cap) {
+        free(heap_temp);
+        return 0;
+    }
+    memcpy(out_buf, stage_src, stage_len);
+    out_buf[stage_len] = '\0';
+    free(heap_temp);
+    return stage_len;
+}
+
 size_t we_builtin_effect_decompress_stage(we_builtin_effect_id_t id, bool is_frag, char *out_buf,
                                           size_t out_buf_cap)
 {
     const we_builtin_effect_desc_t *desc = we_builtin_effect_get_by_id(id);
     if (!desc || !out_buf || out_buf_cap == 0)
         return 0;
-    if (desc->lz4_compressed_offset > sizeof(s_we_builtin_lz4_blob) ||
-        desc->lz4_compressed_size > sizeof(s_we_builtin_lz4_blob) - desc->lz4_compressed_offset) {
-        return 0;
-    }
-
-    char temp[8192];
-    size_t decomp = we_lz4_decompress_block(s_we_builtin_lz4_blob + desc->lz4_compressed_offset,
-                                            desc->lz4_compressed_size, temp, sizeof(temp));
-    if (decomp < 4 || decomp >= sizeof(temp) || decomp != desc->uncompressed_glsl_size)
-        return 0;
-
-    uint32_t vert_len = (uint32_t)((uint8_t)temp[0] | ((uint8_t)temp[1] << 8) |
-                                   ((uint8_t)temp[2] << 16) | ((uint8_t)temp[3] << 24));
-    if (4u + vert_len > decomp)
-        return 0;
-
-    const char *v_src = temp + 4;
-    const char *f_src = temp + 4 + vert_len;
-    size_t f_len = decomp - (4u + vert_len);
-
-    const char *stage_src = is_frag ? f_src : v_src;
-    size_t stage_len = is_frag ? f_len : vert_len;
-    if (stage_len + 1u > out_buf_cap)
-        return 0;
-
-    memcpy(out_buf, stage_src, stage_len);
-    out_buf[stage_len] = '\0';
-    return stage_len;
+    return extract_builtin_stage_impl(desc, is_frag, out_buf, out_buf_cap, NULL);
 }
 
-static char s_stage_cache[WE_BUILTIN_EFFECT_COUNT][2][1280];
+static char *_Atomic s_stage_cache[WE_BUILTIN_EFFECT_COUNT][2];
+/* 0=uninitialized, 1=decompressing, 2=ready, 3=terminal failure (do not retry per-frame). */
 static _Atomic uint8_t s_stage_state[WE_BUILTIN_EFFECT_COUNT][2];
+
+__attribute__((destructor)) static void we_builtin_effects_cleanup_cache(void)
+{
+    for (uint32_t i = 0; i < WE_BUILTIN_EFFECT_COUNT; i++) {
+        for (uint32_t s = 0; s < 2u; s++) {
+            char *p = atomic_exchange_explicit(&s_stage_cache[i][s], NULL, memory_order_acq_rel);
+            free(p);
+            atomic_store_explicit(&s_stage_state[i][s], 0u, memory_order_release);
+        }
+    }
+}
 
 const char *we_builtin_effect_get_stage_glsl(we_builtin_effect_id_t id, bool is_frag)
 {
@@ -3083,23 +3071,29 @@ const char *we_builtin_effect_get_stage_glsl(we_builtin_effect_id_t id, bool is_
     uint32_t stage = is_frag ? 1u : 0u;
     uint8_t st = atomic_load_explicit(&s_stage_state[idx][stage], memory_order_acquire);
     if (st == 2u)
-        return s_stage_cache[idx][stage];
+        return atomic_load_explicit(&s_stage_cache[idx][stage], memory_order_acquire);
+    if (st == 3u)
+        return NULL;
 
     uint8_t expected = 0u;
     if (atomic_compare_exchange_strong_explicit(&s_stage_state[idx][stage], &expected, 1u,
                                                 memory_order_acq_rel, memory_order_acquire)) {
-        size_t n = we_builtin_effect_decompress_stage(id, is_frag, s_stage_cache[idx][stage],
-                                                      sizeof(s_stage_cache[idx][stage]));
-        if (n == 0) {
-            atomic_store_explicit(&s_stage_state[idx][stage], 0u, memory_order_release);
+        const we_builtin_effect_desc_t *desc = we_builtin_effect_get_by_id(id);
+        char *cached = NULL;
+        size_t n = extract_builtin_stage_impl(desc, is_frag, NULL, 0, &cached);
+        if (n == 0 || !cached) {
+            free(cached);
+            atomic_store_explicit(&s_stage_state[idx][stage], 3u, memory_order_release);
             return NULL;
         }
+        atomic_store_explicit(&s_stage_cache[idx][stage], cached, memory_order_release);
         atomic_store_explicit(&s_stage_state[idx][stage], 2u, memory_order_release);
-        return s_stage_cache[idx][stage];
+        return cached;
     }
 
     while ((st = atomic_load_explicit(&s_stage_state[idx][stage], memory_order_acquire)) == 1u) {
         sched_yield();
     }
-    return (st == 2u) ? s_stage_cache[idx][stage] : NULL;
+    return (st == 2u) ? atomic_load_explicit(&s_stage_cache[idx][stage], memory_order_acquire)
+                      : NULL;
 }

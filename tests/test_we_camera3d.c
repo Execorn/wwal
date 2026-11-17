@@ -17,6 +17,7 @@
 
 #include <assert.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -300,6 +301,124 @@ static void test_multi_camera_parallax_isolation_and_25d_ortho(void)
     printf("    -> Multi-camera parallax isolation, 2.5D ortho & f-stop bokeh verified.\n");
 }
 
+static void *cam3d_tls_worker_thread(void *arg)
+{
+    int tid = *(const int *)arg;
+    we_camera_kf_t kfs[4];
+    for (int p = 0; p < 4; p++) {
+        memset(kfs, 0, sizeof(kfs));
+        for (int i = 0; i < 4; i++) {
+            kfs[i].time_sec = (float)i * 0.5f;
+            kfs[i].position[0] = (float)(tid * 100 + p * 20 + i * 10);
+            kfs[i].position[1] = (float)(i * 5);
+            kfs[i].position[2] = 500.0f;
+            kfs[i].orientation_quat[3] = 1.0f;
+            kfs[i].fov_deg = 60.0f;
+            kfs[i].tension = 0.5f;
+        }
+        float out_p[3], out_q[4], fov, foc, ap;
+        we_camera3d_eval_spline(kfs, 4, WE_CAM_PATH_ONCE, 0.75, out_p, out_q, &fov, &foc, &ap);
+        assert(isfinite(out_p[0]) && isfinite(out_p[1]) && isfinite(out_p[2]));
+    }
+    we_camera3d_t cams[12];
+    for (int i = 0; i < 12; i++) {
+        we_camera3d_init_default(&cams[i], 1920.0f, 1080.0f);
+        cams[i].parallax_amount[0] = 20.0f;
+        cams[i].parallax_smoothing = 0.1f;
+        we_camera3d_update(&cams[i], 0.0, 0.5f, 0.5f, 16.0f / 9.0f);
+        we_camera3d_update(&cams[i], 0.016, 1.0f, 0.5f, 16.0f / 9.0f);
+        assert(isfinite(cams[i].view_proj_matrix[0]));
+    }
+    return NULL;
+}
+
+static void test_spline_and_parallax_tls_scaling(void)
+{
+    printf(
+        "[+] Testing >2 spline paths, >8 parallax cameras, thread cleanup & near/far guards...\n");
+
+    we_camera_kf_t paths[8][4];
+    for (int p = 0; p < 8; p++) {
+        memset(paths[p], 0, sizeof(paths[p]));
+        for (int k = 0; k < 4; k++) {
+            paths[p][k].time_sec = (float)k;
+            paths[p][k].position[0] = (float)(p * 100 + k * 25);
+            paths[p][k].position[1] = (float)(p * 10);
+            paths[p][k].position[2] = 600.0f;
+            paths[p][k].orientation_quat[3] = 1.0f;
+            paths[p][k].fov_deg = 55.0f;
+            paths[p][k].tension = 0.5f;
+        }
+    }
+    for (int iter = 0; iter < 4; iter++) {
+        for (int p = 0; p < 8; p++) {
+            float pos[3], quat[4], fov, focal, ap;
+            we_camera3d_eval_spline(paths[p], 4, WE_CAM_PATH_ONCE, 0.5 * (iter + 1), pos, quat,
+                                    &fov, &focal, &ap);
+            assert(pos[0] >= (float)(p * 100) && pos[0] <= (float)(p * 100 + 75));
+        }
+    }
+
+    /* 16 concurrent cameras (>8 old TLS slots) must all retain exponential parallax damping */
+    we_camera3d_t cams[16];
+    for (int i = 0; i < 16; i++) {
+        we_camera3d_init_default(&cams[i], 1920.0f, 1080.0f);
+        cams[i].parallax_amount[0] = 40.0f;
+        cams[i].parallax_smoothing = 0.1f;
+        we_camera3d_update(&cams[i], 0.0, 0.5f, 0.5f, 16.0f / 9.0f);
+    }
+    for (int step = 1; step <= 3; step++) {
+        double t = 0.016 * (double)step;
+        for (int i = 0; i < 16; i++) {
+            we_camera3d_update(&cams[i], t, 1.0f, 0.5f, 16.0f / 9.0f);
+            float eye_before_snap = cams[i].view_matrix[12];
+            assert(isfinite(eye_before_snap));
+        }
+    }
+    /* Reference single camera that never gets interleaved must match cam[0] exact damping */
+    we_camera3d_t ref_cam;
+    we_camera3d_init_default(&ref_cam, 1920.0f, 1080.0f);
+    ref_cam.parallax_amount[0] = 40.0f;
+    ref_cam.parallax_smoothing = 0.1f;
+    we_camera3d_update(&ref_cam, 0.0, 0.5f, 0.5f, 16.0f / 9.0f);
+    for (int step = 1; step <= 3; step++) {
+        we_camera3d_update(&ref_cam, 0.016 * (double)step, 1.0f, 0.5f, 16.0f / 9.0f);
+    }
+    assert(fabsf(cams[0].view_matrix[12] - ref_cam.view_matrix[12]) < 1e-4f);
+
+    /* Degenerate near_z <= 0 / far_z <= near_z / NaN must still yield finite matrices */
+    we_camera3d_t bad_cam;
+    we_camera3d_init_default(&bad_cam, 1280.0f, 720.0f);
+    bad_cam.near_z = -5.0f;
+    bad_cam.far_z = -10.0f;
+    bad_cam.fov_y_deg = NAN;
+    we_camera3d_update(&bad_cam, 0.5, 0.5f, 0.5f, 16.0f / 9.0f);
+    for (int i = 0; i < 16; i++) {
+        assert(isfinite(bad_cam.proj_matrix[i]));
+        assert(isfinite(bad_cam.view_proj_matrix[i]));
+    }
+    bad_cam.projection_mode = WE_PROJ_DEPTH_PARALLAX_25D;
+    bad_cam.near_z = 5.0f;
+    bad_cam.far_z = 5.0f;
+    we_camera3d_update(&bad_cam, 0.5, 0.5f, 0.5f, 16.0f / 9.0f);
+    for (int i = 0; i < 16; i++) {
+        assert(isfinite(bad_cam.proj_matrix[i]));
+        assert(isfinite(bad_cam.view_proj_matrix[i]));
+    }
+
+    pthread_t th[2];
+    int tids[2] = {1, 2};
+    for (int i = 0; i < 2; i++) {
+        assert(pthread_create(&th[i], NULL, cam3d_tls_worker_thread, &tids[i]) == 0);
+    }
+    for (int i = 0; i < 2; i++) {
+        assert(pthread_join(th[i], NULL) == 0);
+    }
+
+    printf(
+        "    -> TLS scaling (>2 paths, >8 cameras, pthreads cleanup) & near/far guards passed.\n");
+}
+
 int main(void)
 {
     printf("==========================================================\n");
@@ -312,6 +431,7 @@ int main(void)
     test_std140_ubo_lighting_pack();
     test_camera_update_and_coc_performance();
     test_multi_camera_parallax_isolation_and_25d_ortho();
+    test_spline_and_parallax_tls_scaling();
 
     printf("==========================================================\n");
     printf("  >>> ALL WE_CAMERA3D TESTS PASSED CLEANLY (100%%) <<<\n");

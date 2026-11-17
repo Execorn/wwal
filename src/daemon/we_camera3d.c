@@ -2,7 +2,9 @@
 #include "waywal/we_camera3d.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifndef M_PI
@@ -441,9 +443,11 @@ void quat_to_mat4(const float q[4], const float pos[3], float out[16])
  * Centripetal Catmull-Rom Position Spline & Pre-Baked Arc-Length + SQUAD LUT
  * ========================================================================= */
 
-#define WE_CAM_ARC_LUT_STEPS        16u
-#define WE_CAM_PATH_CACHE_WAYS      2u
-#define WE_CAM_PARALLAX_CACHE_SLOTS 8u
+#define WE_CAM_ARC_LUT_STEPS           16u
+#define WE_CAM_PATH_CACHE_INIT_CAP     8u
+#define WE_CAM_PATH_CACHE_MAX_WAYS     64u
+#define WE_CAM_PARALLAX_CACHE_INIT_CAP 32u
+#define WE_CAM_PARALLAX_CACHE_MAX      4096u
 
 typedef struct {
     float p0[3], p1[3], p2[3], p3[3];
@@ -473,13 +477,118 @@ typedef struct {
     double t_start;
     double t_end;
     double duration;
-    float knot_times[WE_CAMERA_MAX_KEYFRAMES];
-    baked_cam_segment_t segs[WE_CAMERA_MAX_KEYFRAMES];
+    we_camera_kf_t *raw_kfs;
+    float *knot_times;
+    baked_cam_segment_t *segs;
     bool valid;
 } baked_cam_path_t;
 
-static _Thread_local baked_cam_path_t s_baked_paths[WE_CAM_PATH_CACHE_WAYS];
-static _Thread_local uint64_t s_baked_tick = 0;
+typedef struct {
+    uintptr_t cam_key;
+    uint64_t last_use_tick;
+    double last_time_sec;
+    float px;
+    float py;
+    bool initialized;
+} cam_parallax_state_t;
+
+typedef struct we_cam_tls_cache {
+    baked_cam_path_t *paths;
+    uint32_t path_cap;
+    uint64_t baked_tick;
+    cam_parallax_state_t *parallax_states;
+    uint32_t parallax_cap;
+    uint64_t parallax_tick;
+    struct we_cam_tls_cache *prev;
+    struct we_cam_tls_cache *next;
+} we_cam_tls_cache_t;
+
+/* Hold only an 8-byte pointer in .tbss so thread stacks pay zero fixed cache cost. */
+static _Thread_local we_cam_tls_cache_t *s_cam_tls = NULL;
+static pthread_mutex_t s_cam_tls_list_lock = PTHREAD_MUTEX_INITIALIZER;
+static we_cam_tls_cache_t *s_cam_tls_list_head = NULL;
+static pthread_once_t s_cam_tls_key_once = PTHREAD_ONCE_INIT;
+static pthread_key_t s_cam_tls_key;
+
+static void free_baked_cam_path_buffers(baked_cam_path_t *p)
+{
+    if (!p) {
+        return;
+    }
+    free(p->raw_kfs);
+    free(p->knot_times);
+    free(p->segs);
+    memset(p, 0, sizeof(*p));
+}
+
+static void destroy_cam_tls_cache_locked(we_cam_tls_cache_t *tls)
+{
+    if (!tls) {
+        return;
+    }
+    if (tls->prev) {
+        tls->prev->next = tls->next;
+    } else if (s_cam_tls_list_head == tls) {
+        s_cam_tls_list_head = tls->next;
+    }
+    if (tls->next) {
+        tls->next->prev = tls->prev;
+    }
+    if (tls->paths) {
+        for (uint32_t i = 0; i < tls->path_cap; i++) {
+            free_baked_cam_path_buffers(&tls->paths[i]);
+        }
+        free(tls->paths);
+    }
+    free(tls->parallax_states);
+    free(tls);
+}
+
+static void on_cam_thread_exit(void *ptr)
+{
+    we_cam_tls_cache_t *tls = (we_cam_tls_cache_t *)ptr;
+    if (!tls) {
+        return;
+    }
+    pthread_mutex_lock(&s_cam_tls_list_lock);
+    destroy_cam_tls_cache_locked(tls);
+    pthread_mutex_unlock(&s_cam_tls_list_lock);
+}
+
+static void init_cam_tls_key(void) { (void)pthread_key_create(&s_cam_tls_key, on_cam_thread_exit); }
+
+__attribute__((destructor)) static void we_camera3d_cleanup_all_tls(void)
+{
+    pthread_mutex_lock(&s_cam_tls_list_lock);
+    while (s_cam_tls_list_head) {
+        destroy_cam_tls_cache_locked(s_cam_tls_list_head);
+    }
+    pthread_mutex_unlock(&s_cam_tls_list_lock);
+    s_cam_tls = NULL;
+}
+
+static we_cam_tls_cache_t *get_cam_tls_cache(bool create)
+{
+    we_cam_tls_cache_t *tls = s_cam_tls;
+    if (tls || !create) {
+        return tls;
+    }
+    (void)pthread_once(&s_cam_tls_key_once, init_cam_tls_key);
+    tls = (we_cam_tls_cache_t *)calloc(1, sizeof(*tls));
+    if (!tls) {
+        return NULL;
+    }
+    pthread_mutex_lock(&s_cam_tls_list_lock);
+    tls->next = s_cam_tls_list_head;
+    if (s_cam_tls_list_head) {
+        s_cam_tls_list_head->prev = tls;
+    }
+    s_cam_tls_list_head = tls;
+    pthread_mutex_unlock(&s_cam_tls_list_lock);
+    s_cam_tls = tls;
+    (void)pthread_setspecific(s_cam_tls_key, tls);
+    return tls;
+}
 
 static void eval_catmull_pos_and_deriv(const catmull_segment_t *s, float u, float out_pos[3],
                                        float out_deriv[3])
@@ -630,30 +739,72 @@ static void sanitize_single_kf(const we_camera_kf_t *src, const float fallback_p
 static const baked_cam_path_t *get_or_bake_cam_path(const we_camera_kf_t *kfs, uint32_t count,
                                                     uint32_t loop_mode)
 {
+    we_cam_tls_cache_t *tls = get_cam_tls_cache(true);
+    if (!tls) {
+        return NULL;
+    }
+
     uint64_t hash = hash_keyframes_fnv1a(kfs, count, loop_mode);
-    for (uint32_t w = 0; w < WE_CAM_PATH_CACHE_WAYS; w++) {
-        baked_cam_path_t *slot = &s_baked_paths[w];
+    size_t raw_bytes = (size_t)count * sizeof(we_camera_kf_t);
+    for (uint32_t w = 0; w < tls->path_cap; w++) {
+        baked_cam_path_t *slot = &tls->paths[w];
         if (slot->valid && slot->count == count && slot->loop_mode == loop_mode &&
-            slot->hash == hash) {
-            slot->last_use_tick = ++s_baked_tick;
+            slot->hash == hash && slot->raw_kfs && memcmp(slot->raw_kfs, kfs, raw_bytes) == 0) {
+            slot->last_use_tick = ++tls->baked_tick;
             return slot;
         }
     }
 
-    uint32_t victim = 0;
-    for (uint32_t w = 1; w < WE_CAM_PATH_CACHE_WAYS; w++) {
-        if (!s_baked_paths[w].valid ||
-            s_baked_paths[w].last_use_tick < s_baked_paths[victim].last_use_tick) {
+    uint32_t victim = UINT32_MAX;
+    for (uint32_t w = 0; w < tls->path_cap; w++) {
+        if (!tls->paths[w].valid) {
             victim = w;
+            break;
         }
     }
 
-    baked_cam_path_t *path = &s_baked_paths[victim];
-    path->valid = false;
+    if (victim == UINT32_MAX && tls->path_cap < WE_CAM_PATH_CACHE_MAX_WAYS) {
+        uint32_t new_cap = tls->path_cap == 0 ? WE_CAM_PATH_CACHE_INIT_CAP : tls->path_cap * 2u;
+        if (new_cap > WE_CAM_PATH_CACHE_MAX_WAYS) {
+            new_cap = WE_CAM_PATH_CACHE_MAX_WAYS;
+        }
+        baked_cam_path_t *grown =
+            (baked_cam_path_t *)realloc(tls->paths, (size_t)new_cap * sizeof(baked_cam_path_t));
+        if (grown) {
+            memset(&grown[tls->path_cap], 0,
+                   (size_t)(new_cap - tls->path_cap) * sizeof(baked_cam_path_t));
+            tls->paths = grown;
+            victim = tls->path_cap;
+            tls->path_cap = new_cap;
+        }
+    }
+
+    if (victim == UINT32_MAX) {
+        if (tls->path_cap == 0) {
+            return NULL;
+        }
+        victim = 0;
+        for (uint32_t w = 1; w < tls->path_cap; w++) {
+            if (tls->paths[w].last_use_tick < tls->paths[victim].last_use_tick) {
+                victim = w;
+            }
+        }
+    }
+
+    baked_cam_path_t *path = &tls->paths[victim];
+    free_baked_cam_path_buffers(path);
+    path->raw_kfs = (we_camera_kf_t *)malloc(raw_bytes);
+    path->knot_times = (float *)malloc((size_t)count * sizeof(float));
+    path->segs = (baked_cam_segment_t *)calloc((size_t)(count - 1u), sizeof(baked_cam_segment_t));
+    if (!path->raw_kfs || !path->knot_times || !path->segs) {
+        free_baked_cam_path_buffers(path);
+        return NULL;
+    }
+    memcpy(path->raw_kfs, kfs, raw_bytes);
     path->hash = hash;
     path->count = count;
     path->loop_mode = loop_mode;
-    path->last_use_tick = ++s_baked_tick;
+    path->last_use_tick = ++tls->baked_tick;
 
     we_camera_kf_t clean[WE_CAMERA_MAX_KEYFRAMES];
     float prev_pos[3] = {0.0f, 0.0f, 1000.0f};
@@ -871,6 +1022,27 @@ void we_camera3d_eval_spline(const we_camera_kf_t *kfs, uint32_t count, uint32_t
     }
 
     const baked_cam_path_t *path = get_or_bake_cam_path(kfs, count, loop_mode);
+    if (!path) {
+        we_camera_kf_t clean0;
+        const float def_pos[3] = {0.0f, 0.0f, 1000.0f};
+        sanitize_single_kf(&kfs[0], def_pos, &clean0);
+        if (out_pos) {
+            memcpy(out_pos, clean0.position, 3 * sizeof(float));
+        }
+        if (out_quat) {
+            memcpy(out_quat, clean0.orientation_quat, 4 * sizeof(float));
+        }
+        if (out_fov) {
+            *out_fov = clean0.fov_deg;
+        }
+        if (out_focal_dist) {
+            *out_focal_dist = clean0.focal_distance;
+        }
+        if (out_aperture) {
+            *out_aperture = clean0.aperture_fstop;
+        }
+        return;
+    }
     double t_in = isfinite(time_sec) ? time_sec : path->t_start;
     double t_eval_d = path->t_start;
 
@@ -982,51 +1154,79 @@ void we_camera3d_eval_spline(const we_camera_kf_t *kfs, uint32_t count, uint32_t
 }
 
 /* =========================================================================
- * Camera Initializer & Runtime Update Engine (Zero Heap Allocations)
+ * Camera Initializer & Runtime Update Engine
  * ========================================================================= */
-
-typedef struct {
-    uintptr_t cam_key;
-    uint64_t last_use_tick;
-    double last_time_sec;
-    float px;
-    float py;
-    bool initialized;
-} cam_parallax_state_t;
-
-static _Thread_local cam_parallax_state_t s_parallax_states[WE_CAM_PARALLAX_CACHE_SLOTS];
-static _Thread_local uint64_t s_parallax_tick = 0;
 
 static void reset_parallax_slot_for_cam(const we_camera3d_t *cam)
 {
+    we_cam_tls_cache_t *tls = get_cam_tls_cache(false);
+    if (!tls || !tls->parallax_states) {
+        return;
+    }
     uintptr_t key = (uintptr_t)cam;
-    for (uint32_t i = 0; i < WE_CAM_PARALLAX_CACHE_SLOTS; i++) {
-        if (s_parallax_states[i].cam_key == key) {
-            memset(&s_parallax_states[i], 0, sizeof(s_parallax_states[i]));
+    for (uint32_t i = 0; i < tls->parallax_cap; i++) {
+        if (tls->parallax_states[i].cam_key == key) {
+            memset(&tls->parallax_states[i], 0, sizeof(tls->parallax_states[i]));
         }
     }
 }
 
 static cam_parallax_state_t *get_parallax_slot_for_cam(const we_camera3d_t *cam)
 {
+    we_cam_tls_cache_t *tls = get_cam_tls_cache(true);
+    if (!tls) {
+        return NULL;
+    }
     uintptr_t key = (uintptr_t)cam;
-    for (uint32_t i = 0; i < WE_CAM_PARALLAX_CACHE_SLOTS; i++) {
-        if (s_parallax_states[i].cam_key == key) {
-            s_parallax_states[i].last_use_tick = ++s_parallax_tick;
-            return &s_parallax_states[i];
+    for (uint32_t i = 0; i < tls->parallax_cap; i++) {
+        if (tls->parallax_states[i].cam_key == key) {
+            tls->parallax_states[i].last_use_tick = ++tls->parallax_tick;
+            return &tls->parallax_states[i];
         }
     }
-    uint32_t victim = 0;
-    for (uint32_t i = 1; i < WE_CAM_PARALLAX_CACHE_SLOTS; i++) {
-        if (s_parallax_states[i].cam_key == 0 ||
-            s_parallax_states[i].last_use_tick < s_parallax_states[victim].last_use_tick) {
+
+    uint32_t victim = UINT32_MAX;
+    for (uint32_t i = 0; i < tls->parallax_cap; i++) {
+        if (tls->parallax_states[i].cam_key == 0) {
             victim = i;
+            break;
         }
     }
-    memset(&s_parallax_states[victim], 0, sizeof(s_parallax_states[victim]));
-    s_parallax_states[victim].cam_key = key;
-    s_parallax_states[victim].last_use_tick = ++s_parallax_tick;
-    return &s_parallax_states[victim];
+
+    if (victim == UINT32_MAX && tls->parallax_cap < WE_CAM_PARALLAX_CACHE_MAX) {
+        uint32_t new_cap =
+            tls->parallax_cap == 0 ? WE_CAM_PARALLAX_CACHE_INIT_CAP : tls->parallax_cap * 2u;
+        if (new_cap > WE_CAM_PARALLAX_CACHE_MAX) {
+            new_cap = WE_CAM_PARALLAX_CACHE_MAX;
+        }
+        cam_parallax_state_t *grown = (cam_parallax_state_t *)realloc(
+            tls->parallax_states, (size_t)new_cap * sizeof(cam_parallax_state_t));
+        if (grown) {
+            memset(&grown[tls->parallax_cap], 0,
+                   (size_t)(new_cap - tls->parallax_cap) * sizeof(cam_parallax_state_t));
+            tls->parallax_states = grown;
+            victim = tls->parallax_cap;
+            tls->parallax_cap = new_cap;
+        }
+    }
+
+    if (victim == UINT32_MAX) {
+        if (tls->parallax_cap == 0) {
+            return NULL;
+        }
+        victim = 0;
+        for (uint32_t i = 1; i < tls->parallax_cap; i++) {
+            if (tls->parallax_states[i].last_use_tick <
+                tls->parallax_states[victim].last_use_tick) {
+                victim = i;
+            }
+        }
+    }
+
+    memset(&tls->parallax_states[victim], 0, sizeof(tls->parallax_states[victim]));
+    tls->parallax_states[victim].cam_key = key;
+    tls->parallax_states[victim].last_use_tick = ++tls->parallax_tick;
+    return &tls->parallax_states[victim];
 }
 
 void we_camera3d_init_default(we_camera3d_t *cam, float viewport_w, float viewport_h)
@@ -1147,27 +1347,29 @@ void we_camera3d_update(we_camera3d_t *cam, double time_sec, float pointer_norm_
     float smoothing = sanitize_f32(cam->parallax_smoothing, 1.0f);
     if (pax != 0.0f || pay != 0.0f) {
         cam_parallax_state_t *st = get_parallax_slot_for_cam(cam);
-        if (!st->initialized || smoothing <= 0.0f || smoothing >= 0.999f) {
-            st->px = target_px;
-            st->py = target_py;
-            st->last_time_sec = t_sec;
-            st->initialized = true;
-        } else {
-            double dt = t_sec - st->last_time_sec;
-            if (dt < 0.0 || dt > 1.0) {
+        if (st) {
+            if (!st->initialized || smoothing <= 0.0f || smoothing >= 0.999f) {
                 st->px = target_px;
                 st->py = target_py;
                 st->last_time_sec = t_sec;
-            } else if (dt > 0.0) {
-                float s = clamp_f32(smoothing, 0.001f, 0.999f);
-                float alpha = 1.0f - expf(logf(1.0f - s) * (float)dt * 60.0f);
-                st->px += alpha * (target_px - st->px);
-                st->py += alpha * (target_py - st->py);
-                st->last_time_sec = t_sec;
+                st->initialized = true;
+            } else {
+                double dt = t_sec - st->last_time_sec;
+                if (dt < 0.0 || dt > 1.0) {
+                    st->px = target_px;
+                    st->py = target_py;
+                    st->last_time_sec = t_sec;
+                } else if (dt > 0.0) {
+                    float s = clamp_f32(smoothing, 0.001f, 0.999f);
+                    float alpha = 1.0f - expf(logf(1.0f - s) * (float)dt * 60.0f);
+                    st->px += alpha * (target_px - st->px);
+                    st->py += alpha * (target_py - st->py);
+                    st->last_time_sec = t_sec;
+                }
             }
+            smooth_px = st->px;
+            smooth_py = st->py;
         }
-        smooth_px = st->px;
-        smooth_py = st->py;
     }
 
     float fx = cam->target_pos[0] - cam->eye_pos[0];
@@ -1212,7 +1414,8 @@ void we_camera3d_update(we_camera3d_t *cam, double time_sec, float pointer_norm_
         float fov_deg = sanitize_f32(cam->fov_y_deg, 60.0f);
         float fovy_rad = clamp_f32(fov_deg * (float)(M_PI / 180.0), 0.1f, 2.8f);
         float nz = (isfinite(cam->near_z) && cam->near_z > 0.01f) ? cam->near_z : 1.0f;
-        float fz_val = (isfinite(cam->far_z) && cam->far_z > nz) ? cam->far_z : (nz + 1000.0f);
+        float fz_val =
+            (isfinite(cam->far_z) && cam->far_z > nz + 1e-4f) ? cam->far_z : (nz + 1000.0f);
         mat4_perspective_rh_gl(fovy_rad, aspect, nz, fz_val, cam->proj_matrix);
         mat4_mul_mat4(cam->proj_matrix, cam->view_matrix, cam->view_proj_matrix);
     } else {
@@ -1221,7 +1424,8 @@ void we_camera3d_update(we_camera3d_t *cam, double time_sec, float pointer_norm_
         float half_h = 540.0f;
         float half_w = half_h * aspect;
         float nz = (isfinite(cam->near_z) && cam->near_z > 0.01f) ? cam->near_z : 0.1f;
-        float fz_val = (isfinite(cam->far_z) && cam->far_z > nz) ? cam->far_z : 5000.0f;
+        float fz_val =
+            (isfinite(cam->far_z) && cam->far_z > nz + 1e-4f) ? cam->far_z : (nz + 5000.0f);
         mat4_ortho_gl(-half_w, half_w, half_h, -half_h, nz, fz_val, cam->proj_matrix);
         mat4_mul_mat4(cam->proj_matrix, cam->view_matrix, cam->view_proj_matrix);
     }

@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <gbm.h>
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -510,6 +511,43 @@ static void test_headless_gles31_compile_all_50(void)
            "driver.\n");
 }
 
+static void *effects_cache_worker(void *arg)
+{
+    (void)arg;
+    for (uint32_t id = 1; id <= WE_BUILTIN_EFFECT_COUNT; id++) {
+        const char *v = we_builtin_effect_get_stage_glsl((we_builtin_effect_id_t)id, false);
+        const char *f = we_builtin_effect_get_stage_glsl((we_builtin_effect_id_t)id, true);
+        assert(v != NULL && f != NULL && v[0] != '\0' && f[0] != '\0');
+    }
+    return NULL;
+}
+
+static void test_builtin_effects_multithread_and_cache(void)
+{
+    printf("[+] Testing dynamic stage cache, bounds & thread safety...\n");
+
+    pthread_t t0, t1;
+    assert(pthread_create(&t0, NULL, effects_cache_worker, NULL) == 0);
+    assert(pthread_create(&t1, NULL, effects_cache_worker, NULL) == 0);
+    assert(pthread_join(t0, NULL) == 0);
+    assert(pthread_join(t1, NULL) == 0);
+
+    const char *v1 = we_builtin_effect_get_stage_glsl(WE_EFFECT_BLOOM, false);
+    const char *v2 = we_builtin_effect_get_stage_glsl(WE_EFFECT_BLOOM, false);
+    assert(v1 != NULL && v1 == v2);
+
+    char small_buf[4];
+    assert(we_builtin_effect_decompress_stage(WE_EFFECT_BLOOM, true, small_buf,
+                                              sizeof(small_buf)) == 0u);
+    assert(we_builtin_effect_decompress_stage(WE_EFFECT_BLOOM, true, NULL, 1024u) == 0u);
+    assert(we_builtin_effect_decompress_stage(WE_EFFECT_BLOOM, true, small_buf, 0u) == 0u);
+
+    assert(we_builtin_effect_get_stage_glsl((we_builtin_effect_id_t)999u, true) == NULL);
+    assert(we_builtin_effect_get_stage_glsl((we_builtin_effect_id_t)0u, false) == NULL);
+
+    printf("    -> Dynamic stage cache, bounds & terminal fail behavior verified.\n");
+}
+
 int main(void)
 {
     printf("==========================================================\n");
@@ -520,6 +558,7 @@ int main(void)
     test_decompression_performance_and_syntax();
     test_robin_hood_slug_lookup();
     test_headless_gles31_compile_all_50();
+    test_builtin_effects_multithread_and_cache();
 
     printf("==========================================================\n");
     printf("  >>> ALL BUILT-IN EFFECT TESTS PASSED CLEANLY (100%%) <<<\n");
