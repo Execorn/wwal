@@ -2862,7 +2862,7 @@ typedef struct {
 } verified_manifest_slot_t;
 
 static pthread_mutex_t g_mf_cache_mu = PTHREAD_MUTEX_INITIALIZER;
-static verified_manifest_slot_t g_mf_cache[32];
+static verified_manifest_slot_t *g_mf_cache = nullptr;
 
 static void copy_manifest_fast(wwpkg_manifest_t *dst, const wwpkg_manifest_t *src, size_t desc_len)
 {
@@ -2897,7 +2897,8 @@ static bool parse_manifest_from_string_opts(const char *json_str, size_t len, ww
 
         mslot = read_u32_le(h_raw) & 31u;
         pthread_mutex_lock(&g_mf_cache_mu);
-        if (g_mf_cache[mslot].valid && memcmp(g_mf_cache[mslot].sha256, h_raw, 32) == 0) {
+        if (g_mf_cache && g_mf_cache[mslot].valid &&
+            memcmp(g_mf_cache[mslot].sha256, h_raw, 32) == 0) {
             copy_manifest_fast(m, &g_mf_cache[mslot].parsed, g_mf_cache[mslot].desc_len);
             pthread_mutex_unlock(&g_mf_cache_mu);
             return true;
@@ -2928,10 +2929,15 @@ static bool parse_manifest_from_string_opts(const char *json_str, size_t len, ww
     if (ok && !allow_empty_preview) {
         size_t dlen = strlen(m->description);
         pthread_mutex_lock(&g_mf_cache_mu);
-        memcpy(g_mf_cache[mslot].sha256, h_raw, 32);
-        g_mf_cache[mslot].desc_len = (uint16_t)dlen;
-        copy_manifest_fast(&g_mf_cache[mslot].parsed, m, dlen);
-        g_mf_cache[mslot].valid = true;
+        if (!g_mf_cache) {
+            g_mf_cache = (verified_manifest_slot_t *)calloc(32u, sizeof(verified_manifest_slot_t));
+        }
+        if (g_mf_cache) {
+            memcpy(g_mf_cache[mslot].sha256, h_raw, 32);
+            g_mf_cache[mslot].desc_len = (uint16_t)dlen;
+            copy_manifest_fast(&g_mf_cache[mslot].parsed, m, dlen);
+            g_mf_cache[mslot].valid = true;
+        }
         pthread_mutex_unlock(&g_mf_cache_mu);
     }
     return ok;
@@ -3595,20 +3601,29 @@ struct wwpkg_package {
 };
 
 #define WWPKG_FAST_PKG_SLOTS 8u
-static wwpkg_package_t g_pkg_pool[WWPKG_FAST_PKG_SLOTS];
+static wwpkg_package_t *g_pkg_pool = nullptr;
+static pthread_once_t g_pkg_pool_once = PTHREAD_ONCE_INIT;
 static _Atomic uint32_t g_pkg_pool_mask = 0u;
+
+static void init_pkg_pool_once(void)
+{
+    g_pkg_pool = (wwpkg_package_t *)calloc(WWPKG_FAST_PKG_SLOTS, sizeof(wwpkg_package_t));
+}
 
 static wwpkg_package_t *alloc_empty_package(void)
 {
+    pthread_once(&g_pkg_pool_once, init_pkg_pool_once);
     wwpkg_package_t *pkg = nullptr;
-    uint32_t mask = atomic_load_explicit(&g_pkg_pool_mask, memory_order_relaxed);
-    while (mask != ((1u << WWPKG_FAST_PKG_SLOTS) - 1u)) {
-        uint32_t free_idx = (uint32_t)__builtin_ctz(~mask);
-        uint32_t bit = 1u << free_idx;
-        if (atomic_compare_exchange_weak_explicit(&g_pkg_pool_mask, &mask, mask | bit,
-                                                  memory_order_acquire, memory_order_relaxed)) {
-            pkg = &g_pkg_pool[free_idx];
-            break;
+    if (g_pkg_pool) {
+        uint32_t mask = atomic_load_explicit(&g_pkg_pool_mask, memory_order_relaxed);
+        while (mask != ((1u << WWPKG_FAST_PKG_SLOTS) - 1u)) {
+            uint32_t free_idx = (uint32_t)__builtin_ctz(~mask);
+            uint32_t bit = 1u << free_idx;
+            if (atomic_compare_exchange_weak_explicit(&g_pkg_pool_mask, &mask, mask | bit,
+                                                      memory_order_acquire, memory_order_relaxed)) {
+                pkg = &g_pkg_pool[free_idx];
+                break;
+            }
         }
     }
     if (!pkg) {
@@ -3684,10 +3699,13 @@ void wwpkg_close(wwpkg_package_t *pkg)
         free(pkg->raw_manifest_str);
     }
     pthread_mutex_destroy(&pkg->lock);
-    if (pkg >= &g_pkg_pool[0] && pkg < &g_pkg_pool[WWPKG_FAST_PKG_SLOTS]) {
-        uint32_t idx = (uint32_t)(pkg - &g_pkg_pool[0]);
-        atomic_fetch_and_explicit(&g_pkg_pool_mask, ~(1u << idx), memory_order_release);
-        return;
+    if (g_pkg_pool) {
+        for (uint32_t i = 0; i < WWPKG_FAST_PKG_SLOTS; ++i) {
+            if (pkg == &g_pkg_pool[i]) {
+                atomic_fetch_and_explicit(&g_pkg_pool_mask, ~(1u << i), memory_order_release);
+                return;
+            }
+        }
     }
     free(pkg);
 }
@@ -3824,7 +3842,7 @@ typedef struct {
 } verified_env_slot_t;
 
 static pthread_mutex_t g_env_cache_mu = PTHREAD_MUTEX_INITIALIZER;
-static verified_env_slot_t g_env_cache[64];
+static verified_env_slot_t *g_env_cache = nullptr;
 
 static bool verify_outer_envelope_bytes(const uint8_t *raw, size_t len,
                                         wwpkg_outer_envelope_t *out_env, int *out_err)
@@ -3845,7 +3863,7 @@ static bool verify_outer_envelope_bytes(const uint8_t *raw, size_t len,
 
     uint32_t slot = read_u32_le(raw + offsetof(wwpkg_outer_envelope_t, signature)) & 63u;
     pthread_mutex_lock(&g_env_cache_mu);
-    if (g_env_cache[slot].valid &&
+    if (g_env_cache && g_env_cache[slot].valid &&
         memcmp(g_env_cache[slot].raw, raw, sizeof(wwpkg_outer_envelope_t)) == 0) {
         if (out_env) {
             *out_env = g_env_cache[slot].parsed;
@@ -3872,9 +3890,14 @@ static bool verify_outer_envelope_bytes(const uint8_t *raw, size_t len,
     }
 
     pthread_mutex_lock(&g_env_cache_mu);
-    memcpy(g_env_cache[slot].raw, raw, sizeof(wwpkg_outer_envelope_t));
-    g_env_cache[slot].parsed = env;
-    g_env_cache[slot].valid = true;
+    if (!g_env_cache) {
+        g_env_cache = (verified_env_slot_t *)calloc(64u, sizeof(verified_env_slot_t));
+    }
+    if (g_env_cache) {
+        memcpy(g_env_cache[slot].raw, raw, sizeof(wwpkg_outer_envelope_t));
+        g_env_cache[slot].parsed = env;
+        g_env_cache[slot].valid = true;
+    }
     pthread_mutex_unlock(&g_env_cache_mu);
 
     if (out_env) {

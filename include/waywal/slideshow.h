@@ -13,6 +13,7 @@ extern "C" {
 #endif
 
 struct daemon_state;
+struct slideshow_async;
 
 typedef struct slideshow_engine {
     bool active;
@@ -63,6 +64,8 @@ typedef struct slideshow_engine {
     size_t current_file_idx;
 
     struct daemon_state *daemon_state;
+    bool *is_dir_list;
+    struct slideshow_async *async;
 } slideshow_engine_t;
 
 bool slideshow_init(slideshow_engine_t *ss, struct daemon_state *state);

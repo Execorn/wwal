@@ -7,6 +7,7 @@
 #include "waywal/log.h"
 
 #include <dlfcn.h>
+#include <pthread.h>
 #if defined(__has_include) && __has_include(<stdckdint.h>)
 #include <stdckdint.h>
 #else
@@ -17,8 +18,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define GIF_MAX_LZW_BITS   12
-#define GIF_LZW_TABLE_SIZE (1 << GIF_MAX_LZW_BITS)
+#define GIF_MAX_LZW_BITS          12
+#define GIF_LZW_TABLE_SIZE        (1 << GIF_MAX_LZW_BITS)
+#define ANIM_MAX_CANVAS_DIM       16384u
+#define ANIM_MAX_DECODED_BYTES    (256ULL * 1024ULL * 1024ULL)
+#define ANIM_MAX_FRAMES           16384u
+#define ANIM_MAX_COMPRESSED_BYTES (256ULL * 1024ULL * 1024ULL)
+#define ANIM_WEBP_DEMUX_ABI_VER   0x0107
 
 typedef struct {
     uint16_t left;
@@ -78,6 +84,32 @@ typedef int (*pfn_WebPAnimDecoderHasMoreFrames)(const void *);
 typedef void (*pfn_WebPAnimDecoderReset)(void *);
 typedef void (*pfn_WebPAnimDecoderDelete)(void *);
 
+_Static_assert(sizeof(webp_anim_options_t) == 36u, "WebPAnimDecoderOptions ABI size mismatch");
+_Static_assert(sizeof(webp_anim_info_t) == 36u, "WebPAnimInfo ABI size mismatch");
+
+typedef struct {
+    void *dl_demux;
+    pfn_WebPAnimDecoderOptionsInitInternal fn_opts_init;
+    pfn_WebPAnimDecoderNewInternal fn_new;
+    pfn_WebPAnimDecoderGetInfo fn_info;
+    pfn_WebPAnimDecoderGetNext fn_next;
+    pfn_WebPAnimDecoderHasMoreFrames fn_has_more;
+    pfn_WebPAnimDecoderReset fn_reset;
+    pfn_WebPAnimDecoderDelete fn_delete;
+    bool ok;
+} webp_demux_api_t;
+
+static webp_demux_api_t s_webp_api;
+static pthread_once_t s_webp_once = PTHREAD_ONCE_INIT;
+
+typedef struct {
+    uint8_t *rgba;
+    uint32_t delay_ms;
+    uint32_t frame_idx;
+    bool ready;
+    bool ok;
+} apng_ping_pong_slot_t;
+
 struct waywal_anim_decoder {
     waywal_anim_format_t format;
     uint8_t *raw_data;
@@ -113,15 +145,25 @@ struct waywal_anim_decoder {
     uint16_t png_trns_count;
     apng_frame_t *apng_frames;
 
-    void *webp_dl_demux;
-    void *webp_dl_codec;
+    apng_ping_pong_slot_t apng_slots[2];
+    pthread_mutex_t apng_mu;
+    pthread_cond_t apng_cv_prod;
+    pthread_cond_t apng_cv_cons;
+    pthread_t apng_thread;
+    bool apng_sync_init;
+    bool apng_thread_started;
+    bool apng_stop;
+    bool apng_reset_pending;
+    bool apng_worker_busy;
+    uint64_t apng_epoch;
+    uint32_t apng_worker_next_frame;
+    uint8_t apng_write_slot;
+    uint8_t apng_read_slot;
+    int apng_held_slot;
+
     void *webp_dec;
     webp_data_t webp_raw;
     int webp_prev_timestamp;
-    pfn_WebPAnimDecoderGetNext fn_webp_next;
-    pfn_WebPAnimDecoderHasMoreFrames fn_webp_has_more;
-    pfn_WebPAnimDecoderReset fn_webp_reset;
-    pfn_WebPAnimDecoderDelete fn_webp_delete;
 };
 
 static uint16_t read_le16(const uint8_t *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
@@ -145,7 +187,7 @@ static bool skip_gif_subblocks(const uint8_t *data, size_t size, size_t *pos)
         if (block_len == 0) {
             return true;
         }
-        if (*pos + block_len > size) {
+        if ((size_t)block_len > size - *pos) {
             return false;
         }
         *pos += block_len;
@@ -167,10 +209,11 @@ static bool probe_gif_frames(const uint8_t *data, size_t size, uint32_t *out_fra
     size_t pos = 13;
     if (packed & 0x80u) {
         uint32_t gct_count = 1u << ((packed & 0x07u) + 1u);
-        if (pos + gct_count * 3u > size) {
+        size_t gct_bytes = (size_t)gct_count * 3u;
+        if (gct_bytes > size - pos) {
             return false;
         }
-        pos += gct_count * 3u;
+        pos += gct_bytes;
     }
 
     uint32_t frames = 0;
@@ -193,17 +236,18 @@ static bool probe_gif_frames(const uint8_t *data, size_t size, uint32_t *out_fra
                 break;
             }
         } else if (marker == 0x2Cu) {
-            if (pos + 9 > size) {
+            if (size - pos < 9u) {
                 break;
             }
             uint8_t img_packed = data[pos + 8];
             pos += 9;
             if (img_packed & 0x80u) {
                 uint32_t lct_count = 1u << ((img_packed & 0x07u) + 1u);
-                if (pos + lct_count * 3u > size) {
+                size_t lct_bytes = (size_t)lct_count * 3u;
+                if (lct_bytes > size - pos) {
                     break;
                 }
-                pos += lct_count * 3u;
+                pos += lct_bytes;
             }
             if (pos >= size) {
                 break;
@@ -235,10 +279,10 @@ static bool probe_apng(const uint8_t *data, size_t size)
     }
 
     size_t pos = 8;
-    while (pos + 12 <= size) {
+    while (pos <= size - 12u) {
         uint32_t chunk_len = read_be32(data + pos);
         const uint8_t *chunk_type = data + pos + 4;
-        if (pos + 12 + (size_t)chunk_len > size) {
+        if ((size_t)chunk_len > size - pos - 12u) {
             return false;
         }
         if (memcmp(chunk_type, "acTL", 4) == 0 && chunk_len >= 8) {
@@ -248,7 +292,7 @@ static bool probe_apng(const uint8_t *data, size_t size)
         if (memcmp(chunk_type, "IDAT", 4) == 0 || memcmp(chunk_type, "IEND", 4) == 0) {
             return false;
         }
-        pos += 12 + (size_t)chunk_len;
+        pos += 12u + (size_t)chunk_len;
     }
     return false;
 }
@@ -268,16 +312,16 @@ static bool probe_webp_anim(const uint8_t *data, size_t size)
         }
     }
     size_t pos = 12;
-    while (pos + 8 <= size) {
+    while (pos <= size - 8u) {
         uint32_t chunk_size = read_le32(data + pos + 4);
         if (memcmp(data + pos, "ANIM", 4) == 0 || memcmp(data + pos, "ANMF", 4) == 0) {
             return true;
         }
         size_t padded = (size_t)chunk_size + (chunk_size & 1u);
-        if (pos + 8 + padded > size) {
+        if (padded > size - pos - 8u) {
             break;
         }
-        pos += 8 + padded;
+        pos += 8u + padded;
     }
     return false;
 }
@@ -472,8 +516,15 @@ static bool init_gif_decoder(waywal_anim_decoder_t *dec)
 
     dec->canvas_w = read_le16(data + 6);
     dec->canvas_h = read_le16(data + 8);
-    if (dec->canvas_w == 0 || dec->canvas_h == 0 || dec->canvas_w > 16384 ||
-        dec->canvas_h > 16384) {
+    if (dec->canvas_w == 0 || dec->canvas_h == 0 || dec->canvas_w > ANIM_MAX_CANVAS_DIM ||
+        dec->canvas_h > ANIM_MAX_CANVAS_DIM) {
+        return false;
+    }
+
+    size_t early_pixels = 0;
+    size_t early_bytes = 0;
+    if (ckd_mul(&early_pixels, (size_t)dec->canvas_w, (size_t)dec->canvas_h) ||
+        ckd_mul(&early_bytes, early_pixels, (size_t)4u) || early_bytes > ANIM_MAX_DECODED_BYTES) {
         return false;
     }
 
@@ -484,11 +535,12 @@ static bool init_gif_decoder(waywal_anim_decoder_t *dec)
     if (packed & 0x80u) {
         dec->gif_has_gct = true;
         dec->gif_gct_count = (uint16_t)(1u << ((packed & 0x07u) + 1u));
-        if (pos + (size_t)dec->gif_gct_count * 3u > size) {
+        size_t gct_bytes = (size_t)dec->gif_gct_count * 3u;
+        if (gct_bytes > size - pos) {
             return false;
         }
-        memcpy(dec->gif_gct, data + pos, (size_t)dec->gif_gct_count * 3u);
-        pos += (size_t)dec->gif_gct_count * 3u;
+        memcpy(dec->gif_gct, data + pos, gct_bytes);
+        pos += gct_bytes;
     }
 
     uint32_t cap = 16;
@@ -501,6 +553,7 @@ static bool init_gif_decoder(waywal_anim_decoder_t *dec)
     bool cur_has_trans = false;
     uint8_t cur_trans_idx = 0;
     uint32_t cur_delay_ms = 100;
+    bool needs_prev_canvas = false;
 
     while (pos < size) {
         uint8_t marker = data[pos++];
@@ -511,7 +564,7 @@ static bool init_gif_decoder(waywal_anim_decoder_t *dec)
                 break;
             }
             uint8_t ext = data[pos++];
-            if (ext == 0xF9u && pos + 6 <= size && data[pos] == 4) {
+            if (ext == 0xF9u && size - pos >= 6u && data[pos] == 4) {
                 uint8_t gce_packed = data[pos + 1];
                 uint16_t delay_cs = read_le16(data + pos + 2);
                 uint8_t trans_idx = data[pos + 4];
@@ -525,13 +578,19 @@ static bool init_gif_decoder(waywal_anim_decoder_t *dec)
                 break;
             }
         } else if (marker == 0x2Cu) {
-            if (pos + 9 > size) {
+            if (size - pos < 9u) {
                 break;
             }
+            if (dec->frame_count >= ANIM_MAX_FRAMES) {
+                return false;
+            }
             if (dec->frame_count >= cap) {
-                uint32_t new_cap = cap * 2u;
-                gif_frame_meta_t *nf = (gif_frame_meta_t *)realloc(
-                    dec->gif_frames, (size_t)new_cap * sizeof(gif_frame_meta_t));
+                uint32_t new_cap = (cap > ANIM_MAX_FRAMES / 2u) ? ANIM_MAX_FRAMES : (cap * 2u);
+                size_t alloc_bytes = 0;
+                if (ckd_mul(&alloc_bytes, (size_t)new_cap, sizeof(gif_frame_meta_t))) {
+                    return false;
+                }
+                gif_frame_meta_t *nf = (gif_frame_meta_t *)realloc(dec->gif_frames, alloc_bytes);
                 if (!nf) {
                     return false;
                 }
@@ -557,11 +616,12 @@ static bool init_gif_decoder(waywal_anim_decoder_t *dec)
             if (img_packed & 0x80u) {
                 f->has_lct = true;
                 f->lct_count = (uint16_t)(1u << ((img_packed & 0x07u) + 1u));
-                if (pos + (size_t)f->lct_count * 3u > size) {
+                size_t lct_bytes = (size_t)f->lct_count * 3u;
+                if (lct_bytes > size - pos) {
                     break;
                 }
-                memcpy(f->lct, data + pos, (size_t)f->lct_count * 3u);
-                pos += (size_t)f->lct_count * 3u;
+                memcpy(f->lct, data + pos, lct_bytes);
+                pos += lct_bytes;
             }
 
             if (pos >= size) {
@@ -574,6 +634,9 @@ static bool init_gif_decoder(waywal_anim_decoder_t *dec)
             }
 
             if (f->width > 0 && f->height > 0) {
+                if (f->disposal == 3) {
+                    needs_prev_canvas = true;
+                }
                 dec->frame_count++;
             }
 
@@ -596,10 +659,6 @@ static bool init_gif_decoder(waywal_anim_decoder_t *dec)
         ckd_mul(&canvas_bytes, num_pixels, (size_t)4u)) {
         return false;
     }
-    dec->canvas = (uint8_t *)calloc(1, canvas_bytes);
-    if (!dec->canvas) {
-        return false;
-    }
 
     size_t max_frame_pixels = 0;
     for (uint32_t i = 0; i < dec->frame_count; ++i) {
@@ -607,6 +666,20 @@ static bool init_gif_decoder(waywal_anim_decoder_t *dec)
         if (fp > max_frame_pixels) {
             max_frame_pixels = fp;
         }
+    }
+
+    size_t total_gif_bytes = canvas_bytes;
+    if (needs_prev_canvas && ckd_add(&total_gif_bytes, total_gif_bytes, canvas_bytes)) {
+        return false;
+    }
+    if (ckd_add(&total_gif_bytes, total_gif_bytes, max_frame_pixels) ||
+        total_gif_bytes > ANIM_MAX_DECODED_BYTES) {
+        return false;
+    }
+
+    dec->canvas = (uint8_t *)calloc(1, canvas_bytes);
+    if (!dec->canvas) {
+        return false;
     }
     if (max_frame_pixels > 0 && !ensure_scratch_buf(dec, max_frame_pixels)) {
         return false;
@@ -735,6 +808,7 @@ typedef struct {
     size_t pos;
     uint32_t bitbuf;
     uint32_t bitcnt;
+    bool err;
 } deflate_bits_t;
 
 typedef struct {
@@ -744,12 +818,17 @@ typedef struct {
 
 static uint32_t bits_pull(deflate_bits_t *b, uint32_t n)
 {
+    if (b->err || n > 24u) {
+        b->err = true;
+        return 0u;
+    }
     while (b->bitcnt < n) {
         if (b->pos >= b->size) {
-            return 0;
+            b->err = true;
+            return 0u;
         }
         b->bitbuf |= ((uint32_t)b->src[b->pos++]) << b->bitcnt;
-        b->bitcnt += 8;
+        b->bitcnt += 8u;
     }
     uint32_t val = b->bitbuf & ((1u << n) - 1u);
     b->bitbuf >>= n;
@@ -759,6 +838,9 @@ static uint32_t bits_pull(deflate_bits_t *b, uint32_t n)
 
 static bool huff_build(huff_table_t *h, const uint8_t *lengths, uint32_t num_syms)
 {
+    if (num_syms > 288u) {
+        return false;
+    }
     memset(h->counts, 0, sizeof(h->counts));
     for (uint32_t i = 0; i < num_syms; ++i) {
         if (lengths[i] > 15) {
@@ -769,14 +851,20 @@ static bool huff_build(huff_table_t *h, const uint8_t *lengths, uint32_t num_sym
     h->counts[0] = 0;
 
     uint16_t offs[16];
-    uint16_t sum = 0;
+    uint32_t sum = 0;
     for (int len = 1; len <= 15; ++len) {
-        offs[len] = sum;
-        sum = (uint16_t)(sum + h->counts[len]);
+        offs[len] = (uint16_t)sum;
+        sum += h->counts[len];
+        if (sum > 288u) {
+            return false;
+        }
     }
     for (uint32_t i = 0; i < num_syms; ++i) {
         uint8_t l = lengths[i];
         if (l != 0) {
+            if (offs[l] >= 288u) {
+                return false;
+            }
             h->symbols[offs[l]++] = (uint16_t)i;
         }
     }
@@ -789,7 +877,10 @@ static int huff_decode(deflate_bits_t *b, const huff_table_t *h)
     int first = 0;
     int index = 0;
     for (int len = 1; len <= 15; ++len) {
-        code |= (int)bits_pull(b, 1);
+        code |= (int)bits_pull(b, 1u);
+        if (b->err) {
+            return -1;
+        }
         int count = h->counts[len];
         int diff = code - first;
         if (diff >= 0 && diff < count) {
@@ -813,17 +904,18 @@ static bool zlib_inflate_buf(const uint8_t *src, size_t src_size, uint8_t *dst, 
     if ((cmf & 0x0Fu) != 8 || ((cmf * 256u + flg) % 31u) != 0) {
         return false;
     }
-    size_t start_offset = (flg & 0x20u) ? 6 : 2;
-    if (start_offset >= src_size) {
+    size_t start_offset = (flg & 0x20u) ? 6u : 2u;
+    if (start_offset >= src_size - 4u) {
         return false;
     }
 
     deflate_bits_t b = {
         .src = src,
-        .size = src_size - 4,
+        .size = src_size - 4u,
         .pos = start_offset,
         .bitbuf = 0,
         .bitcnt = 0,
+        .err = false,
     };
 
     static const uint16_t len_base[29] = {3,  4,  5,  6,   7,   8,   9,   10,  11, 13,
@@ -843,8 +935,11 @@ static bool zlib_inflate_buf(const uint8_t *src, size_t src_size, uint8_t *dst, 
     uint32_t bfinal = 0;
 
     do {
-        bfinal = bits_pull(&b, 1);
-        uint32_t btype = bits_pull(&b, 2);
+        bfinal = bits_pull(&b, 1u);
+        uint32_t btype = bits_pull(&b, 2u);
+        if (b.err) {
+            return false;
+        }
 
         if (btype == 0) {
             /* RFC 1951: Discard remaining bits in current byte, rewind any full prefetched bytes */
@@ -854,7 +949,7 @@ static bool zlib_inflate_buf(const uint8_t *src, size_t src_size, uint8_t *dst, 
             }
             b.bitbuf = 0;
             b.bitcnt = 0;
-            if (b.pos + 4 > b.size) {
+            if (b.size - b.pos < 4u) {
                 return false;
             }
             uint16_t blk_len = read_le16(b.src + b.pos);
@@ -863,7 +958,7 @@ static bool zlib_inflate_buf(const uint8_t *src, size_t src_size, uint8_t *dst, 
             if ((uint16_t)~blk_len != blk_nlen) {
                 return false;
             }
-            if (b.pos + blk_len > b.size || out_pos + blk_len > dst_cap) {
+            if (blk_len > b.size - b.pos || blk_len > dst_cap - out_pos) {
                 return false;
             }
             memcpy(dst + out_pos, b.src + b.pos, blk_len);
@@ -888,16 +983,19 @@ static bool zlib_inflate_buf(const uint8_t *src, size_t src_size, uint8_t *dst, 
                 huff_build(&litlen_tab, lengths, 288);
                 huff_build(&dist_tab, lengths + 288, 32);
             } else {
-                uint32_t hlit = bits_pull(&b, 5) + 257u;
-                uint32_t hdist = bits_pull(&b, 5) + 1u;
-                uint32_t hclen = bits_pull(&b, 4) + 4u;
-                if (hlit > 286 || hdist > 30) {
+                uint32_t hlit = bits_pull(&b, 5u) + 257u;
+                uint32_t hdist = bits_pull(&b, 5u) + 1u;
+                uint32_t hclen = bits_pull(&b, 4u) + 4u;
+                if (b.err || hlit > 286 || hdist > 30) {
                     return false;
                 }
                 uint8_t clen[19];
                 memset(clen, 0, sizeof(clen));
                 for (uint32_t i = 0; i < hclen; ++i) {
-                    clen[clen_order[i]] = (uint8_t)bits_pull(&b, 3);
+                    clen[clen_order[i]] = (uint8_t)bits_pull(&b, 3u);
+                }
+                if (b.err) {
+                    return false;
                 }
                 huff_table_t clen_tab;
                 if (!huff_build(&clen_tab, clen, 19)) {
@@ -907,7 +1005,7 @@ static bool zlib_inflate_buf(const uint8_t *src, size_t src_size, uint8_t *dst, 
                 uint32_t total = hlit + hdist;
                 while (idx < total) {
                     int sym = huff_decode(&b, &clen_tab);
-                    if (sym < 0) {
+                    if (sym < 0 || b.err) {
                         return false;
                     }
                     if (sym < 16) {
@@ -920,13 +1018,13 @@ static bool zlib_inflate_buf(const uint8_t *src, size_t src_size, uint8_t *dst, 
                                 return false;
                             }
                             val = lengths[idx - 1];
-                            rep = 3u + bits_pull(&b, 2);
+                            rep = 3u + bits_pull(&b, 2u);
                         } else if (sym == 17) {
-                            rep = 3u + bits_pull(&b, 3);
+                            rep = 3u + bits_pull(&b, 3u);
                         } else {
-                            rep = 11u + bits_pull(&b, 7);
+                            rep = 11u + bits_pull(&b, 7u);
                         }
-                        if (idx + rep > total) {
+                        if (b.err || idx + rep > total) {
                             return false;
                         }
                         while (rep-- > 0) {
@@ -942,7 +1040,7 @@ static bool zlib_inflate_buf(const uint8_t *src, size_t src_size, uint8_t *dst, 
 
             for (;;) {
                 int sym = huff_decode(&b, &litlen_tab);
-                if (sym < 0) {
+                if (sym < 0 || b.err) {
                     return false;
                 }
                 if (sym < 256) {
@@ -958,12 +1056,15 @@ static bool zlib_inflate_buf(const uint8_t *src, size_t src_size, uint8_t *dst, 
                         return false;
                     }
                     uint32_t match_len = len_base[sym] + bits_pull(&b, len_extra[sym]);
+                    if (b.err) {
+                        return false;
+                    }
                     int dsym = huff_decode(&b, &dist_tab);
-                    if (dsym < 0 || dsym >= 30) {
+                    if (dsym < 0 || dsym >= 30 || b.err) {
                         return false;
                     }
                     uint32_t dist = dist_base[dsym] + bits_pull(&b, dist_extra[dsym]);
-                    if (dist > out_pos || out_pos + match_len > dst_cap) {
+                    if (b.err || dist > out_pos || match_len > dst_cap - out_pos) {
                         return false;
                     }
                     for (uint32_t i = 0; i < match_len; ++i) {
@@ -977,7 +1078,7 @@ static bool zlib_inflate_buf(const uint8_t *src, size_t src_size, uint8_t *dst, 
         }
     } while (!bfinal);
 
-    return out_pos == dst_cap;
+    return !b.err && out_pos == dst_cap;
 }
 
 static inline uint8_t paeth_predictor(int a, int b, int c)
@@ -995,11 +1096,27 @@ static inline uint8_t paeth_predictor(int a, int b, int c)
     return (uint8_t)c;
 }
 
-static bool append_apng_zdata(apng_frame_t *f, const uint8_t *chunk, size_t len)
+static bool append_apng_zdata(apng_frame_t *f, const uint8_t *chunk, size_t len,
+                              size_t *total_zdata_bytes)
 {
-    if (f->zsize + len > f->zcap) {
-        size_t new_cap = f->zcap ? f->zcap * 2u : 4096u;
-        while (new_cap < f->zsize + len) {
+    if (len == 0) {
+        return true;
+    }
+    size_t new_total = 0;
+    if (ckd_add(&new_total, *total_zdata_bytes, len) || new_total > ANIM_MAX_COMPRESSED_BYTES) {
+        return false;
+    }
+    size_t needed = 0;
+    if (ckd_add(&needed, f->zsize, len)) {
+        return false;
+    }
+    if (needed > f->zcap) {
+        size_t new_cap = f->zcap ? f->zcap : 4096u;
+        while (new_cap < needed) {
+            if (new_cap > SIZE_MAX / 2u) {
+                new_cap = needed;
+                break;
+            }
             new_cap *= 2u;
         }
         uint8_t *nb = (uint8_t *)realloc(f->zdata, new_cap);
@@ -1010,136 +1127,8 @@ static bool append_apng_zdata(apng_frame_t *f, const uint8_t *chunk, size_t len)
         f->zcap = new_cap;
     }
     memcpy(f->zdata + f->zsize, chunk, len);
-    f->zsize += len;
-    return true;
-}
-
-static bool init_apng_decoder(waywal_anim_decoder_t *dec)
-{
-    const uint8_t *data = dec->raw_data;
-    size_t size = dec->raw_size;
-    size_t pos = 8;
-
-    bool seen_ihdr = false;
-    bool seen_actl = false;
-    bool seen_idat = false;
-    uint32_t cap = 16;
-    dec->apng_frames = (apng_frame_t *)calloc(cap, sizeof(apng_frame_t));
-    if (!dec->apng_frames) {
-        return false;
-    }
-
-    apng_frame_t *cur_frame = NULL;
-    bool fctl_before_idat = false;
-
-    while (pos + 12 <= size) {
-        uint32_t clen = read_be32(data + pos);
-        const uint8_t *ctype = data + pos + 4;
-        const uint8_t *cpayload = data + pos + 8;
-        if (pos + 12 + (size_t)clen > size) {
-            break;
-        }
-
-        if (memcmp(ctype, "IHDR", 4) == 0 && clen >= 13) {
-            dec->canvas_w = read_be32(cpayload);
-            dec->canvas_h = read_be32(cpayload + 4);
-            dec->png_bit_depth = cpayload[8];
-            dec->png_color_type = cpayload[9];
-            if (dec->canvas_w == 0 || dec->canvas_h == 0 || dec->canvas_w > 16384u ||
-                dec->canvas_h > 16384u || dec->png_bit_depth != 8 || cpayload[12] != 0) {
-                return false;
-            }
-            seen_ihdr = true;
-        } else if (memcmp(ctype, "PLTE", 4) == 0) {
-            uint32_t entries = clen / 3u;
-            if (entries > 256) {
-                entries = 256;
-            }
-            memcpy(dec->png_plte, cpayload, entries * 3u);
-            dec->png_plte_count = (uint16_t)entries;
-        } else if (memcmp(ctype, "tRNS", 4) == 0) {
-            uint32_t entries = clen > 256 ? 256 : clen;
-            memcpy(dec->png_trns, cpayload, entries);
-            dec->png_trns_count = (uint16_t)entries;
-        } else if (memcmp(ctype, "acTL", 4) == 0 && clen >= 8) {
-            seen_actl = true;
-        } else if (memcmp(ctype, "fcTL", 4) == 0 && clen >= 26) {
-            if (!seen_ihdr) {
-                return false;
-            }
-            if (!seen_idat) {
-                fctl_before_idat = true;
-            }
-            if (dec->frame_count >= cap) {
-                uint32_t new_cap = cap * 2u;
-                apng_frame_t *nf = (apng_frame_t *)realloc(dec->apng_frames,
-                                                           (size_t)new_cap * sizeof(apng_frame_t));
-                if (!nf) {
-                    return false;
-                }
-                memset(nf + cap, 0, (size_t)(new_cap - cap) * sizeof(apng_frame_t));
-                dec->apng_frames = nf;
-                cap = new_cap;
-            }
-            cur_frame = &dec->apng_frames[dec->frame_count++];
-            cur_frame->width = read_be32(cpayload + 4);
-            cur_frame->height = read_be32(cpayload + 8);
-            cur_frame->x_offset = read_be32(cpayload + 12);
-            cur_frame->y_offset = read_be32(cpayload + 16);
-            if (cur_frame->width == 0 || cur_frame->height == 0 ||
-                (uint64_t)cur_frame->x_offset + cur_frame->width > dec->canvas_w ||
-                (uint64_t)cur_frame->y_offset + cur_frame->height > dec->canvas_h) {
-                return false;
-            }
-            uint16_t delay_num = read_be16(cpayload + 20);
-            uint16_t delay_den = read_be16(cpayload + 22);
-            if (delay_den == 0) {
-                delay_den = 100;
-            }
-            uint32_t ms = ((uint32_t)delay_num * 1000u) / (uint32_t)delay_den;
-            cur_frame->delay_ms = (ms < 10u) ? 100u : ms;
-            cur_frame->dispose_op = cpayload[24];
-            cur_frame->blend_op = cpayload[25];
-        } else if (memcmp(ctype, "IDAT", 4) == 0) {
-            seen_idat = true;
-            if (fctl_before_idat && cur_frame) {
-                if (!append_apng_zdata(cur_frame, cpayload, clen)) {
-                    return false;
-                }
-            }
-        } else if (memcmp(ctype, "fdAT", 4) == 0 && clen > 4) {
-            if (cur_frame) {
-                if (!append_apng_zdata(cur_frame, cpayload + 4, clen - 4)) {
-                    return false;
-                }
-            }
-        } else if (memcmp(ctype, "IEND", 4) == 0) {
-            break;
-        }
-
-        pos += 12 + (size_t)clen;
-    }
-
-    if (!seen_ihdr || !seen_actl || dec->frame_count == 0 || dec->canvas_w == 0 ||
-        dec->canvas_h == 0 || dec->canvas_w > 16384u || dec->canvas_h > 16384u) {
-        return false;
-    }
-
-    size_t num_pixels = 0;
-    size_t canvas_bytes = 0;
-    if (ckd_mul(&num_pixels, (size_t)dec->canvas_w, (size_t)dec->canvas_h) ||
-        ckd_mul(&canvas_bytes, num_pixels, (size_t)4u)) {
-        return false;
-    }
-    dec->canvas = (uint8_t *)calloc(1, canvas_bytes);
-    if (!dec->canvas) {
-        return false;
-    }
-
-    /* All compressed frame chunks are stored in apng_frames[i].zdata; free raw_data immediately */
-    free(dec->raw_data);
-    dec->raw_data = NULL;
-    dec->raw_size = 0;
+    f->zsize = needed;
+    *total_zdata_bytes = new_total;
     return true;
 }
 
@@ -1161,29 +1150,63 @@ static uint32_t png_bytes_per_pixel(uint8_t color_type)
     }
 }
 
-static bool step_apng_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba, uint32_t *out_w,
-                            uint32_t *out_h, uint32_t *out_delay_ms)
+static bool commit_pending_apng_frame(waywal_anim_decoder_t *dec, apng_frame_t *pending,
+                                      bool *has_pending, uint32_t *cap)
 {
-    if (dec->current_frame >= dec->frame_count) {
-        waywal_anim_reset(dec);
+    if (!*has_pending) {
+        return true;
+    }
+    *has_pending = false;
+    if (!pending->zdata || pending->zsize == 0) {
+        free(pending->zdata);
+        memset(pending, 0, sizeof(*pending));
+        return true;
+    }
+    if (dec->frame_count >= ANIM_MAX_FRAMES) {
+        free(pending->zdata);
+        memset(pending, 0, sizeof(*pending));
+        return false;
+    }
+    if (dec->frame_count >= *cap) {
+        uint32_t new_cap = (*cap > ANIM_MAX_FRAMES / 2u) ? ANIM_MAX_FRAMES : (*cap * 2u);
+        size_t alloc_bytes = 0;
+        if (ckd_mul(&alloc_bytes, (size_t)new_cap, sizeof(apng_frame_t))) {
+            free(pending->zdata);
+            memset(pending, 0, sizeof(*pending));
+            return false;
+        }
+        apng_frame_t *nf = (apng_frame_t *)realloc(dec->apng_frames, alloc_bytes);
+        if (!nf) {
+            free(pending->zdata);
+            memset(pending, 0, sizeof(*pending));
+            return false;
+        }
+        memset(nf + *cap, 0, (size_t)(new_cap - *cap) * sizeof(apng_frame_t));
+        dec->apng_frames = nf;
+        *cap = new_cap;
+    }
+    dec->apng_frames[dec->frame_count++] = *pending;
+    memset(pending, 0, sizeof(*pending));
+    return true;
+}
+
+static bool decode_apng_frame_to_canvas(waywal_anim_decoder_t *dec, uint32_t frame_idx)
+{
+    if (!dec || frame_idx >= dec->frame_count) {
+        return false;
     }
 
     apply_previous_disposal(dec);
 
-    const apng_frame_t *f = &dec->apng_frames[dec->current_frame];
-    if (f->dispose_op == 2) {
+    const apng_frame_t *f = &dec->apng_frames[frame_idx];
+    if (f->dispose_op == 2 && dec->prev_canvas) {
         size_t canvas_bytes = (size_t)dec->canvas_w * dec->canvas_h * 4u;
-        if (!dec->prev_canvas) {
-            dec->prev_canvas = (uint8_t *)calloc(1, canvas_bytes);
-        }
-        if (dec->prev_canvas) {
-            memcpy(dec->prev_canvas, dec->canvas, canvas_bytes);
-        }
+        memcpy(dec->prev_canvas, dec->canvas, canvas_bytes);
     }
 
     uint32_t bpp = png_bytes_per_pixel(dec->png_color_type);
     if (bpp == 0 || f->width == 0 || f->height == 0 || f->width > dec->canvas_w ||
-        f->height > dec->canvas_h || !f->zdata) {
+        f->height > dec->canvas_h || !f->zdata || f->zsize == 0) {
         return false;
     }
 
@@ -1208,7 +1231,7 @@ static bool step_apng_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba
         uint8_t *line = raw_scan + (size_t)y * (stride + 1u);
         uint8_t filter = line[0];
         uint8_t *cur = line + 1;
-        const uint8_t *prev = (y > 0) ? (line - stride) : NULL;
+        const uint8_t *prev = (y > 0) ? (cur - (stride + 1u)) : NULL;
 
         switch (filter) {
         case 0:
@@ -1331,6 +1354,362 @@ static bool step_apng_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba
     dec->prev_rect_y = f->y_offset;
     dec->prev_rect_w = f->width;
     dec->prev_rect_h = f->height;
+    return true;
+}
+
+static void *apng_worker_main(void *arg)
+{
+    waywal_anim_decoder_t *dec = (waywal_anim_decoder_t *)arg;
+    size_t canvas_bytes = (size_t)dec->canvas_w * (size_t)dec->canvas_h * 4u;
+
+    pthread_mutex_lock(&dec->apng_mu);
+    for (;;) {
+        while (!dec->apng_stop &&
+               (dec->apng_reset_pending || dec->apng_slots[dec->apng_write_slot].ready ||
+                (int)dec->apng_write_slot == dec->apng_held_slot)) {
+            pthread_cond_wait(&dec->apng_cv_prod, &dec->apng_mu);
+        }
+        if (dec->apng_stop) {
+            break;
+        }
+
+        uint8_t slot_idx = dec->apng_write_slot;
+        uint32_t fidx = dec->apng_worker_next_frame;
+        uint64_t epoch = dec->apng_epoch;
+        dec->apng_worker_busy = true;
+        pthread_mutex_unlock(&dec->apng_mu);
+
+        if (fidx == 0u) {
+            memset(dec->canvas, 0, canvas_bytes);
+            if (dec->prev_canvas) {
+                memset(dec->prev_canvas, 0, canvas_bytes);
+            }
+            dec->prev_disposal = 0;
+            dec->prev_rect_x = 0;
+            dec->prev_rect_y = 0;
+            dec->prev_rect_w = 0;
+            dec->prev_rect_h = 0;
+        }
+
+        bool ok = decode_apng_frame_to_canvas(dec, fidx);
+        if (ok) {
+            memcpy(dec->apng_slots[slot_idx].rgba, dec->canvas, canvas_bytes);
+        }
+
+        pthread_mutex_lock(&dec->apng_mu);
+        dec->apng_worker_busy = false;
+        if (!dec->apng_stop && !dec->apng_reset_pending && epoch == dec->apng_epoch) {
+            dec->apng_slots[slot_idx].frame_idx = fidx;
+            dec->apng_slots[slot_idx].delay_ms = dec->apng_frames[fidx].delay_ms;
+            dec->apng_slots[slot_idx].ok = ok;
+            dec->apng_slots[slot_idx].ready = true;
+            if (ok) {
+                dec->apng_worker_next_frame = (fidx + 1u) % dec->frame_count;
+                dec->apng_write_slot ^= 1u;
+            }
+            pthread_cond_broadcast(&dec->apng_cv_cons);
+            if (!ok) {
+                while (!dec->apng_stop && !dec->apng_reset_pending && epoch == dec->apng_epoch) {
+                    pthread_cond_wait(&dec->apng_cv_prod, &dec->apng_mu);
+                }
+            }
+        } else {
+            pthread_cond_broadcast(&dec->apng_cv_cons);
+        }
+    }
+    pthread_mutex_unlock(&dec->apng_mu);
+    return NULL;
+}
+
+static bool init_apng_decoder(waywal_anim_decoder_t *dec)
+{
+    const uint8_t *data = dec->raw_data;
+    size_t size = dec->raw_size;
+    size_t pos = 8;
+
+    bool seen_ihdr = false;
+    bool seen_actl = false;
+    bool seen_idat = false;
+    uint32_t cap = 16;
+    dec->apng_frames = (apng_frame_t *)calloc(cap, sizeof(apng_frame_t));
+    if (!dec->apng_frames) {
+        return false;
+    }
+
+    apng_frame_t pending;
+    memset(&pending, 0, sizeof(pending));
+    bool has_pending = false;
+    bool fctl_before_idat = false;
+    size_t total_zdata_bytes = 0;
+
+    while (pos <= size - 12u) {
+        uint32_t clen = read_be32(data + pos);
+        const uint8_t *ctype = data + pos + 4;
+        const uint8_t *cpayload = data + pos + 8;
+        if ((size_t)clen > size - pos - 12u) {
+            break;
+        }
+
+        if (memcmp(ctype, "IHDR", 4) == 0 && clen >= 13) {
+            dec->canvas_w = read_be32(cpayload);
+            dec->canvas_h = read_be32(cpayload + 4);
+            dec->png_bit_depth = cpayload[8];
+            dec->png_color_type = cpayload[9];
+            if (dec->canvas_w == 0 || dec->canvas_h == 0 || dec->canvas_w > ANIM_MAX_CANVAS_DIM ||
+                dec->canvas_h > ANIM_MAX_CANVAS_DIM || dec->png_bit_depth != 8 ||
+                cpayload[12] != 0 || png_bytes_per_pixel(dec->png_color_type) == 0) {
+                free(pending.zdata);
+                return false;
+            }
+            size_t early_px = 0;
+            size_t early_bytes = 0;
+            if (ckd_mul(&early_px, (size_t)dec->canvas_w, (size_t)dec->canvas_h) ||
+                ckd_mul(&early_bytes, early_px, (size_t)4u) ||
+                early_bytes > ANIM_MAX_DECODED_BYTES / 3u) {
+                free(pending.zdata);
+                return false;
+            }
+            seen_ihdr = true;
+        } else if (memcmp(ctype, "PLTE", 4) == 0) {
+            uint32_t entries = clen / 3u;
+            if (entries > 256) {
+                entries = 256;
+            }
+            memcpy(dec->png_plte, cpayload, entries * 3u);
+            dec->png_plte_count = (uint16_t)entries;
+        } else if (memcmp(ctype, "tRNS", 4) == 0) {
+            uint32_t entries = clen > 256 ? 256 : clen;
+            memcpy(dec->png_trns, cpayload, entries);
+            dec->png_trns_count = (uint16_t)entries;
+        } else if (memcmp(ctype, "acTL", 4) == 0 && clen >= 8) {
+            seen_actl = true;
+        } else if (memcmp(ctype, "fcTL", 4) == 0 && clen >= 26) {
+            if (!seen_ihdr) {
+                free(pending.zdata);
+                return false;
+            }
+            if (!commit_pending_apng_frame(dec, &pending, &has_pending, &cap)) {
+                return false;
+            }
+            fctl_before_idat = !seen_idat;
+            pending.width = read_be32(cpayload + 4);
+            pending.height = read_be32(cpayload + 8);
+            pending.x_offset = read_be32(cpayload + 12);
+            pending.y_offset = read_be32(cpayload + 16);
+            if (pending.width == 0 || pending.height == 0 ||
+                (uint64_t)pending.x_offset + pending.width > dec->canvas_w ||
+                (uint64_t)pending.y_offset + pending.height > dec->canvas_h) {
+                return false;
+            }
+            uint16_t delay_num = read_be16(cpayload + 20);
+            uint16_t delay_den = read_be16(cpayload + 22);
+            if (delay_den == 0) {
+                delay_den = 100;
+            }
+            uint32_t ms = ((uint32_t)delay_num * 1000u) / (uint32_t)delay_den;
+            pending.delay_ms = (ms < 10u) ? 100u : ms;
+            pending.dispose_op = cpayload[24];
+            pending.blend_op = cpayload[25];
+            has_pending = true;
+        } else if (memcmp(ctype, "IDAT", 4) == 0) {
+            seen_idat = true;
+            if (fctl_before_idat && has_pending) {
+                if (!append_apng_zdata(&pending, cpayload, clen, &total_zdata_bytes)) {
+                    free(pending.zdata);
+                    return false;
+                }
+            }
+        } else if (memcmp(ctype, "fdAT", 4) == 0 && clen > 4) {
+            fctl_before_idat = false;
+            if (has_pending) {
+                if (!append_apng_zdata(&pending, cpayload + 4, clen - 4, &total_zdata_bytes)) {
+                    free(pending.zdata);
+                    return false;
+                }
+            }
+        } else if (memcmp(ctype, "IEND", 4) == 0) {
+            break;
+        }
+
+        pos += 12u + (size_t)clen;
+    }
+
+    if (!commit_pending_apng_frame(dec, &pending, &has_pending, &cap)) {
+        return false;
+    }
+
+    if (!seen_ihdr || !seen_actl || dec->frame_count == 0 || dec->canvas_w == 0 ||
+        dec->canvas_h == 0 || dec->canvas_w > ANIM_MAX_CANVAS_DIM ||
+        dec->canvas_h > ANIM_MAX_CANVAS_DIM) {
+        return false;
+    }
+
+    uint32_t bpp = png_bytes_per_pixel(dec->png_color_type);
+    if (bpp == 0) {
+        return false;
+    }
+
+    size_t num_pixels = 0;
+    size_t canvas_bytes = 0;
+    if (ckd_mul(&num_pixels, (size_t)dec->canvas_w, (size_t)dec->canvas_h) ||
+        ckd_mul(&canvas_bytes, num_pixels, (size_t)4u)) {
+        return false;
+    }
+
+    bool needs_prev = false;
+    size_t max_raw_len = 0;
+    for (uint32_t i = 0; i < dec->frame_count; ++i) {
+        const apng_frame_t *f = &dec->apng_frames[i];
+        if (f->dispose_op == 2) {
+            needs_prev = true;
+        }
+        size_t stride = 0;
+        size_t stride_plus_1 = 0;
+        size_t raw_len = 0;
+        if (ckd_mul(&stride, (size_t)f->width, (size_t)bpp) ||
+            ckd_add(&stride_plus_1, stride, (size_t)1u) ||
+            ckd_mul(&raw_len, stride_plus_1, (size_t)f->height)) {
+            return false;
+        }
+        if (raw_len > max_raw_len) {
+            max_raw_len = raw_len;
+        }
+    }
+
+    size_t buf_count = 3u + (needs_prev ? 1u : 0u);
+    size_t total_decoded = 0;
+    if (ckd_mul(&total_decoded, canvas_bytes, buf_count) ||
+        ckd_add(&total_decoded, total_decoded, max_raw_len) ||
+        total_decoded > ANIM_MAX_DECODED_BYTES) {
+        return false;
+    }
+
+    dec->canvas = (uint8_t *)calloc(1, canvas_bytes);
+    if (!dec->canvas) {
+        return false;
+    }
+    if (needs_prev) {
+        dec->prev_canvas = (uint8_t *)calloc(1, canvas_bytes);
+        if (!dec->prev_canvas) {
+            return false;
+        }
+    }
+    dec->apng_slots[0].rgba = (uint8_t *)malloc(canvas_bytes);
+    dec->apng_slots[1].rgba = (uint8_t *)malloc(canvas_bytes);
+    if (!dec->apng_slots[0].rgba || !dec->apng_slots[1].rgba) {
+        return false;
+    }
+    if (max_raw_len > 0 && !ensure_scratch_buf(dec, max_raw_len)) {
+        return false;
+    }
+
+    /* All compressed frame chunks are stored in apng_frames[i].zdata; free raw_data immediately */
+    free(dec->raw_data);
+    dec->raw_data = NULL;
+    dec->raw_size = 0;
+
+    if (!decode_apng_frame_to_canvas(dec, 0u)) {
+        return false;
+    }
+    memcpy(dec->apng_slots[0].rgba, dec->canvas, canvas_bytes);
+    dec->apng_slots[0].frame_idx = 0u;
+    dec->apng_slots[0].delay_ms = dec->apng_frames[0].delay_ms;
+    dec->apng_slots[0].ok = true;
+    dec->apng_slots[0].ready = true;
+    dec->apng_held_slot = -1;
+    dec->apng_read_slot = 0u;
+    dec->apng_write_slot = 1u;
+    dec->apng_worker_next_frame = (dec->frame_count > 1u) ? 1u : 0u;
+
+    if (pthread_mutex_init(&dec->apng_mu, NULL) == 0) {
+        if (pthread_cond_init(&dec->apng_cv_prod, NULL) == 0) {
+            if (pthread_cond_init(&dec->apng_cv_cons, NULL) == 0) {
+                dec->apng_sync_init = true;
+            } else {
+                pthread_cond_destroy(&dec->apng_cv_prod);
+                pthread_mutex_destroy(&dec->apng_mu);
+            }
+        } else {
+            pthread_mutex_destroy(&dec->apng_mu);
+        }
+    }
+
+    if (dec->apng_sync_init && dec->frame_count > 1u) {
+        if (pthread_create(&dec->apng_thread, NULL, apng_worker_main, dec) == 0) {
+            dec->apng_thread_started = true;
+        }
+    }
+    return true;
+}
+
+static bool step_apng_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba, uint32_t *out_w,
+                            uint32_t *out_h, uint32_t *out_delay_ms)
+{
+    if (dec->apng_thread_started) {
+        pthread_mutex_lock(&dec->apng_mu);
+        if (dec->apng_held_slot >= 0) {
+            dec->apng_slots[dec->apng_held_slot].ready = false;
+            dec->apng_held_slot = -1;
+            pthread_cond_signal(&dec->apng_cv_prod);
+        }
+        while (!dec->apng_slots[dec->apng_read_slot].ready && !dec->apng_stop) {
+            pthread_cond_wait(&dec->apng_cv_cons, &dec->apng_mu);
+        }
+        if (dec->apng_stop) {
+            pthread_mutex_unlock(&dec->apng_mu);
+            return false;
+        }
+        apng_ping_pong_slot_t *slot = &dec->apng_slots[dec->apng_read_slot];
+        if (!slot->ok) {
+            pthread_mutex_unlock(&dec->apng_mu);
+            return false;
+        }
+        dec->apng_held_slot = dec->apng_read_slot;
+        dec->apng_read_slot ^= 1u;
+        dec->current_frame = slot->frame_idx + 1u;
+        const uint8_t *rgba = slot->rgba;
+        uint32_t delay_ms = slot->delay_ms;
+        pthread_mutex_unlock(&dec->apng_mu);
+
+        if (out_rgba) {
+            *out_rgba = rgba;
+        }
+        if (out_w) {
+            *out_w = dec->canvas_w;
+        }
+        if (out_h) {
+            *out_h = dec->canvas_h;
+        }
+        if (out_delay_ms) {
+            *out_delay_ms = delay_ms;
+        }
+        return true;
+    }
+
+    if (dec->frame_count == 1u && dec->apng_slots[0].ready && dec->apng_slots[0].ok) {
+        dec->current_frame = 1u;
+        if (out_rgba) {
+            *out_rgba = dec->apng_slots[0].rgba;
+        }
+        if (out_w) {
+            *out_w = dec->canvas_w;
+        }
+        if (out_h) {
+            *out_h = dec->canvas_h;
+        }
+        if (out_delay_ms) {
+            *out_delay_ms = dec->apng_slots[0].delay_ms;
+        }
+        return true;
+    }
+
+    if (dec->current_frame >= dec->frame_count) {
+        waywal_anim_reset(dec);
+    }
+    uint32_t fidx = dec->current_frame;
+    if (!decode_apng_frame_to_canvas(dec, fidx)) {
+        return false;
+    }
     dec->current_frame++;
 
     if (out_rgba) {
@@ -1343,10 +1722,45 @@ static bool step_apng_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba
         *out_h = dec->canvas_h;
     }
     if (out_delay_ms) {
-        *out_delay_ms = f->delay_ms;
+        *out_delay_ms = dec->apng_frames[fidx].delay_ms;
     }
     return true;
 }
+
+#ifndef WWAL_DISABLE_WEBP
+static void init_webp_api_once(void)
+{
+    void *dl = dlopen("libwebpdemux.so.2", RTLD_LAZY | RTLD_LOCAL | RTLD_NODELETE);
+    if (!dl) {
+        dl = dlopen("libwebpdemux.so", RTLD_LAZY | RTLD_LOCAL | RTLD_NODELETE);
+    }
+    if (!dl) {
+        WAYWAL_LOG_WARN("libwebpdemux.so.2 not found for animated WebP decoding");
+        return;
+    }
+    s_webp_api.dl_demux = dl;
+
+    void *sym_opts_init = dlsym(dl, "WebPAnimDecoderOptionsInitInternal");
+    void *sym_new = dlsym(dl, "WebPAnimDecoderNewInternal");
+    void *sym_info = dlsym(dl, "WebPAnimDecoderGetInfo");
+    void *sym_next = dlsym(dl, "WebPAnimDecoderGetNext");
+    void *sym_has_more = dlsym(dl, "WebPAnimDecoderHasMoreFrames");
+    void *sym_reset = dlsym(dl, "WebPAnimDecoderReset");
+    void *sym_delete = dlsym(dl, "WebPAnimDecoderDelete");
+
+    memcpy(&s_webp_api.fn_opts_init, &sym_opts_init, sizeof(s_webp_api.fn_opts_init));
+    memcpy(&s_webp_api.fn_new, &sym_new, sizeof(s_webp_api.fn_new));
+    memcpy(&s_webp_api.fn_info, &sym_info, sizeof(s_webp_api.fn_info));
+    memcpy(&s_webp_api.fn_next, &sym_next, sizeof(s_webp_api.fn_next));
+    memcpy(&s_webp_api.fn_has_more, &sym_has_more, sizeof(s_webp_api.fn_has_more));
+    memcpy(&s_webp_api.fn_reset, &sym_reset, sizeof(s_webp_api.fn_reset));
+    memcpy(&s_webp_api.fn_delete, &sym_delete, sizeof(s_webp_api.fn_delete));
+
+    s_webp_api.ok =
+        (s_webp_api.fn_opts_init && s_webp_api.fn_new && s_webp_api.fn_info && s_webp_api.fn_next &&
+         s_webp_api.fn_has_more && s_webp_api.fn_reset && s_webp_api.fn_delete);
+}
+#endif
 
 static bool init_webp_decoder(waywal_anim_decoder_t *dec)
 {
@@ -1354,45 +1768,14 @@ static bool init_webp_decoder(waywal_anim_decoder_t *dec)
     (void)dec;
     return false;
 #else
-    dec->webp_dl_codec = dlopen("libwebp.so.7", RTLD_LAZY | RTLD_GLOBAL);
-    if (!dec->webp_dl_codec) {
-        dec->webp_dl_codec = dlopen("libwebp.so", RTLD_LAZY | RTLD_GLOBAL);
-    }
-    dec->webp_dl_demux = dlopen("libwebpdemux.so.2", RTLD_LAZY);
-    if (!dec->webp_dl_demux) {
-        dec->webp_dl_demux = dlopen("libwebpdemux.so", RTLD_LAZY);
-    }
-    if (!dec->webp_dl_demux) {
-        WAYWAL_LOG_WARN("libwebpdemux.so.2 not found for animated WebP decoding");
-        return false;
-    }
-
-    pfn_WebPAnimDecoderOptionsInitInternal fn_opts_init = NULL;
-    pfn_WebPAnimDecoderNewInternal fn_new = NULL;
-    pfn_WebPAnimDecoderGetInfo fn_info = NULL;
-    void *sym_opts_init = dlsym(dec->webp_dl_demux, "WebPAnimDecoderOptionsInitInternal");
-    void *sym_new = dlsym(dec->webp_dl_demux, "WebPAnimDecoderNewInternal");
-    void *sym_info = dlsym(dec->webp_dl_demux, "WebPAnimDecoderGetInfo");
-    void *sym_next = dlsym(dec->webp_dl_demux, "WebPAnimDecoderGetNext");
-    void *sym_has_more = dlsym(dec->webp_dl_demux, "WebPAnimDecoderHasMoreFrames");
-    void *sym_reset = dlsym(dec->webp_dl_demux, "WebPAnimDecoderReset");
-    void *sym_delete = dlsym(dec->webp_dl_demux, "WebPAnimDecoderDelete");
-    memcpy(&fn_opts_init, &sym_opts_init, sizeof(fn_opts_init));
-    memcpy(&fn_new, &sym_new, sizeof(fn_new));
-    memcpy(&fn_info, &sym_info, sizeof(fn_info));
-    memcpy(&dec->fn_webp_next, &sym_next, sizeof(dec->fn_webp_next));
-    memcpy(&dec->fn_webp_has_more, &sym_has_more, sizeof(dec->fn_webp_has_more));
-    memcpy(&dec->fn_webp_reset, &sym_reset, sizeof(dec->fn_webp_reset));
-    memcpy(&dec->fn_webp_delete, &sym_delete, sizeof(dec->fn_webp_delete));
-
-    if (!fn_opts_init || !fn_new || !fn_info || !dec->fn_webp_next || !dec->fn_webp_has_more ||
-        !dec->fn_webp_reset || !dec->fn_webp_delete) {
+    pthread_once(&s_webp_once, init_webp_api_once);
+    if (!s_webp_api.ok) {
         return false;
     }
 
     webp_anim_options_t opts;
     memset(&opts, 0, sizeof(opts));
-    if (!fn_opts_init(&opts, 0x0107)) {
+    if (!s_webp_api.fn_opts_init(&opts, ANIM_WEBP_DEMUX_ABI_VER)) {
         return false;
     }
     opts.color_mode = 1; /* MODE_RGBA */
@@ -1400,15 +1783,25 @@ static bool init_webp_decoder(waywal_anim_decoder_t *dec)
 
     dec->webp_raw.bytes = dec->raw_data;
     dec->webp_raw.size = dec->raw_size;
-    dec->webp_dec = fn_new(&dec->webp_raw, &opts, 0x0107);
+    dec->webp_dec = s_webp_api.fn_new(&dec->webp_raw, &opts, ANIM_WEBP_DEMUX_ABI_VER);
     if (!dec->webp_dec) {
         return false;
     }
 
     webp_anim_info_t info;
     memset(&info, 0, sizeof(info));
-    if (!fn_info(dec->webp_dec, &info) || info.canvas_width == 0 || info.canvas_height == 0 ||
-        info.canvas_width > 16384u || info.canvas_height > 16384u || info.frame_count == 0) {
+    if (!s_webp_api.fn_info(dec->webp_dec, &info) || info.canvas_width == 0 ||
+        info.canvas_height == 0 || info.canvas_width > ANIM_MAX_CANVAS_DIM ||
+        info.canvas_height > ANIM_MAX_CANVAS_DIM || info.frame_count == 0) {
+        return false;
+    }
+
+    size_t num_pixels = 0;
+    size_t canvas_bytes = 0;
+    size_t est_budget = 0;
+    if (ckd_mul(&num_pixels, (size_t)info.canvas_width, (size_t)info.canvas_height) ||
+        ckd_mul(&canvas_bytes, num_pixels, (size_t)4u) ||
+        ckd_mul(&est_budget, canvas_bytes, (size_t)3u) || est_budget > ANIM_MAX_DECODED_BYTES) {
         return false;
     }
 
@@ -1423,18 +1816,26 @@ static bool init_webp_decoder(waywal_anim_decoder_t *dec)
 static bool step_webp_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba, uint32_t *out_w,
                             uint32_t *out_h, uint32_t *out_delay_ms)
 {
-    if (!dec->webp_dec) {
+#ifdef WWAL_DISABLE_WEBP
+    (void)dec;
+    (void)out_rgba;
+    (void)out_w;
+    (void)out_h;
+    (void)out_delay_ms;
+    return false;
+#else
+    if (!dec->webp_dec || !s_webp_api.ok) {
         return false;
     }
-    if (!dec->fn_webp_has_more(dec->webp_dec)) {
-        dec->fn_webp_reset(dec->webp_dec);
+    if (!s_webp_api.fn_has_more(dec->webp_dec)) {
+        s_webp_api.fn_reset(dec->webp_dec);
         dec->webp_prev_timestamp = 0;
         dec->current_frame = 0;
     }
 
     uint8_t *buf = NULL;
     int timestamp = 0;
-    if (!dec->fn_webp_next(dec->webp_dec, &buf, &timestamp) || !buf) {
+    if (!s_webp_api.fn_next(dec->webp_dec, &buf, &timestamp) || !buf) {
         return false;
     }
 
@@ -1456,6 +1857,7 @@ static bool step_webp_frame(waywal_anim_decoder_t *dec, const uint8_t **out_rgba
         *out_delay_ms = delay_ms;
     }
     return true;
+#endif
 }
 
 waywal_anim_decoder_t *waywal_anim_create(const uint8_t *data, size_t size)
@@ -1480,6 +1882,7 @@ waywal_anim_decoder_t *waywal_anim_create(const uint8_t *data, size_t size)
     }
 
     dec->format = fmt;
+    dec->apng_held_slot = -1;
     dec->raw_data = (uint8_t *)malloc(size);
     if (!dec->raw_data) {
         free(dec);
@@ -1527,6 +1930,39 @@ void waywal_anim_reset(waywal_anim_decoder_t *dec)
     if (!dec) {
         return;
     }
+    if (dec->format == WAYWAL_ANIM_FORMAT_APNG && dec->apng_thread_started) {
+        size_t canvas_bytes = (size_t)dec->canvas_w * (size_t)dec->canvas_h * 4u;
+        pthread_mutex_lock(&dec->apng_mu);
+        dec->apng_epoch++;
+        dec->apng_reset_pending = true;
+        pthread_cond_broadcast(&dec->apng_cv_prod);
+        while (dec->apng_worker_busy && !dec->apng_stop) {
+            pthread_cond_wait(&dec->apng_cv_cons, &dec->apng_mu);
+        }
+        if (dec->canvas) {
+            memset(dec->canvas, 0, canvas_bytes);
+        }
+        if (dec->prev_canvas) {
+            memset(dec->prev_canvas, 0, canvas_bytes);
+        }
+        dec->prev_disposal = 0;
+        dec->prev_rect_x = 0;
+        dec->prev_rect_y = 0;
+        dec->prev_rect_w = 0;
+        dec->prev_rect_h = 0;
+        dec->apng_slots[0].ready = false;
+        dec->apng_slots[1].ready = false;
+        dec->apng_held_slot = -1;
+        dec->apng_read_slot = 0u;
+        dec->apng_write_slot = 0u;
+        dec->apng_worker_next_frame = 0u;
+        dec->apng_reset_pending = false;
+        dec->current_frame = 0u;
+        pthread_cond_broadcast(&dec->apng_cv_prod);
+        pthread_mutex_unlock(&dec->apng_mu);
+        return;
+    }
+
     dec->current_frame = 0;
     dec->prev_disposal = 0;
     dec->prev_rect_x = 0;
@@ -1540,10 +1976,12 @@ void waywal_anim_reset(waywal_anim_decoder_t *dec)
     if (dec->prev_canvas) {
         memset(dec->prev_canvas, 0, (size_t)dec->canvas_w * dec->canvas_h * 4u);
     }
-    if (dec->format == WAYWAL_ANIM_FORMAT_WEBP && dec->webp_dec && dec->fn_webp_reset) {
-        dec->fn_webp_reset(dec->webp_dec);
+#ifndef WWAL_DISABLE_WEBP
+    if (dec->format == WAYWAL_ANIM_FORMAT_WEBP && dec->webp_dec && s_webp_api.fn_reset) {
+        s_webp_api.fn_reset(dec->webp_dec);
         dec->webp_prev_timestamp = 0;
     }
+#endif
 }
 
 uint32_t waywal_anim_frame_count(const waywal_anim_decoder_t *dec)
@@ -1561,15 +1999,27 @@ void waywal_anim_destroy(waywal_anim_decoder_t *dec)
     if (!dec) {
         return;
     }
-    if (dec->webp_dec && dec->fn_webp_delete) {
-        dec->fn_webp_delete(dec->webp_dec);
+    if (dec->apng_thread_started) {
+        pthread_mutex_lock(&dec->apng_mu);
+        dec->apng_stop = true;
+        pthread_cond_broadcast(&dec->apng_cv_prod);
+        pthread_mutex_unlock(&dec->apng_mu);
+        pthread_join(dec->apng_thread, NULL);
+        dec->apng_thread_started = false;
     }
-    if (dec->webp_dl_demux) {
-        dlclose(dec->webp_dl_demux);
+    if (dec->apng_sync_init) {
+        pthread_cond_destroy(&dec->apng_cv_cons);
+        pthread_cond_destroy(&dec->apng_cv_prod);
+        pthread_mutex_destroy(&dec->apng_mu);
+        dec->apng_sync_init = false;
     }
-    if (dec->webp_dl_codec) {
-        dlclose(dec->webp_dl_codec);
+    free(dec->apng_slots[0].rgba);
+    free(dec->apng_slots[1].rgba);
+#ifndef WWAL_DISABLE_WEBP
+    if (dec->webp_dec && s_webp_api.fn_delete) {
+        s_webp_api.fn_delete(dec->webp_dec);
     }
+#endif
     if (dec->apng_frames) {
         for (uint32_t i = 0; i < dec->frame_count; ++i) {
             free(dec->apng_frames[i].zdata);

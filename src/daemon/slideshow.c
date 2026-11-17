@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "waywal/slideshow.h"
 
 #include "wayland_core.h"
@@ -8,6 +11,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -79,52 +83,269 @@ static bool has_supported_media_extension(const char *name)
     return has_image_extension(name) || has_video_extension(name) || has_shader_extension(name);
 }
 
-static bool is_workshop_directory(const char *dir_path)
+static uint32_t slideshow_uniform_u32(uint32_t upper_bound)
 {
-    if (!dir_path || dir_path[0] == '\0')
-        return false;
-    char probe[4096];
-    struct stat st;
-    if (snprintf(probe, sizeof(probe), "%s/project.json", dir_path) < (int)sizeof(probe) &&
-        stat(probe, &st) == 0 && S_ISREG(st.st_mode)) {
-        return true;
+    if (upper_bound <= 1u) {
+        return 0u;
     }
-    if (snprintf(probe, sizeof(probe), "%s/scene.pkg", dir_path) < (int)sizeof(probe) &&
-        stat(probe, &st) == 0 && S_ISREG(st.st_mode)) {
-        return true;
-    }
-    if (snprintf(probe, sizeof(probe), "%s/gifscene.pkg", dir_path) < (int)sizeof(probe) &&
-        stat(probe, &st) == 0 && S_ISREG(st.st_mode)) {
-        return true;
-    }
-    if (snprintf(probe, sizeof(probe), "%s/scene.json", dir_path) < (int)sizeof(probe) &&
-        stat(probe, &st) == 0 && S_ISREG(st.st_mode)) {
-        return true;
-    }
-    return false;
+    return arc4random_uniform(upper_bound);
 }
 
-static void add_file_to_list(slideshow_engine_t *ss, const char *filepath)
+static size_t slideshow_uniform_size(size_t upper_bound)
 {
-    if (!ss || !filepath)
+    if (upper_bound <= 1u) {
+        return 0u;
+    }
+    if (upper_bound <= (size_t)UINT32_MAX) {
+        return (size_t)slideshow_uniform_u32((uint32_t)upper_bound);
+    }
+    uint64_t ub = (uint64_t)upper_bound;
+    uint64_t threshold = (0ULL - ub) % ub;
+    for (;;) {
+        uint64_t r = ((uint64_t)arc4random() << 32) | (uint64_t)arc4random();
+        if (r >= threshold) {
+            return (size_t)(r % ub);
+        }
+    }
+}
+
+typedef struct {
+    dev_t dev;
+    ino_t ino;
+    bool occupied;
+} slideshow_dir_slot_t;
+
+typedef struct {
+    char **files;
+    bool *is_dir;
+    size_t count;
+    size_t cap;
+    slideshow_dir_slot_t *visited;
+    size_t visited_cap;
+    size_t visited_count;
+} slideshow_scan_ctx_t;
+
+typedef struct {
+    char path[4096];
+    struct stat st;
+} slideshow_subdir_t;
+
+static bool is_workshop_marker_name(const char *name)
+{
+    return (strcmp(name, "project.json") == 0 || strcmp(name, "scene.pkg") == 0 ||
+            strcmp(name, "gifscene.pkg") == 0 || strcmp(name, "scene.json") == 0);
+}
+
+static uint64_t hash_dev_ino(dev_t dev, ino_t ino)
+{
+    uint64_t h = ((uint64_t)dev * 0x9e3779b97f4a7c15ULL) ^ (uint64_t)ino;
+    h ^= h >> 30;
+    h *= 0xbf58476d1ce4e5b9ULL;
+    h ^= h >> 27;
+    h *= 0x94d049bb133111ebULL;
+    h ^= h >> 31;
+    return h;
+}
+
+static bool visited_dirs_grow(slideshow_scan_ctx_t *ctx)
+{
+    size_t old_cap = ctx->visited_cap;
+    size_t new_cap = (old_cap == 0u) ? 256u : (old_cap * 2u);
+    if (new_cap > (1u << 20)) {
+        return false;
+    }
+    slideshow_dir_slot_t *tbl =
+        (slideshow_dir_slot_t *)calloc(new_cap, sizeof(slideshow_dir_slot_t));
+    if (!tbl) {
+        return false;
+    }
+    size_t mask = new_cap - 1u;
+    for (size_t i = 0; i < old_cap; ++i) {
+        if (!ctx->visited[i].occupied) {
+            continue;
+        }
+        size_t pos = (size_t)hash_dev_ino(ctx->visited[i].dev, ctx->visited[i].ino) & mask;
+        while (tbl[pos].occupied) {
+            pos = (pos + 1u) & mask;
+        }
+        tbl[pos] = ctx->visited[i];
+    }
+    free(ctx->visited);
+    ctx->visited = tbl;
+    ctx->visited_cap = new_cap;
+    return true;
+}
+
+static bool visited_dirs_insert(slideshow_scan_ctx_t *ctx, dev_t dev, ino_t ino)
+{
+    if (ctx->visited_cap == 0u || (ctx->visited_count + 1u) * 2u > ctx->visited_cap) {
+        if (!visited_dirs_grow(ctx)) {
+            return false;
+        }
+    }
+    size_t mask = ctx->visited_cap - 1u;
+    size_t pos = (size_t)hash_dev_ino(dev, ino) & mask;
+    while (ctx->visited[pos].occupied) {
+        if (ctx->visited[pos].dev == dev && ctx->visited[pos].ino == ino) {
+            return false;
+        }
+        pos = (pos + 1u) & mask;
+    }
+    ctx->visited[pos].dev = dev;
+    ctx->visited[pos].ino = ino;
+    ctx->visited[pos].occupied = true;
+    ctx->visited_count++;
+    return true;
+}
+
+static void scan_add_item(slideshow_scan_ctx_t *ctx, const char *filepath, bool is_dir)
+{
+    if (!ctx || !filepath)
         return;
-    if (ss->num_files >= ss->capacity_files) {
-        size_t new_cap = ss->capacity_files == 0 ? 32 : ss->capacity_files * 2;
-        char **new_list = (char **)realloc(ss->file_list, new_cap * sizeof(char *));
-        if (!new_list)
+    if (ctx->count >= ctx->cap) {
+        size_t new_cap = (ctx->cap == 0u) ? 32u : (ctx->cap * 2u);
+        char **new_files = (char **)realloc(ctx->files, new_cap * sizeof(char *));
+        if (!new_files)
             return;
-        ss->file_list = new_list;
-        ss->capacity_files = new_cap;
+        ctx->files = new_files;
+        bool *new_dirs = (bool *)realloc(ctx->is_dir, new_cap * sizeof(bool));
+        if (!new_dirs)
+            return;
+        ctx->is_dir = new_dirs;
+        ctx->cap = new_cap;
     }
     char *dup = strdup(filepath);
     if (!dup)
         return;
-    ss->file_list[ss->num_files++] = dup;
+    ctx->files[ctx->count] = dup;
+    ctx->is_dir[ctx->count] = is_dir;
+    ctx->count++;
 }
 
-static void scan_path_recursive_internal(slideshow_engine_t *ss, const char *path, int depth)
+static void scan_dir_at(slideshow_scan_ctx_t *ctx, const char *dir_path, const struct stat *dir_st,
+                        bool recursive, bool collect_files, int depth)
 {
-    if (depth > 16)
+    if (depth > 32 || !dir_path || !dir_st)
+        return;
+    if (!visited_dirs_insert(ctx, dir_st->st_dev, dir_st->st_ino)) {
+        return;
+    }
+
+    int dfd = open(dir_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0)
+        return;
+
+    DIR *dir = fdopendir(dfd);
+    if (!dir) {
+        close(dfd);
+        return;
+    }
+
+    size_t start_count = ctx->count;
+    size_t dir_len = strlen(dir_path);
+    const char *sep = (dir_len > 0 && dir_path[dir_len - 1] == '/') ? "" : "/";
+
+    slideshow_subdir_t *subdirs = NULL;
+    size_t num_subdirs = 0;
+    size_t cap_subdirs = 0;
+    bool is_workshop = false;
+
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (ent->d_name[0] == '.')
+            continue;
+
+        if (is_workshop_marker_name(ent->d_name)) {
+            bool is_reg = false;
+#ifdef _DIRENT_HAVE_D_TYPE
+            if (ent->d_type == DT_REG) {
+                is_reg = true;
+            } else if (ent->d_type == DT_LNK || ent->d_type == DT_UNKNOWN)
+#endif
+            {
+                struct stat cst;
+                if (fstatat(dfd, ent->d_name, &cst, 0) == 0 && S_ISREG(cst.st_mode)) {
+                    is_reg = true;
+                }
+            }
+            if (is_reg) {
+                is_workshop = true;
+                break;
+            }
+            continue;
+        }
+
+        char full_path[4096];
+        int n = snprintf(full_path, sizeof(full_path), "%s%s%s", dir_path, sep, ent->d_name);
+        if (n <= 0 || (size_t)n >= sizeof(full_path)) {
+            continue;
+        }
+
+        bool child_is_reg = false;
+        bool child_is_dir = false;
+        struct stat child_st;
+        bool have_st = false;
+
+#ifdef _DIRENT_HAVE_D_TYPE
+        if (ent->d_type == DT_REG) {
+            child_is_reg = true;
+        } else if (ent->d_type == DT_DIR) {
+            child_is_dir = true;
+        } else if (ent->d_type == DT_LNK || ent->d_type == DT_UNKNOWN)
+#endif
+        {
+            if (fstatat(dfd, ent->d_name, &child_st, 0) == 0) {
+                have_st = true;
+                child_is_reg = S_ISREG(child_st.st_mode);
+                child_is_dir = S_ISDIR(child_st.st_mode);
+            }
+        }
+
+        if (child_is_reg) {
+            if (collect_files && has_supported_media_extension(ent->d_name)) {
+                scan_add_item(ctx, full_path, false);
+            }
+        } else if (child_is_dir && (recursive || depth == 0)) {
+            if (!have_st && fstatat(dfd, ent->d_name, &child_st, 0) != 0) {
+                continue;
+            }
+            if (num_subdirs >= cap_subdirs) {
+                size_t nc = (cap_subdirs == 0u) ? 16u : (cap_subdirs * 2u);
+                slideshow_subdir_t *ns =
+                    (slideshow_subdir_t *)realloc(subdirs, nc * sizeof(slideshow_subdir_t));
+                if (!ns) {
+                    continue;
+                }
+                subdirs = ns;
+                cap_subdirs = nc;
+            }
+            memcpy(subdirs[num_subdirs].path, full_path, (size_t)n + 1u);
+            subdirs[num_subdirs].st = child_st;
+            num_subdirs++;
+        }
+    }
+
+    closedir(dir);
+
+    if (is_workshop) {
+        for (size_t i = start_count; i < ctx->count; ++i) {
+            free(ctx->files[i]);
+        }
+        ctx->count = start_count;
+        free(subdirs);
+        scan_add_item(ctx, dir_path, true);
+        return;
+    }
+
+    for (size_t i = 0; i < num_subdirs; ++i) {
+        scan_dir_at(ctx, subdirs[i].path, &subdirs[i].st, recursive, recursive, depth + 1);
+    }
+    free(subdirs);
+}
+
+static void scan_path_tree(slideshow_scan_ctx_t *ctx, const char *path, bool recursive)
+{
+    if (!ctx || !path || path[0] == '\0')
         return;
 
     struct stat st;
@@ -133,92 +354,41 @@ static void scan_path_recursive_internal(slideshow_engine_t *ss, const char *pat
 
     if (S_ISREG(st.st_mode)) {
         if (has_supported_media_extension(path)) {
-            add_file_to_list(ss, path);
+            scan_add_item(ctx, path, false);
         }
         return;
     }
 
     if (S_ISDIR(st.st_mode)) {
-        if (is_workshop_directory(path)) {
-            add_file_to_list(ss, path);
-            return;
-        }
-
-        DIR *dir = opendir(path);
-        if (!dir)
-            return;
-
-        struct dirent *ent;
-        while ((ent = readdir(dir)) != NULL) {
-            if (ent->d_name[0] == '.')
-                continue;
-
-            char full_path[4096];
-            snprintf(full_path, sizeof(full_path), "%s/%s", path, ent->d_name);
-
-#ifdef _DIRENT_HAVE_D_TYPE
-            if (ent->d_type == DT_REG) {
-                if (has_supported_media_extension(ent->d_name)) {
-                    add_file_to_list(ss, full_path);
-                }
-                continue;
-            } else if (ent->d_type == DT_DIR) {
-                if (is_workshop_directory(full_path)) {
-                    add_file_to_list(ss, full_path);
-                } else if (ss->recursive) {
-                    scan_path_recursive_internal(ss, full_path, depth + 1);
-                }
-                continue;
-            }
-#endif
-
-            struct stat child_st;
-            if (stat(full_path, &child_st) == 0) {
-                if (S_ISDIR(child_st.st_mode)) {
-                    if (is_workshop_directory(full_path)) {
-                        add_file_to_list(ss, full_path);
-                    } else if (ss->recursive) {
-                        scan_path_recursive_internal(ss, full_path, depth + 1);
-                    }
-                } else if (S_ISREG(child_st.st_mode) &&
-                           has_supported_media_extension(ent->d_name)) {
-                    add_file_to_list(ss, full_path);
-                }
-            }
-        }
-        closedir(dir);
+        scan_dir_at(ctx, path, &st, recursive, true, 0);
     }
-}
-
-static void scan_path_recursive(slideshow_engine_t *ss, const char *path)
-{
-    scan_path_recursive_internal(ss, path, 0);
-}
-
-static int cmp_path_asc(const void *a, const void *b)
-{
-    const char *pa = *(const char *const *)a;
-    const char *pb = *(const char *const *)b;
-    return strcmp(pa, pb);
-}
-
-static int cmp_path_desc(const void *a, const void *b)
-{
-    const char *pa = *(const char *const *)a;
-    const char *pb = *(const char *const *)b;
-    return strcmp(pb, pa);
 }
 
 typedef struct {
     char *path;
+    bool is_dir;
     time_t sec;
     long nsec;
-} path_mtime_entry_t;
+} sort_entry_t;
 
-static int cmp_mtime_entry(const void *a, const void *b)
+static int cmp_entry_asc(const void *a, const void *b)
 {
-    const path_mtime_entry_t *ea = (const path_mtime_entry_t *)a;
-    const path_mtime_entry_t *eb = (const path_mtime_entry_t *)b;
+    const sort_entry_t *ea = (const sort_entry_t *)a;
+    const sort_entry_t *eb = (const sort_entry_t *)b;
+    return strcmp(ea->path, eb->path);
+}
+
+static int cmp_entry_desc(const void *a, const void *b)
+{
+    const sort_entry_t *ea = (const sort_entry_t *)a;
+    const sort_entry_t *eb = (const sort_entry_t *)b;
+    return strcmp(eb->path, ea->path);
+}
+
+static int cmp_entry_mtime(const void *a, const void *b)
+{
+    const sort_entry_t *ea = (const sort_entry_t *)a;
+    const sort_entry_t *eb = (const sort_entry_t *)b;
     if (ea->sec != eb->sec) {
         return (ea->sec > eb->sec) ? -1 : 1;
     }
@@ -228,90 +398,201 @@ static int cmp_mtime_entry(const void *a, const void *b)
     return strcmp(ea->path, eb->path);
 }
 
-static int cmp_path_mtime(const void *a, const void *b)
+static void swap_slide_items(char **files, bool *is_dir, size_t a, size_t b)
 {
-    const char *pa = *(const char *const *)a;
-    const char *pb = *(const char *const *)b;
-    struct stat sa, sb;
-    bool ok_a = (stat(pa, &sa) == 0);
-    bool ok_b = (stat(pb, &sb) == 0);
-    time_t sec_a = ok_a ? sa.st_mtim.tv_sec : 0;
-    time_t sec_b = ok_b ? sb.st_mtim.tv_sec : 0;
-    if (sec_a != sec_b) {
-        return (sec_a > sec_b) ? -1 : 1;
+    if (a == b)
+        return;
+    char *tmp_p = files[a];
+    files[a] = files[b];
+    files[b] = tmp_p;
+    if (is_dir) {
+        bool tmp_d = is_dir[a];
+        is_dir[a] = is_dir[b];
+        is_dir[b] = tmp_d;
     }
-    long nsec_a = ok_a ? sa.st_mtim.tv_nsec : 0;
-    long nsec_b = ok_b ? sb.st_mtim.tv_nsec : 0;
-    if (nsec_a != nsec_b) {
-        return (nsec_a > nsec_b) ? -1 : 1;
+}
+
+static void shuffle_slide_arrays(char **files, bool *is_dir, size_t num_files,
+                                 const char *last_played_path)
+{
+    if (!files || num_files < 2)
+        return;
+    for (size_t i = num_files - 1; i > 0; --i) {
+        size_t j = slideshow_uniform_size(i + 1u);
+        swap_slide_items(files, is_dir, i, j);
     }
-    return strcmp(pa, pb);
+    if (last_played_path && last_played_path[0] != '\0' && files[0] &&
+        strcmp(files[0], last_played_path) == 0) {
+        size_t swap_idx = 1u + slideshow_uniform_size(num_files - 1u);
+        swap_slide_items(files, is_dir, 0u, swap_idx);
+    }
 }
 
 static void shuffle_files(slideshow_engine_t *ss)
 {
     if (!ss || ss->num_files < 2)
         return;
-    for (size_t i = ss->num_files - 1; i > 0; --i) {
-        size_t j = (size_t)rand() % (i + 1);
-        char *tmp = ss->file_list[i];
-        ss->file_list[i] = ss->file_list[j];
-        ss->file_list[j] = tmp;
+    shuffle_slide_arrays(ss->file_list, ss->is_dir_list, ss->num_files, ss->last_played_path);
+}
+
+static void sort_or_shuffle_arrays(char **files, bool *is_dir, size_t count,
+                                   waywal_sort_mode_t mode, const char *last_played_path)
+{
+    if (!files || count < 2)
+        return;
+
+    sort_entry_t *entries = (sort_entry_t *)malloc(count * sizeof(sort_entry_t));
+    if (!entries)
+        return;
+
+    for (size_t i = 0; i < count; ++i) {
+        entries[i].path = files[i];
+        entries[i].is_dir = is_dir ? is_dir[i] : false;
+        entries[i].sec = 0;
+        entries[i].nsec = 0;
+        if (mode == WAYWAL_SORT_MTIME) {
+            struct stat st;
+            if (stat(files[i], &st) == 0) {
+                entries[i].sec = st.st_mtim.tv_sec;
+                entries[i].nsec = st.st_mtim.tv_nsec;
+            }
+        }
     }
-    if (ss->last_played_path[0] != '\0' && ss->file_list[0] &&
-        strcmp(ss->file_list[0], ss->last_played_path) == 0) {
-        size_t swap_idx = 1 + ((size_t)rand() % (ss->num_files - 1));
-        char *tmp = ss->file_list[0];
-        ss->file_list[0] = ss->file_list[swap_idx];
-        ss->file_list[swap_idx] = tmp;
+
+    switch (mode) {
+    case WAYWAL_SORT_RANDOM:
+        qsort(entries, count, sizeof(sort_entry_t), cmp_entry_asc);
+        break;
+    case WAYWAL_SORT_DESCENDING:
+        qsort(entries, count, sizeof(sort_entry_t), cmp_entry_desc);
+        break;
+    case WAYWAL_SORT_MTIME:
+        qsort(entries, count, sizeof(sort_entry_t), cmp_entry_mtime);
+        break;
+    case WAYWAL_SORT_ASCENDING:
+    default:
+        qsort(entries, count, sizeof(sort_entry_t), cmp_entry_asc);
+        break;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        files[i] = entries[i].path;
+        if (is_dir) {
+            is_dir[i] = entries[i].is_dir;
+        }
+    }
+    free(entries);
+
+    if (mode == WAYWAL_SORT_RANDOM) {
+        shuffle_slide_arrays(files, is_dir, count, last_played_path);
     }
 }
 
-static void apply_sort_or_shuffle(slideshow_engine_t *ss)
+static void free_slide_arrays(char **files, bool *is_dir, size_t count)
 {
-    if (!ss || ss->num_files < 2)
-        return;
-    waywal_sort_mode_t mode = ss->has_sort_mode
-                                  ? (waywal_sort_mode_t)ss->sort_mode
-                                  : (ss->random_order ? WAYWAL_SORT_RANDOM : WAYWAL_SORT_ASCENDING);
-    switch (mode) {
-    case WAYWAL_SORT_RANDOM:
-        qsort(ss->file_list, ss->num_files, sizeof(char *), cmp_path_asc);
-        shuffle_files(ss);
-        break;
-    case WAYWAL_SORT_DESCENDING:
-        qsort(ss->file_list, ss->num_files, sizeof(char *), cmp_path_desc);
-        break;
-    case WAYWAL_SORT_MTIME: {
-        path_mtime_entry_t *entries =
-            (path_mtime_entry_t *)malloc(ss->num_files * sizeof(path_mtime_entry_t));
-        if (entries) {
-            for (size_t i = 0; i < ss->num_files; ++i) {
-                entries[i].path = ss->file_list[i];
-                struct stat st;
-                if (stat(ss->file_list[i], &st) == 0) {
-                    entries[i].sec = st.st_mtim.tv_sec;
-                    entries[i].nsec = st.st_mtim.tv_nsec;
-                } else {
-                    entries[i].sec = 0;
-                    entries[i].nsec = 0;
-                }
-            }
-            qsort(entries, ss->num_files, sizeof(path_mtime_entry_t), cmp_mtime_entry);
-            for (size_t i = 0; i < ss->num_files; ++i) {
-                ss->file_list[i] = entries[i].path;
-            }
-            free(entries);
-        } else {
-            qsort(ss->file_list, ss->num_files, sizeof(char *), cmp_path_mtime);
+    if (files) {
+        for (size_t i = 0; i < count; ++i) {
+            free(files[i]);
         }
-        break;
+        free(files);
     }
-    case WAYWAL_SORT_ASCENDING:
-    default:
-        qsort(ss->file_list, ss->num_files, sizeof(char *), cmp_path_asc);
-        break;
+    free(is_dir);
+}
+
+static bool scan_and_build_list(const char *root_path, bool recursive, waywal_sort_mode_t mode,
+                                const char *last_played_path, const char *preserve_path,
+                                char ***out_files, bool **out_is_dir, size_t *out_count,
+                                size_t *out_cap, size_t *out_idx)
+{
+    slideshow_scan_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+
+    scan_path_tree(&ctx, root_path, recursive);
+    free(ctx.visited);
+    ctx.visited = NULL;
+
+    if (ctx.count == 0) {
+        free_slide_arrays(ctx.files, ctx.is_dir, ctx.count);
+        return false;
     }
+
+    sort_or_shuffle_arrays(ctx.files, ctx.is_dir, ctx.count, mode, last_played_path);
+
+    size_t idx = 0;
+    if (mode != WAYWAL_SORT_RANDOM && preserve_path && preserve_path[0] != '\0') {
+        for (size_t i = 0; i < ctx.count; ++i) {
+            if (ctx.files[i] && strcmp(ctx.files[i], preserve_path) == 0) {
+                idx = i;
+                break;
+            }
+        }
+    }
+
+    *out_files = ctx.files;
+    *out_is_dir = ctx.is_dir;
+    *out_count = ctx.count;
+    *out_cap = ctx.cap;
+    if (out_idx) {
+        *out_idx = idx;
+    }
+    return true;
+}
+
+typedef struct slideshow_async {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    pthread_t thread;
+    bool sync_init;
+    bool thread_started;
+    bool stop;
+    int timer_fd;
+
+    uint64_t req_gen;
+    bool req_pending;
+    char req_path[4096];
+    int req_dir;
+    bool req_from_tick;
+    size_t req_fail_streak;
+
+    bool has_done;
+    uint64_t done_gen;
+    char done_path[4096];
+    bool done_ok;
+    uint8_t *done_pixels;
+    uint32_t done_w;
+    uint32_t done_h;
+    int done_dir;
+    bool done_from_tick;
+    size_t done_fail_streak;
+
+    bool has_prefetch_req;
+    char prefetch_req_path[4096];
+
+    bool has_prefetch;
+    char prefetch_path[4096];
+    bool prefetch_ok;
+    uint8_t *prefetch_pixels;
+    uint32_t prefetch_w;
+    uint32_t prefetch_h;
+} slideshow_async_t;
+
+typedef enum {
+    SLIDE_PRESENT_ASYNC_PENDING = 0,
+    SLIDE_PRESENT_SYNC_OK = 1,
+    SLIDE_PRESENT_SYNC_FAIL = 2,
+} slide_present_res_t;
+
+static void copy_cstr_trunc(char *dst, size_t cap, const char *src)
+{
+    if (!dst || cap == 0)
+        return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    size_t len = strnlen(src, cap - 1u);
+    memcpy(dst, src, len);
+    dst[len] = '\0';
 }
 
 static void arm_timer(slideshow_engine_t *ss)
@@ -342,49 +623,242 @@ static void disarm_timer(slideshow_engine_t *ss)
         ;
 }
 
-static void display_current_image(slideshow_engine_t *ss)
+static void trigger_timer_async_wakeup(int timer_fd)
 {
-    if (!ss || ss->num_files == 0)
+    if (timer_fd < 0)
+        return;
+    struct itimerspec its = {
+        .it_interval = {0, 0},
+        .it_value = {.tv_sec = 0, .tv_nsec = 1},
+    };
+    (void)timerfd_settime(timer_fd, 0, &its, NULL);
+}
+
+static void *slideshow_async_worker_main(void *arg)
+{
+    slideshow_async_t *async = (slideshow_async_t *)arg;
+    for (;;) {
+        char path[4096];
+        bool is_primary = false;
+        uint64_t gen = 0;
+        int dir = 1;
+        bool from_tick = false;
+        size_t fail_streak = 0;
+
+        pthread_mutex_lock(&async->mu);
+        while (!async->stop && !async->req_pending && !async->has_prefetch_req) {
+            pthread_cond_wait(&async->cv, &async->mu);
+        }
+        if (async->stop) {
+            pthread_mutex_unlock(&async->mu);
+            break;
+        }
+        if (async->req_pending) {
+            is_primary = true;
+            copy_cstr_trunc(path, sizeof(path), async->req_path);
+            gen = async->req_gen;
+            dir = async->req_dir;
+            from_tick = async->req_from_tick;
+            fail_streak = async->req_fail_streak;
+            async->req_pending = false;
+        } else {
+            is_primary = false;
+            copy_cstr_trunc(path, sizeof(path), async->prefetch_req_path);
+            async->has_prefetch_req = false;
+        }
+        pthread_mutex_unlock(&async->mu);
+
+        uint8_t *pixels = NULL;
+        uint32_t img_w = 0, img_h = 0;
+        bool ok = image_load(path, &pixels, &img_w, &img_h);
+        if (!ok || !pixels || img_w == 0 || img_h == 0) {
+            image_free(pixels);
+            pixels = NULL;
+            img_w = 0;
+            img_h = 0;
+            ok = false;
+        }
+
+        pthread_mutex_lock(&async->mu);
+        if (async->stop) {
+            pthread_mutex_unlock(&async->mu);
+            image_free(pixels);
+            break;
+        }
+        if (is_primary) {
+            if (gen == async->req_gen && !async->req_pending) {
+                image_free(async->done_pixels);
+                async->done_pixels = pixels;
+                async->done_w = img_w;
+                async->done_h = img_h;
+                async->done_ok = ok;
+                async->done_gen = gen;
+                async->done_dir = dir;
+                async->done_from_tick = from_tick;
+                async->done_fail_streak = fail_streak;
+                copy_cstr_trunc(async->done_path, sizeof(async->done_path), path);
+                async->has_done = true;
+                trigger_timer_async_wakeup(async->timer_fd);
+            } else {
+                image_free(pixels);
+            }
+        } else {
+            if (!async->has_prefetch_req && !async->req_pending) {
+                image_free(async->prefetch_pixels);
+                async->prefetch_pixels = pixels;
+                async->prefetch_w = img_w;
+                async->prefetch_h = img_h;
+                async->prefetch_ok = ok;
+                copy_cstr_trunc(async->prefetch_path, sizeof(async->prefetch_path), path);
+                async->has_prefetch = true;
+            } else {
+                image_free(pixels);
+            }
+        }
+        pthread_mutex_unlock(&async->mu);
+    }
+    return NULL;
+}
+
+static slideshow_async_t *ensure_slideshow_async(slideshow_engine_t *ss)
+{
+    if (!ss || ss->timer_fd < 0)
+        return NULL;
+    if (ss->async)
+        return ss->async;
+
+    slideshow_async_t *async = (slideshow_async_t *)calloc(1, sizeof(slideshow_async_t));
+    if (!async)
+        return NULL;
+    async->timer_fd = ss->timer_fd;
+    if (pthread_mutex_init(&async->mu, NULL) != 0) {
+        free(async);
+        return NULL;
+    }
+    if (pthread_cond_init(&async->cv, NULL) != 0) {
+        pthread_mutex_destroy(&async->mu);
+        free(async);
+        return NULL;
+    }
+    async->sync_init = true;
+    if (pthread_create(&async->thread, NULL, slideshow_async_worker_main, async) != 0) {
+        pthread_cond_destroy(&async->cv);
+        pthread_mutex_destroy(&async->mu);
+        free(async);
+        return NULL;
+    }
+    async->thread_started = true;
+    ss->async = async;
+    return async;
+}
+
+static void destroy_slideshow_async(slideshow_engine_t *ss)
+{
+    if (!ss || !ss->async)
+        return;
+    slideshow_async_t *async = ss->async;
+    ss->async = NULL;
+
+    if (async->sync_init) {
+        if (async->thread_started) {
+            pthread_mutex_lock(&async->mu);
+            async->stop = true;
+            pthread_cond_signal(&async->cv);
+            pthread_mutex_unlock(&async->mu);
+            (void)pthread_join(async->thread, NULL);
+            async->thread_started = false;
+        }
+        image_free(async->done_pixels);
+        image_free(async->prefetch_pixels);
+        pthread_cond_destroy(&async->cv);
+        pthread_mutex_destroy(&async->mu);
+    }
+    free(async);
+}
+
+static void cancel_async_requests(slideshow_engine_t *ss, bool clear_prefetch)
+{
+    if (!ss || !ss->async)
+        return;
+    slideshow_async_t *async = ss->async;
+    pthread_mutex_lock(&async->mu);
+    async->req_gen++;
+    async->req_pending = false;
+    if (async->has_done) {
+        image_free(async->done_pixels);
+        async->done_pixels = NULL;
+        async->has_done = false;
+    }
+    if (clear_prefetch) {
+        async->has_prefetch_req = false;
+        if (async->has_prefetch) {
+            image_free(async->prefetch_pixels);
+            async->prefetch_pixels = NULL;
+            async->has_prefetch = false;
+        }
+    }
+    pthread_mutex_unlock(&async->mu);
+}
+
+static waywal_sort_mode_t effective_sort_mode(const slideshow_engine_t *ss)
+{
+    return ss->has_sort_mode ? (waywal_sort_mode_t)ss->sort_mode
+                             : (ss->random_order ? WAYWAL_SORT_RANDOM : WAYWAL_SORT_ASCENDING);
+}
+
+static void schedule_prefetch_next(slideshow_engine_t *ss)
+{
+    if (!ss || !ss->daemon_state || ss->num_files < 2 || !ss->file_list)
         return;
 
-    const char *filepath = ss->file_list[ss->current_file_idx];
-    if (!filepath)
+    size_t next_idx = ss->current_file_idx + 1u;
+    if (next_idx >= ss->num_files) {
+        if (effective_sort_mode(ss) == WAYWAL_SORT_RANDOM) {
+            return;
+        }
+        next_idx = 0u;
+    }
+    const char *next_path = ss->file_list[next_idx];
+    bool next_is_dir = ss->is_dir_list ? ss->is_dir_list[next_idx] : false;
+    if (!next_path || next_is_dir || has_video_extension(next_path) ||
+        has_shader_extension(next_path)) {
+        return;
+    }
+
+    slideshow_async_t *async = ensure_slideshow_async(ss);
+    if (!async)
         return;
 
-    strncpy(ss->last_played_path, filepath, sizeof(ss->last_played_path) - 1);
-    ss->last_played_path[sizeof(ss->last_played_path) - 1] = '\0';
+    pthread_mutex_lock(&async->mu);
+    if ((!async->has_prefetch || strcmp(async->prefetch_path, next_path) != 0) &&
+        !async->req_pending) {
+        copy_cstr_trunc(async->prefetch_req_path, sizeof(async->prefetch_req_path), next_path);
+        async->has_prefetch_req = true;
+        pthread_cond_signal(&async->cv);
+    }
+    pthread_mutex_unlock(&async->mu);
+}
 
-    if (!ss->daemon_state)
-        return;
-
+static uint32_t choose_transition_type(const slideshow_engine_t *ss)
+{
     uint32_t trans_type = ss->transition_type;
     if (trans_type == WAYWAL_TRANSITION_RANDOM) {
-        /* Pick random animated transition between SIMPLE (1) and PAGE_CURL (19) */
-        trans_type = 1 + (uint32_t)(rand() % 19);
+        /* Pick random animated transition between SIMPLE (1) and PAGE_CURL (19). */
+        trans_type = 1u + slideshow_uniform_u32(19u);
+    }
+    return trans_type;
+}
+
+static bool present_decoded_image(slideshow_engine_t *ss, const char *filepath, uint8_t *pixels,
+                                  uint32_t img_w, uint32_t img_h)
+{
+    if (!ss || !ss->daemon_state || !filepath || !pixels || img_w == 0 || img_h == 0) {
+        image_free(pixels);
+        return false;
     }
 
     daemon_state_t *st = ss->daemon_state;
-    struct stat item_st;
-    bool is_dir = (stat(filepath, &item_st) == 0 && S_ISDIR(item_st.st_mode));
-    if (is_dir || has_video_extension(filepath) || has_shader_extension(filepath)) {
-        if (daemon_slideshow_present_media) {
-            WAYWAL_LOG_INFO("Slideshow [%zu/%zu]: presenting live media '%s' (transition: %u)",
-                            ss->current_file_idx + 1, ss->num_files, filepath, trans_type);
-            if (daemon_slideshow_present_media(st, ss, filepath, trans_type) &&
-                st->config.hooks.on_wallpaper_change[0] != '\0') {
-                (void)waywal_palette_run_hook(st->config.hooks.on_wallpaper_change);
-            }
-        }
-        return;
-    }
-
-    uint8_t *pixels = NULL;
-    uint32_t img_w = 0, img_h = 0;
-
-    if (!image_load(filepath, &pixels, &img_w, &img_h)) {
-        WAYWAL_LOG_WARN("Slideshow: Failed to load image '%s', skipping", filepath);
-        return;
-    }
+    uint32_t trans_type = choose_transition_type(ss);
 
     if (daemon_slideshow_prepare_image_output) {
         daemon_slideshow_prepare_image_output(st, ss);
@@ -433,7 +907,7 @@ static void display_current_image(slideshow_engine_t *ss)
         meta->has_auto_day_night = 1;
         meta->auto_day_night = (ss->auto_day_night == 1) ? 1 : 0;
     }
-    strncpy(meta->filepath, filepath, sizeof(meta->filepath) - 1);
+    copy_cstr_trunc(meta->filepath, sizeof(meta->filepath), filepath);
 
     uint32_t valid_targets = 0;
     size_t extra_off = 0;
@@ -485,6 +959,7 @@ static void display_current_image(slideshow_engine_t *ss)
                   : false;
     image_free(pixels);
     if (ok) {
+        copy_cstr_trunc(ss->last_played_path, sizeof(ss->last_played_path), filepath);
         if (st->config.hooks.on_wallpaper_change[0] != '\0') {
             (void)waywal_palette_run_hook(st->config.hooks.on_wallpaper_change);
         }
@@ -493,20 +968,144 @@ static void display_current_image(slideshow_engine_t *ss)
             (void)try_start_native_animation(st, filepath, meta, first_target);
         }
     }
+    return ok;
+}
+
+static void advance_slideshow_index_dir(slideshow_engine_t *ss, int step_dir)
+{
+    if (!ss || ss->num_files == 0)
+        return;
+    if (step_dir < 0) {
+        if (ss->current_file_idx == 0)
+            ss->current_file_idx = ss->num_files - 1u;
+        else
+            ss->current_file_idx--;
+        return;
+    }
+    if (ss->current_file_idx + 1u >= ss->num_files) {
+        ss->current_file_idx = 0u;
+        if (effective_sort_mode(ss) == WAYWAL_SORT_RANDOM && ss->num_files > 1u) {
+            shuffle_files(ss);
+        }
+    } else {
+        ss->current_file_idx++;
+    }
+}
+
+static slide_present_res_t request_or_present_slide(slideshow_engine_t *ss, int step_dir,
+                                                    bool from_tick, size_t fail_streak)
+{
+    if (!ss || ss->num_files == 0 || !ss->file_list)
+        return SLIDE_PRESENT_SYNC_FAIL;
+
+    for (size_t attempt = fail_streak; attempt < ss->num_files; ++attempt) {
+        const char *filepath = ss->file_list[ss->current_file_idx];
+        if (!filepath) {
+            advance_slideshow_index_dir(ss, step_dir);
+            continue;
+        }
+
+        if (!ss->daemon_state) {
+            copy_cstr_trunc(ss->last_played_path, sizeof(ss->last_played_path), filepath);
+            return SLIDE_PRESENT_SYNC_OK;
+        }
+
+        bool is_dir = ss->is_dir_list ? ss->is_dir_list[ss->current_file_idx] : false;
+        if (is_dir || has_video_extension(filepath) || has_shader_extension(filepath)) {
+            cancel_async_requests(ss, false);
+            bool ok = false;
+            if (daemon_slideshow_present_media) {
+                uint32_t trans_type = choose_transition_type(ss);
+                WAYWAL_LOG_INFO("Slideshow [%zu/%zu]: presenting live media '%s' (transition: %u)",
+                                ss->current_file_idx + 1, ss->num_files, filepath, trans_type);
+                ok = daemon_slideshow_present_media(ss->daemon_state, ss, filepath, trans_type);
+                if (ok) {
+                    copy_cstr_trunc(ss->last_played_path, sizeof(ss->last_played_path), filepath);
+                    if (ss->daemon_state->config.hooks.on_wallpaper_change[0] != '\0') {
+                        (void)waywal_palette_run_hook(
+                            ss->daemon_state->config.hooks.on_wallpaper_change);
+                    }
+                }
+            }
+            if (ok) {
+                schedule_prefetch_next(ss);
+                return SLIDE_PRESENT_SYNC_OK;
+            }
+            WAYWAL_LOG_WARN("Slideshow: Failed to present media '%s', skipping", filepath);
+            advance_slideshow_index_dir(ss, step_dir);
+            continue;
+        }
+
+        slideshow_async_t *async = ensure_slideshow_async(ss);
+        if (!async) {
+            uint8_t *pixels = NULL;
+            uint32_t img_w = 0, img_h = 0;
+            if (image_load(filepath, &pixels, &img_w, &img_h) && pixels && img_w > 0 && img_h > 0) {
+                if (present_decoded_image(ss, filepath, pixels, img_w, img_h)) {
+                    return SLIDE_PRESENT_SYNC_OK;
+                }
+            } else {
+                image_free(pixels);
+                WAYWAL_LOG_WARN("Slideshow: Failed to load image '%s', skipping", filepath);
+            }
+            advance_slideshow_index_dir(ss, step_dir);
+            continue;
+        }
+
+        uint8_t *hit_pixels = NULL;
+        uint32_t hit_w = 0, hit_h = 0;
+        bool cache_hit = false;
+        bool cache_ok = false;
+
+        pthread_mutex_lock(&async->mu);
+        if (async->has_prefetch && strcmp(async->prefetch_path, filepath) == 0) {
+            cache_hit = true;
+            cache_ok = async->prefetch_ok;
+            hit_pixels = async->prefetch_pixels;
+            hit_w = async->prefetch_w;
+            hit_h = async->prefetch_h;
+            async->prefetch_pixels = NULL;
+            async->has_prefetch = false;
+            async->req_gen++;
+            async->req_pending = false;
+        } else {
+            if (async->has_done) {
+                image_free(async->done_pixels);
+                async->done_pixels = NULL;
+                async->has_done = false;
+            }
+            async->req_gen++;
+            async->req_pending = true;
+            copy_cstr_trunc(async->req_path, sizeof(async->req_path), filepath);
+            async->req_dir = step_dir;
+            async->req_from_tick = from_tick;
+            async->req_fail_streak = attempt;
+            async->has_prefetch_req = false;
+            pthread_cond_signal(&async->cv);
+        }
+        pthread_mutex_unlock(&async->mu);
+
+        if (!cache_hit) {
+            return SLIDE_PRESENT_ASYNC_PENDING;
+        }
+
+        if (cache_ok && present_decoded_image(ss, filepath, hit_pixels, hit_w, hit_h)) {
+            schedule_prefetch_next(ss);
+            return SLIDE_PRESENT_SYNC_OK;
+        }
+        image_free(hit_pixels);
+        WAYWAL_LOG_WARN("Slideshow: Failed to load image '%s', skipping", filepath);
+        advance_slideshow_index_dir(ss, step_dir);
+    }
+
+    WAYWAL_LOG_WARN("Slideshow: All %zu candidate items failed to load", ss->num_files);
+    return SLIDE_PRESENT_SYNC_FAIL;
 }
 
 bool slideshow_init(slideshow_engine_t *ss, struct daemon_state *state)
 {
     if (!ss)
         return false;
-
-    static bool s_rng_seeded = false;
-    if (!s_rng_seeded) {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        srand((unsigned int)(ts.tv_sec ^ ts.tv_nsec ^ (long)getpid()));
-        s_rng_seeded = true;
-    }
 
     memset(ss, 0, sizeof(*ss));
     ss->daemon_state = state;
@@ -533,12 +1132,15 @@ bool slideshow_clone(slideshow_engine_t *dst, const slideshow_engine_t *src)
     *dst = *src;
     dst->timer_fd = new_timer_fd;
     dst->file_list = NULL;
+    dst->is_dir_list = NULL;
+    dst->async = NULL;
     dst->num_files = 0;
     dst->capacity_files = 0;
 
     if (src->num_files > 0 && src->file_list) {
         dst->file_list = (char **)calloc(src->num_files, sizeof(char *));
-        if (!dst->file_list) {
+        dst->is_dir_list = (bool *)calloc(src->num_files, sizeof(bool));
+        if (!dst->file_list || !dst->is_dir_list) {
             slideshow_destroy(dst);
             return false;
         }
@@ -551,6 +1153,7 @@ bool slideshow_clone(slideshow_engine_t *dst, const slideshow_engine_t *src)
                 slideshow_destroy(dst);
                 return false;
             }
+            dst->is_dir_list[dst->num_files] = src->is_dir_list ? src->is_dir_list[i] : false;
             dst->file_list[dst->num_files++] = dup;
         }
     }
@@ -558,7 +1161,7 @@ bool slideshow_clone(slideshow_engine_t *dst, const slideshow_engine_t *src)
     if (dst->num_files == 0) {
         dst->current_file_idx = 0;
     } else if (dst->current_file_idx >= dst->num_files) {
-        dst->current_file_idx = dst->num_files - 1;
+        dst->current_file_idx = dst->num_files - 1u;
     }
 
     if (dst->active && !dst->paused && dst->interval_s > 0) {
@@ -573,17 +1176,16 @@ void slideshow_destroy(slideshow_engine_t *ss)
         return;
 
     slideshow_stop(ss);
+    destroy_slideshow_async(ss);
 
     if (ss->timer_fd >= 0) {
         close(ss->timer_fd);
         ss->timer_fd = -1;
     }
 
-    for (size_t i = 0; i < ss->num_files; ++i) {
-        free(ss->file_list[i]);
-    }
-    free(ss->file_list);
+    free_slide_arrays(ss->file_list, ss->is_dir_list, ss->num_files);
     ss->file_list = NULL;
+    ss->is_dir_list = NULL;
     ss->num_files = 0;
     ss->capacity_files = 0;
 }
@@ -597,84 +1199,77 @@ bool slideshow_rescan(slideshow_engine_t *ss)
     prev_path[0] = '\0';
     if (ss->file_list && ss->current_file_idx < ss->num_files &&
         ss->file_list[ss->current_file_idx]) {
-        const char *cur = ss->file_list[ss->current_file_idx];
-        size_t plen = strnlen(cur, sizeof(prev_path) - 1);
-        memcpy(prev_path, cur, plen);
-        prev_path[plen] = '\0';
+        copy_cstr_trunc(prev_path, sizeof(prev_path), ss->file_list[ss->current_file_idx]);
         if (ss->last_played_path[0] == '\0') {
-            memcpy(ss->last_played_path, prev_path, plen + 1);
+            copy_cstr_trunc(ss->last_played_path, sizeof(ss->last_played_path), prev_path);
         }
     }
 
-    for (size_t i = 0; i < ss->num_files; ++i) {
-        free(ss->file_list[i]);
-    }
-    free(ss->file_list);
-    ss->file_list = NULL;
-    ss->num_files = 0;
-    ss->capacity_files = 0;
+    char **new_files = NULL;
+    bool *new_dirs = NULL;
+    size_t new_count = 0;
+    size_t new_cap = 0;
+    size_t new_idx = 0;
+    waywal_sort_mode_t mode = effective_sort_mode(ss);
 
-    scan_path_recursive(ss, ss->root_path);
-    if (ss->num_files == 0) {
-        ss->current_file_idx = 0;
+    if (!scan_and_build_list(ss->root_path, ss->recursive, mode, ss->last_played_path, prev_path,
+                             &new_files, &new_dirs, &new_count, &new_cap, &new_idx)) {
         return false;
     }
 
-    apply_sort_or_shuffle(ss);
-
-    ss->current_file_idx = 0;
-    waywal_sort_mode_t mode = ss->has_sort_mode
-                                  ? (waywal_sort_mode_t)ss->sort_mode
-                                  : (ss->random_order ? WAYWAL_SORT_RANDOM : WAYWAL_SORT_ASCENDING);
-    if (mode != WAYWAL_SORT_RANDOM && prev_path[0] != '\0') {
-        for (size_t i = 0; i < ss->num_files; ++i) {
-            if (ss->file_list[i] && strcmp(ss->file_list[i], prev_path) == 0) {
-                ss->current_file_idx = i;
-                break;
-            }
-        }
-    }
+    cancel_async_requests(ss, true);
+    free_slide_arrays(ss->file_list, ss->is_dir_list, ss->num_files);
+    ss->file_list = new_files;
+    ss->is_dir_list = new_dirs;
+    ss->num_files = new_count;
+    ss->capacity_files = new_cap;
+    ss->current_file_idx = new_idx;
     return true;
 }
 
 bool slideshow_start(slideshow_engine_t *ss, const waywal_slideshow_payload_t *payload)
 {
-    if (!ss || !payload)
+    if (!ss || !payload || payload->path[0] == '\0')
         return false;
 
-    memset(ss->root_path, 0, sizeof(ss->root_path));
-    size_t rlen = strnlen(payload->path, sizeof(ss->root_path) - 1);
-    memcpy(ss->root_path, payload->path, rlen);
-    ss->root_path[rlen] = '\0';
-    ss->recursive = (payload->no_recursive == 0);
-    ss->random_order = payload->random_order;
     bool explicit_sort =
         (payload->has_sort_mode != 0) || (payload->sort_mode > (uint8_t)WAYWAL_SORT_RANDOM &&
                                           payload->sort_mode <= (uint8_t)WAYWAL_SORT_MTIME);
-    ss->has_sort_mode = explicit_sort;
-    ss->sort_mode = explicit_sort ? payload->sort_mode
-                                  : (payload->random_order ? (uint8_t)WAYWAL_SORT_RANDOM
-                                                           : (uint8_t)WAYWAL_SORT_ASCENDING);
-    if (ss->has_sort_mode) {
-        ss->random_order = (ss->sort_mode == (uint8_t)WAYWAL_SORT_RANDOM);
-    }
-    ss->current_file_idx = 0;
-    ss->last_played_path[0] = '\0';
+    uint32_t new_sort = explicit_sort ? payload->sort_mode
+                                      : (payload->random_order ? (uint8_t)WAYWAL_SORT_RANDOM
+                                                               : (uint8_t)WAYWAL_SORT_ASCENDING);
+    bool new_random =
+        explicit_sort ? (new_sort == (uint8_t)WAYWAL_SORT_RANDOM) : (payload->random_order != 0);
+    bool new_recursive = (payload->no_recursive == 0);
 
-    /* Clean up any existing file list before fresh start */
-    for (size_t i = 0; i < ss->num_files; ++i) {
-        free(ss->file_list[i]);
-    }
-    free(ss->file_list);
-    ss->file_list = NULL;
-    ss->num_files = 0;
-    ss->capacity_files = 0;
+    char root_buf[4096];
+    copy_cstr_trunc(root_buf, sizeof(root_buf), payload->path);
 
-    if (!slideshow_rescan(ss)) {
+    char **new_files = NULL;
+    bool *new_dirs = NULL;
+    size_t new_count = 0;
+    size_t new_cap = 0;
+    if (!scan_and_build_list(root_buf, new_recursive, (waywal_sort_mode_t)new_sort, "", NULL,
+                             &new_files, &new_dirs, &new_count, &new_cap, NULL)) {
         WAYWAL_LOG_ERR("Slideshow: No supported media files found in '%s'", payload->path);
-        slideshow_stop(ss);
         return false;
     }
+
+    cancel_async_requests(ss, true);
+    free_slide_arrays(ss->file_list, ss->is_dir_list, ss->num_files);
+
+    memset(ss->root_path, 0, sizeof(ss->root_path));
+    memcpy(ss->root_path, root_buf, strlen(root_buf));
+    ss->recursive = new_recursive;
+    ss->random_order = new_random;
+    ss->has_sort_mode = explicit_sort;
+    ss->sort_mode = new_sort;
+    ss->file_list = new_files;
+    ss->is_dir_list = new_dirs;
+    ss->num_files = new_count;
+    ss->capacity_files = new_cap;
+    ss->current_file_idx = 0;
+    ss->last_played_path[0] = '\0';
 
     ss->interval_s = payload->interval_s > 0 ? payload->interval_s : 300;
     ss->transition_type = payload->transition_type;
@@ -717,8 +1312,9 @@ bool slideshow_start(slideshow_engine_t *ss, const waywal_slideshow_payload_t *p
         "Slideshow started with %zu media items (interval: %us, sort: %u, transition: %u)",
         ss->num_files, ss->interval_s, (unsigned)ss->sort_mode, ss->transition_type);
 
-    display_current_image(ss);
-    arm_timer(ss);
+    if (request_or_present_slide(ss, +1, false, 0u) != SLIDE_PRESENT_ASYNC_PENDING) {
+        arm_timer(ss);
+    }
     return true;
 }
 
@@ -727,6 +1323,7 @@ void slideshow_stop(slideshow_engine_t *ss)
     if (!ss || !ss->active)
         return;
 
+    cancel_async_requests(ss, true);
     disarm_timer(ss);
     ss->active = false;
     ss->paused = false;
@@ -738,7 +1335,16 @@ void slideshow_pause(slideshow_engine_t *ss)
     if (!ss || !ss->active || ss->paused)
         return;
 
+    bool rearm_done = false;
+    if (ss->async) {
+        pthread_mutex_lock(&ss->async->mu);
+        rearm_done = ss->async->has_done;
+        pthread_mutex_unlock(&ss->async->mu);
+    }
     disarm_timer(ss);
+    if (rearm_done) {
+        trigger_timer_async_wakeup(ss->timer_fd);
+    }
     ss->paused = true;
     WAYWAL_LOG_INFO("Slideshow paused");
 }
@@ -749,7 +1355,15 @@ void slideshow_resume(slideshow_engine_t *ss)
         return;
 
     ss->paused = false;
-    arm_timer(ss);
+    bool async_pending = false;
+    if (ss->async) {
+        pthread_mutex_lock(&ss->async->mu);
+        async_pending = ss->async->req_pending || ss->async->has_done;
+        pthread_mutex_unlock(&ss->async->mu);
+    }
+    if (!async_pending) {
+        arm_timer(ss);
+    }
     WAYWAL_LOG_INFO("Slideshow resumed");
 }
 
@@ -763,32 +1377,15 @@ void slideshow_toggle(slideshow_engine_t *ss)
         slideshow_pause(ss);
 }
 
-static void advance_slideshow_index(slideshow_engine_t *ss)
-{
-    if (!ss || ss->num_files == 0)
-        return;
-    if (ss->current_file_idx + 1 >= ss->num_files) {
-        ss->current_file_idx = 0;
-        waywal_sort_mode_t mode =
-            ss->has_sort_mode ? (waywal_sort_mode_t)ss->sort_mode
-                              : (ss->random_order ? WAYWAL_SORT_RANDOM : WAYWAL_SORT_ASCENDING);
-        if (mode == WAYWAL_SORT_RANDOM && ss->num_files > 1) {
-            shuffle_files(ss);
-        }
-    } else {
-        ss->current_file_idx++;
-    }
-}
-
 void slideshow_next(slideshow_engine_t *ss)
 {
     if (!ss || !ss->active || ss->num_files == 0)
         return;
 
-    advance_slideshow_index(ss);
-    display_current_image(ss);
-    if (!ss->paused)
+    advance_slideshow_index_dir(ss, +1);
+    if (request_or_present_slide(ss, +1, false, 0u) != SLIDE_PRESENT_ASYNC_PENDING && !ss->paused) {
         arm_timer(ss);
+    }
 }
 
 void slideshow_prev(slideshow_engine_t *ss)
@@ -796,14 +1393,10 @@ void slideshow_prev(slideshow_engine_t *ss)
     if (!ss || !ss->active || ss->num_files == 0)
         return;
 
-    if (ss->current_file_idx == 0)
-        ss->current_file_idx = ss->num_files - 1;
-    else
-        ss->current_file_idx--;
-
-    display_current_image(ss);
-    if (!ss->paused)
+    advance_slideshow_index_dir(ss, -1);
+    if (request_or_present_slide(ss, -1, false, 0u) != SLIDE_PRESENT_ASYNC_PENDING && !ss->paused) {
         arm_timer(ss);
+    }
 }
 
 void slideshow_dispatch_tick(slideshow_engine_t *ss)
@@ -816,12 +1409,97 @@ void slideshow_dispatch_tick(slideshow_engine_t *ss)
     if (s <= 0 || expirations == 0)
         return;
 
-    if (!ss->active || ss->paused || ss->num_files == 0)
+    if (!ss->active || ss->num_files == 0)
         return;
 
-    advance_slideshow_index(ss);
-    display_current_image(ss);
-    if (ss->daemon_state && daemon_broadcast_event) {
+    if (ss->async) {
+        bool has_done = false;
+        uint64_t done_gen = 0;
+        uint64_t cur_gen = 0;
+        bool req_pending = false;
+        char done_path[4096];
+        bool done_ok = false;
+        uint8_t *done_pixels = NULL;
+        uint32_t done_w = 0, done_h = 0;
+        int done_dir = 1;
+        bool done_from_tick = false;
+        size_t done_fail_streak = 0;
+
+        pthread_mutex_lock(&ss->async->mu);
+        cur_gen = ss->async->req_gen;
+        req_pending = ss->async->req_pending;
+        if (ss->async->has_done) {
+            has_done = true;
+            done_gen = ss->async->done_gen;
+            copy_cstr_trunc(done_path, sizeof(done_path), ss->async->done_path);
+            done_ok = ss->async->done_ok;
+            done_pixels = ss->async->done_pixels;
+            done_w = ss->async->done_w;
+            done_h = ss->async->done_h;
+            done_dir = ss->async->done_dir;
+            done_from_tick = ss->async->done_from_tick;
+            done_fail_streak = ss->async->done_fail_streak;
+            ss->async->done_pixels = NULL;
+            ss->async->has_done = false;
+        }
+        pthread_mutex_unlock(&ss->async->mu);
+
+        if (has_done) {
+            if (done_gen != cur_gen) {
+                image_free(done_pixels);
+                return;
+            }
+            bool presented_ok = false;
+            if (done_ok) {
+                presented_ok = present_decoded_image(ss, done_path, done_pixels, done_w, done_h);
+            } else {
+                image_free(done_pixels);
+                WAYWAL_LOG_WARN("Slideshow: Failed to load image '%s', skipping", done_path);
+            }
+            if (presented_ok) {
+                if (!ss->paused) {
+                    arm_timer(ss);
+                }
+                schedule_prefetch_next(ss);
+                if (done_from_tick && ss->daemon_state && daemon_broadcast_event) {
+                    daemon_broadcast_event(ss->daemon_state, "wallpaper_changed");
+                }
+                return;
+            }
+            size_t next_streak = done_fail_streak + 1u;
+            if (next_streak >= ss->num_files) {
+                WAYWAL_LOG_WARN("Slideshow: All %zu candidate items failed to load", ss->num_files);
+                if (!ss->paused) {
+                    arm_timer(ss);
+                }
+                return;
+            }
+            advance_slideshow_index_dir(ss, done_dir);
+            slide_present_res_t res =
+                request_or_present_slide(ss, done_dir, done_from_tick, next_streak);
+            if (res != SLIDE_PRESENT_ASYNC_PENDING) {
+                if (!ss->paused) {
+                    arm_timer(ss);
+                }
+                if (done_from_tick && res == SLIDE_PRESENT_SYNC_OK && ss->daemon_state &&
+                    daemon_broadcast_event) {
+                    daemon_broadcast_event(ss->daemon_state, "wallpaper_changed");
+                }
+            }
+            return;
+        }
+
+        if (req_pending) {
+            return;
+        }
+    }
+
+    if (ss->paused)
+        return;
+
+    advance_slideshow_index_dir(ss, +1);
+    slide_present_res_t res = request_or_present_slide(ss, +1, true, 0u);
+    if (res == SLIDE_PRESENT_SYNC_OK && ss->daemon_state && daemon_broadcast_event) {
         daemon_broadcast_event(ss->daemon_state, "wallpaper_changed");
     }
 }

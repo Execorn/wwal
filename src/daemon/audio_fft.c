@@ -196,15 +196,131 @@ typedef struct {
 } pw_tracked_node_t;
 
 #define PLAYBACK_RING_FRAMES 16384u
+#define PW_TRACKED_NODES_MAX 4096u
+
+typedef struct {
+    bool loaded;
+    void (*pw_init)(int *argc, char ***argv);
+    void *(*pw_thread_loop_new)(const char *name, const void *props);
+    void *(*pw_thread_loop_get_loop)(void *loop);
+    int (*pw_thread_loop_start)(void *loop);
+    void (*pw_thread_loop_stop)(void *loop);
+    void (*pw_thread_loop_destroy)(void *loop);
+    void (*pw_thread_loop_lock)(void *loop);
+    void (*pw_thread_loop_unlock)(void *loop);
+    void *(*pw_context_new)(void *main_loop, void *props, size_t user_data_size);
+    void (*pw_context_destroy)(void *context);
+    void *(*pw_context_connect)(void *context, void *properties, size_t user_data_size);
+    int (*pw_core_disconnect)(void *core);
+    void (*pw_proxy_destroy)(void *proxy);
+    void (*pw_proxy_add_object_listener)(void *proxy, struct spa_hook *listener, const void *funcs,
+                                         void *data);
+    void *(*pw_properties_new)(const char *key, ...);
+    void *(*pw_stream_new_simple)(void *loop, const char *name, void *props,
+                                  const struct pw_stream_events *events, void *data);
+    int (*pw_stream_connect)(void *stream, int direction, uint32_t target_id, int flags,
+                             const struct spa_pod **params, uint32_t n_params);
+    void (*pw_stream_destroy)(void *stream);
+    struct pw_buffer *(*pw_stream_dequeue_buffer)(void *stream);
+    int (*pw_stream_queue_buffer)(void *stream, struct pw_buffer *buffer);
+    int (*pw_stream_set_active)(void *stream, bool active);
+    int (*pw_stream_flush)(void *stream, bool drain);
+} pw_api_t;
+
+static pw_api_t g_pw_api;
+static pthread_once_t g_pw_api_once = PTHREAD_ONCE_INIT;
+static pthread_once_t g_pw_init_once = PTHREAD_ONCE_INIT;
+
+static void pw_api_init_once(void)
+{
+#ifndef WWAL_DISABLE_PIPEWIRE
+    void *lib = dlopen("libpipewire-0.3.so.0", RTLD_LAZY | RTLD_LOCAL | RTLD_NODELETE);
+#else
+    void *lib = NULL;
+#endif
+    if (!lib) {
+        return;
+    }
+    void *s_init = dlsym(lib, "pw_init");
+    void *s_tl_new = dlsym(lib, "pw_thread_loop_new");
+    void *s_tl_get = dlsym(lib, "pw_thread_loop_get_loop");
+    void *s_tl_start = dlsym(lib, "pw_thread_loop_start");
+    void *s_tl_stop = dlsym(lib, "pw_thread_loop_stop");
+    void *s_tl_destroy = dlsym(lib, "pw_thread_loop_destroy");
+    void *s_tl_lock = dlsym(lib, "pw_thread_loop_lock");
+    void *s_tl_unlock = dlsym(lib, "pw_thread_loop_unlock");
+    void *s_ctx_new = dlsym(lib, "pw_context_new");
+    void *s_ctx_destroy = dlsym(lib, "pw_context_destroy");
+    void *s_ctx_conn = dlsym(lib, "pw_context_connect");
+    void *s_core_disc = dlsym(lib, "pw_core_disconnect");
+    void *s_proxy_destroy = dlsym(lib, "pw_proxy_destroy");
+    void *s_proxy_add_l = dlsym(lib, "pw_proxy_add_object_listener");
+    void *s_props_new = dlsym(lib, "pw_properties_new");
+    void *s_st_new = dlsym(lib, "pw_stream_new_simple");
+    void *s_st_conn = dlsym(lib, "pw_stream_connect");
+    void *s_st_destroy = dlsym(lib, "pw_stream_destroy");
+    void *s_st_deq = dlsym(lib, "pw_stream_dequeue_buffer");
+    void *s_st_q = dlsym(lib, "pw_stream_queue_buffer");
+    void *s_st_active = dlsym(lib, "pw_stream_set_active");
+    void *s_st_flush = dlsym(lib, "pw_stream_flush");
+
+    memcpy(&g_pw_api.pw_init, &s_init, sizeof(g_pw_api.pw_init));
+    memcpy(&g_pw_api.pw_thread_loop_new, &s_tl_new, sizeof(g_pw_api.pw_thread_loop_new));
+    memcpy(&g_pw_api.pw_thread_loop_get_loop, &s_tl_get, sizeof(g_pw_api.pw_thread_loop_get_loop));
+    memcpy(&g_pw_api.pw_thread_loop_start, &s_tl_start, sizeof(g_pw_api.pw_thread_loop_start));
+    memcpy(&g_pw_api.pw_thread_loop_stop, &s_tl_stop, sizeof(g_pw_api.pw_thread_loop_stop));
+    memcpy(&g_pw_api.pw_thread_loop_destroy, &s_tl_destroy,
+           sizeof(g_pw_api.pw_thread_loop_destroy));
+    memcpy(&g_pw_api.pw_thread_loop_lock, &s_tl_lock, sizeof(g_pw_api.pw_thread_loop_lock));
+    memcpy(&g_pw_api.pw_thread_loop_unlock, &s_tl_unlock, sizeof(g_pw_api.pw_thread_loop_unlock));
+    memcpy(&g_pw_api.pw_context_new, &s_ctx_new, sizeof(g_pw_api.pw_context_new));
+    memcpy(&g_pw_api.pw_context_destroy, &s_ctx_destroy, sizeof(g_pw_api.pw_context_destroy));
+    memcpy(&g_pw_api.pw_context_connect, &s_ctx_conn, sizeof(g_pw_api.pw_context_connect));
+    memcpy(&g_pw_api.pw_core_disconnect, &s_core_disc, sizeof(g_pw_api.pw_core_disconnect));
+    memcpy(&g_pw_api.pw_proxy_destroy, &s_proxy_destroy, sizeof(g_pw_api.pw_proxy_destroy));
+    memcpy(&g_pw_api.pw_proxy_add_object_listener, &s_proxy_add_l,
+           sizeof(g_pw_api.pw_proxy_add_object_listener));
+    memcpy(&g_pw_api.pw_properties_new, &s_props_new, sizeof(g_pw_api.pw_properties_new));
+    memcpy(&g_pw_api.pw_stream_new_simple, &s_st_new, sizeof(g_pw_api.pw_stream_new_simple));
+    memcpy(&g_pw_api.pw_stream_connect, &s_st_conn, sizeof(g_pw_api.pw_stream_connect));
+    memcpy(&g_pw_api.pw_stream_destroy, &s_st_destroy, sizeof(g_pw_api.pw_stream_destroy));
+    memcpy(&g_pw_api.pw_stream_dequeue_buffer, &s_st_deq,
+           sizeof(g_pw_api.pw_stream_dequeue_buffer));
+    memcpy(&g_pw_api.pw_stream_queue_buffer, &s_st_q, sizeof(g_pw_api.pw_stream_queue_buffer));
+    memcpy(&g_pw_api.pw_stream_set_active, &s_st_active, sizeof(g_pw_api.pw_stream_set_active));
+    memcpy(&g_pw_api.pw_stream_flush, &s_st_flush, sizeof(g_pw_api.pw_stream_flush));
+    g_pw_api.loaded = true;
+}
+
+static void pw_library_init_once(void)
+{
+    if (g_pw_api.pw_init) {
+        g_pw_api.pw_init(NULL, NULL);
+    }
+}
+
+static float sanitize_pcm_sample(float s)
+{
+    if (!isfinite(s)) {
+        return 0.0f;
+    }
+    if (s < -4.0f) {
+        return -4.0f;
+    }
+    if (s > 4.0f) {
+        return 4.0f;
+    }
+    return s;
+}
 
 struct waywal_audio_fft {
     uint32_t sample_rate;
     bool has_avx2;
 
+    /* Put producer/consumer indices and buffers on distinct 64B cache lines */
+    _Alignas(64) _Atomic uint32_t cap_write_idx;
+    _Alignas(64) _Atomic uint32_t cap_read_idx;
     _Alignas(64) float ring[WAYWAL_AUDIO_RING_SIZE];
-    _Atomic uint32_t write_pos;
-    _Atomic uint32_t total_pushed;
-    uint32_t last_consumed;
 
     _Alignas(32) float scratch_samples[WAYWAL_AUDIO_FFT_SIZE];
     _Alignas(32) float history[WAYWAL_AUDIO_FFT_SIZE];
@@ -232,7 +348,6 @@ struct waywal_audio_fft {
     _Atomic bool test_override_enabled;
     _Atomic bool test_external_audio_active;
 
-    void *pw_lib;
     void *pw_loop;
     void *pw_context;
     void *pw_core;
@@ -242,26 +357,16 @@ struct waywal_audio_fft {
     struct pw_stream_events pw_events;
     void *pw_play_stream;
     struct pw_stream_events pw_play_events;
+    _Alignas(64) _Atomic uint32_t play_write_idx;
+    _Atomic uint32_t play_clear_target;
+    _Atomic uint32_t play_clear_seq;
+    _Alignas(64) _Atomic uint32_t play_read_idx;
+    uint32_t play_clear_seq_seen;
     _Alignas(64) float play_ring[PLAYBACK_RING_FRAMES * 2u];
-    _Atomic uint32_t play_write_idx;
-    _Atomic uint32_t play_read_idx;
-    pw_tracked_node_t tracked_nodes[32];
-    void (*fn_pw_thread_loop_stop)(void *loop);
-    void (*fn_pw_thread_loop_destroy)(void *loop);
-    void (*fn_pw_thread_loop_lock)(void *loop);
-    void (*fn_pw_thread_loop_unlock)(void *loop);
-    void *(*fn_pw_context_new)(void *main_loop, void *props, size_t user_data_size);
-    void (*fn_pw_context_destroy)(void *context);
-    void *(*fn_pw_context_connect)(void *context, void *properties, size_t user_data_size);
-    int (*fn_pw_core_disconnect)(void *core);
-    void (*fn_pw_proxy_destroy)(void *proxy);
-    void (*fn_pw_proxy_add_object_listener)(void *proxy, struct spa_hook *listener,
-                                            const void *funcs, void *data);
-    void (*fn_pw_stream_destroy)(void *stream);
-    struct pw_buffer *(*fn_pw_stream_dequeue_buffer)(void *stream);
-    int (*fn_pw_stream_queue_buffer)(void *stream, struct pw_buffer *buffer);
-    int (*fn_pw_stream_set_active)(void *stream, bool active);
-    int (*fn_pw_stream_flush)(void *stream, bool drain);
+    /* Heap-allocated nodes preserve intrusive spa_hook list pointers when array grows */
+    pw_tracked_node_t **tracked_nodes;
+    size_t tracked_node_cap;
+    _Atomic bool pw_running;
     bool pw_available;
 };
 
@@ -741,8 +846,9 @@ static void recompute_pw_external_active(waywal_audio_fft_t *fft)
         return;
     }
     bool any_running = false;
-    for (size_t i = 0; i < 32; ++i) {
-        if (fft->tracked_nodes[i].active && fft->tracked_nodes[i].running) {
+    for (size_t i = 0; i < fft->tracked_node_cap; ++i) {
+        pw_tracked_node_t *node = fft->tracked_nodes[i];
+        if (node && node->active && node->running) {
             any_running = true;
             break;
         }
@@ -756,9 +862,10 @@ static void on_node_info(void *data, const struct pw_node_info *info)
     if (!fft || !info) {
         return;
     }
-    for (size_t i = 0; i < 32; ++i) {
-        if (fft->tracked_nodes[i].active && fft->tracked_nodes[i].id == info->id) {
-            fft->tracked_nodes[i].running = (info->state == 3 /* PW_NODE_STATE_RUNNING */);
+    for (size_t i = 0; i < fft->tracked_node_cap; ++i) {
+        pw_tracked_node_t *node = fft->tracked_nodes[i];
+        if (node && node->active && node->id == info->id) {
+            node->running = (info->state == 3 /* PW_NODE_STATE_RUNNING */);
             recompute_pw_external_active(fft);
             return;
         }
@@ -812,13 +919,51 @@ static void *pw_registry_bind_inline(void *registry, uint32_t id, const char *ty
     return funcs->bind(iface->cb.data, id, type, version, user_data_size);
 }
 
+static size_t find_or_grow_tracked_node_slot(waywal_audio_fft_t *fft, uint32_t id, bool *exists_out)
+{
+    *exists_out = false;
+    size_t free_idx = SIZE_MAX;
+    for (size_t i = 0; i < fft->tracked_node_cap; ++i) {
+        pw_tracked_node_t *node = fft->tracked_nodes[i];
+        if (!node || !node->active) {
+            if (free_idx == SIZE_MAX) {
+                free_idx = i;
+            }
+            continue;
+        }
+        if (node->id == id) {
+            *exists_out = true;
+            return i;
+        }
+    }
+    if (free_idx != SIZE_MAX) {
+        return free_idx;
+    }
+    size_t old_cap = fft->tracked_node_cap;
+    if (old_cap >= PW_TRACKED_NODES_MAX) {
+        return SIZE_MAX;
+    }
+    size_t new_cap = (old_cap == 0u) ? 32u : (old_cap * 2u);
+    if (new_cap > PW_TRACKED_NODES_MAX) {
+        new_cap = PW_TRACKED_NODES_MAX;
+    }
+    pw_tracked_node_t **grown = realloc(fft->tracked_nodes, new_cap * sizeof(*grown));
+    if (!grown) {
+        return SIZE_MAX;
+    }
+    memset(grown + old_cap, 0, (new_cap - old_cap) * sizeof(*grown));
+    fft->tracked_nodes = grown;
+    fft->tracked_node_cap = new_cap;
+    return old_cap;
+}
+
 static void on_registry_global(void *data, uint32_t id, uint32_t permissions, const char *type,
                                uint32_t version, const struct spa_dict *props)
 {
     (void)permissions;
     (void)version;
     waywal_audio_fft_t *fft = (waywal_audio_fft_t *)data;
-    if (!fft || !fft->pw_registry || !fft->fn_pw_proxy_add_object_listener || !type || !props) {
+    if (!fft || !fft->pw_registry || !g_pw_api.pw_proxy_add_object_listener || !type || !props) {
         return;
     }
     if (strcmp(type, "PipeWire:Interface:Node") != 0) {
@@ -844,31 +989,33 @@ static void on_registry_global(void *data, uint32_t id, uint32_t permissions, co
         return;
     }
 
-    for (size_t i = 0; i < 32; ++i) {
-        if (fft->tracked_nodes[i].active && fft->tracked_nodes[i].id == id) {
-            return;
-        }
-    }
-    pw_tracked_node_t *slot = NULL;
-    for (size_t i = 0; i < 32; ++i) {
-        if (!fft->tracked_nodes[i].active) {
-            slot = &fft->tracked_nodes[i];
-            break;
-        }
-    }
-    if (!slot) {
+    bool already_exists = false;
+    size_t slot_idx = find_or_grow_tracked_node_slot(fft, id, &already_exists);
+    if (already_exists || slot_idx == SIZE_MAX) {
         return;
     }
     void *proxy = pw_registry_bind_inline(fft->pw_registry, id, type, 3u /* PW_VERSION_NODE */, 0);
     if (!proxy) {
         return;
     }
-    memset(slot, 0, sizeof(*slot));
+    pw_tracked_node_t *slot = fft->tracked_nodes[slot_idx];
+    if (!slot) {
+        slot = calloc(1, sizeof(*slot));
+        if (!slot) {
+            if (g_pw_api.pw_proxy_destroy) {
+                g_pw_api.pw_proxy_destroy(proxy);
+            }
+            return;
+        }
+        fft->tracked_nodes[slot_idx] = slot;
+    } else {
+        memset(slot, 0, sizeof(*slot));
+    }
     slot->id = id;
     slot->proxy = proxy;
     slot->running = false;
     slot->active = true;
-    fft->fn_pw_proxy_add_object_listener(proxy, &slot->listener, &s_node_events, fft);
+    g_pw_api.pw_proxy_add_object_listener(proxy, &slot->listener, &s_node_events, fft);
 }
 
 static void spa_hook_remove_inline(struct spa_hook *hook)
@@ -893,13 +1040,15 @@ static void on_registry_global_remove(void *data, uint32_t id)
     if (!fft) {
         return;
     }
-    for (size_t i = 0; i < 32; ++i) {
-        if (fft->tracked_nodes[i].active && fft->tracked_nodes[i].id == id) {
-            spa_hook_remove_inline(&fft->tracked_nodes[i].listener);
-            if (fft->tracked_nodes[i].proxy && fft->fn_pw_proxy_destroy) {
-                fft->fn_pw_proxy_destroy(fft->tracked_nodes[i].proxy);
+    for (size_t i = 0; i < fft->tracked_node_cap; ++i) {
+        pw_tracked_node_t *node = fft->tracked_nodes[i];
+        if (node && node->active && node->id == id) {
+            spa_hook_remove_inline(&node->listener);
+            if (node->proxy && g_pw_api.pw_proxy_destroy) {
+                g_pw_api.pw_proxy_destroy(node->proxy);
             }
-            memset(&fft->tracked_nodes[i], 0, sizeof(fft->tracked_nodes[i]));
+            free(node);
+            fft->tracked_nodes[i] = NULL;
             recompute_pw_external_active(fft);
             return;
         }
@@ -915,14 +1064,14 @@ static const struct pw_registry_events s_registry_events = {
 static void on_pw_process(void *userdata)
 {
     waywal_audio_fft_t *fft = (waywal_audio_fft_t *)userdata;
-    if (!fft || !fft->pw_stream || !fft->fn_pw_stream_dequeue_buffer ||
-        !fft->fn_pw_stream_queue_buffer) {
+    if (!fft || !fft->pw_stream || !g_pw_api.pw_stream_dequeue_buffer ||
+        !g_pw_api.pw_stream_queue_buffer) {
         return;
     }
-    if (!atomic_load_explicit(&fft->capture_active, memory_order_relaxed)) {
+    if (!atomic_load_explicit(&fft->capture_active, memory_order_acquire)) {
         return;
     }
-    struct pw_buffer *b = fft->fn_pw_stream_dequeue_buffer(fft->pw_stream);
+    struct pw_buffer *b = g_pw_api.pw_stream_dequeue_buffer(fft->pw_stream);
     if (!b) {
         return;
     }
@@ -932,7 +1081,7 @@ static void on_pw_process(void *userdata)
         uint32_t size = buf->datas[0].chunk->size;
         uint32_t maxsize = buf->datas[0].maxsize;
         if (maxsize == 0 || offset < maxsize) {
-            if (maxsize > 0 && offset + size > maxsize) {
+            if (maxsize > 0 && size > maxsize - offset) {
                 size = maxsize - offset;
             }
             size_t n_samples = size / sizeof(float);
@@ -956,17 +1105,17 @@ static void on_pw_process(void *userdata)
             }
         }
     }
-    fft->fn_pw_stream_queue_buffer(fft->pw_stream, b);
+    g_pw_api.pw_stream_queue_buffer(fft->pw_stream, b);
 }
 
 static void on_pw_playback_process(void *userdata)
 {
     waywal_audio_fft_t *fft = (waywal_audio_fft_t *)userdata;
-    if (!fft || !fft->pw_play_stream || !fft->fn_pw_stream_dequeue_buffer ||
-        !fft->fn_pw_stream_queue_buffer) {
+    if (!fft || !fft->pw_play_stream || !g_pw_api.pw_stream_dequeue_buffer ||
+        !g_pw_api.pw_stream_queue_buffer) {
         return;
     }
-    struct pw_buffer *b = fft->fn_pw_stream_dequeue_buffer(fft->pw_play_stream);
+    struct pw_buffer *b = g_pw_api.pw_stream_dequeue_buffer(fft->pw_play_stream);
     if (!b) {
         return;
     }
@@ -978,8 +1127,16 @@ static void on_pw_playback_process(void *userdata)
         if (max_frames > 1024u) {
             max_frames = 1024u;
         }
+        uint32_t cseq = atomic_load_explicit(&fft->play_clear_seq, memory_order_acquire);
+        uint32_t clear_target = atomic_load_explicit(&fft->play_clear_target, memory_order_relaxed);
         uint32_t w = atomic_load_explicit(&fft->play_write_idx, memory_order_acquire);
         uint32_t r = atomic_load_explicit(&fft->play_read_idx, memory_order_relaxed);
+        if (cseq != fft->play_clear_seq_seen) {
+            fft->play_clear_seq_seen = cseq;
+            if ((uint32_t)(clear_target - r) <= (uint32_t)(w - r)) {
+                r = clear_target;
+            }
+        }
         uint32_t avail = w - r;
         uint32_t to_read = (avail < max_frames) ? avail : max_frames;
 
@@ -992,15 +1149,63 @@ static void on_pw_playback_process(void *userdata)
             dst[i * 2u + 0u] = 0.0f;
             dst[i * 2u + 1u] = 0.0f;
         }
-        uint32_t expected = r;
-        atomic_compare_exchange_strong_explicit(&fft->play_read_idx, &expected, r + to_read,
-                                                memory_order_acq_rel, memory_order_acquire);
+        atomic_store_explicit(&fft->play_read_idx, r + to_read, memory_order_release);
 
         buf->datas[0].chunk->offset = 0;
         buf->datas[0].chunk->stride = 2 * (int)sizeof(float);
         buf->datas[0].chunk->size = max_frames * 2u * sizeof(float);
     }
-    fft->fn_pw_stream_queue_buffer(fft->pw_play_stream, b);
+    g_pw_api.pw_stream_queue_buffer(fft->pw_play_stream, b);
+}
+
+static void cleanup_pw_resources(waywal_audio_fft_t *fft)
+{
+    if (!fft) {
+        return;
+    }
+    if (fft->pw_play_stream && g_pw_api.pw_stream_destroy) {
+        g_pw_api.pw_stream_destroy(fft->pw_play_stream);
+        fft->pw_play_stream = NULL;
+    }
+    if (fft->pw_stream && g_pw_api.pw_stream_destroy) {
+        g_pw_api.pw_stream_destroy(fft->pw_stream);
+        fft->pw_stream = NULL;
+    }
+    if (fft->tracked_nodes) {
+        for (size_t i = 0; i < fft->tracked_node_cap; ++i) {
+            pw_tracked_node_t *node = fft->tracked_nodes[i];
+            if (node) {
+                if (node->active) {
+                    spa_hook_remove_inline(&node->listener);
+                    if (node->proxy && g_pw_api.pw_proxy_destroy) {
+                        g_pw_api.pw_proxy_destroy(node->proxy);
+                    }
+                }
+                free(node);
+                fft->tracked_nodes[i] = NULL;
+            }
+        }
+        free(fft->tracked_nodes);
+        fft->tracked_nodes = NULL;
+        fft->tracked_node_cap = 0;
+    }
+    if (fft->pw_registry && g_pw_api.pw_proxy_destroy) {
+        spa_hook_remove_inline(&fft->pw_registry_listener);
+        g_pw_api.pw_proxy_destroy(fft->pw_registry);
+        fft->pw_registry = NULL;
+    }
+    if (fft->pw_core && g_pw_api.pw_core_disconnect) {
+        g_pw_api.pw_core_disconnect(fft->pw_core);
+        fft->pw_core = NULL;
+    }
+    if (fft->pw_context && g_pw_api.pw_context_destroy) {
+        g_pw_api.pw_context_destroy(fft->pw_context);
+        fft->pw_context = NULL;
+    }
+    if (fft->pw_loop && g_pw_api.pw_thread_loop_destroy) {
+        g_pw_api.pw_thread_loop_destroy(fft->pw_loop);
+        fft->pw_loop = NULL;
+    }
 }
 
 waywal_audio_fft_t *waywal_audio_fft_create(uint32_t sample_rate, bool enable_pipewire)
@@ -1014,16 +1219,18 @@ waywal_audio_fft_t *waywal_audio_fft_create(uint32_t sample_rate, bool enable_pi
 #ifdef WAYWAL_HAVE_X86_AVX2_TARGET
     fft->has_avx2 = (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"));
 #endif
-    atomic_init(&fft->write_pos, 0u);
-    atomic_init(&fft->total_pushed, 0u);
+    atomic_init(&fft->cap_write_idx, 0u);
+    atomic_init(&fft->cap_read_idx, 0u);
     atomic_init(&fft->self_playback_pushed, false);
     atomic_init(&fft->capture_active, true);
     atomic_init(&fft->external_audio_active, false);
     atomic_init(&fft->test_override_enabled, false);
     atomic_init(&fft->test_external_audio_active, false);
     atomic_init(&fft->play_write_idx, 0u);
+    atomic_init(&fft->play_clear_target, 0u);
+    atomic_init(&fft->play_clear_seq, 0u);
     atomic_init(&fft->play_read_idx, 0u);
-    fft->last_consumed = 0u;
+    atomic_init(&fft->pw_running, false);
     fft->user_volume = 0.0f;
     fft->current_gain = 0.0f;
     fft->mute_on_audio = true;
@@ -1037,73 +1244,9 @@ waywal_audio_fft_t *waywal_audio_fft_create(uint32_t sample_rate, bool enable_pi
     }
 
     if (enable_pipewire) {
-#ifndef WWAL_DISABLE_PIPEWIRE
-        fft->pw_lib = dlopen("libpipewire-0.3.so.0", RTLD_LAZY | RTLD_NODELETE);
-#endif
-        if (fft->pw_lib) {
-            void (*fn_pw_init)(int *, char ***) = NULL;
-            void *(*fn_pw_thread_loop_new)(const char *, const void *) = NULL;
-            void *(*fn_pw_thread_loop_get_loop)(void *) = NULL;
-            int (*fn_pw_thread_loop_start)(void *) = NULL;
-            void *(*fn_pw_properties_new)(const char *, ...) = NULL;
-            void *(*fn_pw_stream_new_simple)(void *, const char *, void *,
-                                             const struct pw_stream_events *, void *) = NULL;
-            int (*fn_pw_stream_connect)(void *, int, uint32_t, int, const struct spa_pod **,
-                                        uint32_t) = NULL;
-
-            void *s_init = dlsym(fft->pw_lib, "pw_init");
-            void *s_tl_new = dlsym(fft->pw_lib, "pw_thread_loop_new");
-            void *s_tl_get = dlsym(fft->pw_lib, "pw_thread_loop_get_loop");
-            void *s_tl_start = dlsym(fft->pw_lib, "pw_thread_loop_start");
-            void *s_tl_stop = dlsym(fft->pw_lib, "pw_thread_loop_stop");
-            void *s_tl_destroy = dlsym(fft->pw_lib, "pw_thread_loop_destroy");
-            void *s_tl_lock = dlsym(fft->pw_lib, "pw_thread_loop_lock");
-            void *s_tl_unlock = dlsym(fft->pw_lib, "pw_thread_loop_unlock");
-            void *s_ctx_new = dlsym(fft->pw_lib, "pw_context_new");
-            void *s_ctx_destroy = dlsym(fft->pw_lib, "pw_context_destroy");
-            void *s_ctx_conn = dlsym(fft->pw_lib, "pw_context_connect");
-            void *s_core_disc = dlsym(fft->pw_lib, "pw_core_disconnect");
-            void *s_proxy_destroy = dlsym(fft->pw_lib, "pw_proxy_destroy");
-            void *s_proxy_add_l = dlsym(fft->pw_lib, "pw_proxy_add_object_listener");
-            void *s_props_new = dlsym(fft->pw_lib, "pw_properties_new");
-            void *s_st_new = dlsym(fft->pw_lib, "pw_stream_new_simple");
-            void *s_st_conn = dlsym(fft->pw_lib, "pw_stream_connect");
-            void *s_st_destroy = dlsym(fft->pw_lib, "pw_stream_destroy");
-            void *s_st_deq = dlsym(fft->pw_lib, "pw_stream_dequeue_buffer");
-            void *s_st_q = dlsym(fft->pw_lib, "pw_stream_queue_buffer");
-            void *s_st_active = dlsym(fft->pw_lib, "pw_stream_set_active");
-            void *s_st_flush = dlsym(fft->pw_lib, "pw_stream_flush");
-
-            memcpy(&fn_pw_init, &s_init, sizeof(fn_pw_init));
-            memcpy(&fn_pw_thread_loop_new, &s_tl_new, sizeof(fn_pw_thread_loop_new));
-            memcpy(&fn_pw_thread_loop_get_loop, &s_tl_get, sizeof(fn_pw_thread_loop_get_loop));
-            memcpy(&fn_pw_thread_loop_start, &s_tl_start, sizeof(fn_pw_thread_loop_start));
-            memcpy(&fft->fn_pw_thread_loop_stop, &s_tl_stop, sizeof(fft->fn_pw_thread_loop_stop));
-            memcpy(&fft->fn_pw_thread_loop_destroy, &s_tl_destroy,
-                   sizeof(fft->fn_pw_thread_loop_destroy));
-            memcpy(&fft->fn_pw_thread_loop_lock, &s_tl_lock, sizeof(fft->fn_pw_thread_loop_lock));
-            memcpy(&fft->fn_pw_thread_loop_unlock, &s_tl_unlock,
-                   sizeof(fft->fn_pw_thread_loop_unlock));
-            memcpy(&fft->fn_pw_context_new, &s_ctx_new, sizeof(fft->fn_pw_context_new));
-            memcpy(&fft->fn_pw_context_destroy, &s_ctx_destroy, sizeof(fft->fn_pw_context_destroy));
-            memcpy(&fft->fn_pw_context_connect, &s_ctx_conn, sizeof(fft->fn_pw_context_connect));
-            memcpy(&fft->fn_pw_core_disconnect, &s_core_disc, sizeof(fft->fn_pw_core_disconnect));
-            memcpy(&fft->fn_pw_proxy_destroy, &s_proxy_destroy, sizeof(fft->fn_pw_proxy_destroy));
-            memcpy(&fft->fn_pw_proxy_add_object_listener, &s_proxy_add_l,
-                   sizeof(fft->fn_pw_proxy_add_object_listener));
-            memcpy(&fn_pw_properties_new, &s_props_new, sizeof(fn_pw_properties_new));
-            memcpy(&fn_pw_stream_new_simple, &s_st_new, sizeof(fn_pw_stream_new_simple));
-            memcpy(&fn_pw_stream_connect, &s_st_conn, sizeof(fn_pw_stream_connect));
-            memcpy(&fft->fn_pw_stream_destroy, &s_st_destroy, sizeof(fft->fn_pw_stream_destroy));
-            memcpy(&fft->fn_pw_stream_dequeue_buffer, &s_st_deq,
-                   sizeof(fft->fn_pw_stream_dequeue_buffer));
-            memcpy(&fft->fn_pw_stream_queue_buffer, &s_st_q,
-                   sizeof(fft->fn_pw_stream_queue_buffer));
-            memcpy(&fft->fn_pw_stream_set_active, &s_st_active,
-                   sizeof(fft->fn_pw_stream_set_active));
-            memcpy(&fft->fn_pw_stream_flush, &s_st_flush, sizeof(fft->fn_pw_stream_flush));
-
-            if (fn_pw_init) {
+        (void)pthread_once(&g_pw_api_once, pw_api_init_once);
+        if (g_pw_api.loaded) {
+            if (g_pw_api.pw_init) {
                 WAYWAL_LOG_INFO("Audio FFT engine probed libpipewire-0.3.so.0 successfully");
             }
 
@@ -1119,27 +1262,27 @@ waywal_audio_fft_t *waywal_audio_fft_create(uint32_t sample_rate, bool enable_pi
                     daemon_running = true;
                 }
             } else if (xdg_rt && xdg_rt[0] != '\0') {
-                snprintf(pw_sock, sizeof(pw_sock), "%s/%s", xdg_rt, pw_remote);
-                if (access(pw_sock, F_OK) == 0) {
+                int n = snprintf(pw_sock, sizeof(pw_sock), "%s/%s", xdg_rt, pw_remote);
+                if (n > 0 && (size_t)n < sizeof(pw_sock) && access(pw_sock, F_OK) == 0) {
                     daemon_running = true;
                 }
             }
 
-            if (daemon_running && fn_pw_init && fn_pw_thread_loop_new &&
-                fn_pw_thread_loop_get_loop && fn_pw_thread_loop_start &&
-                fft->fn_pw_thread_loop_stop && fft->fn_pw_thread_loop_destroy &&
-                fn_pw_properties_new && fn_pw_stream_new_simple && fn_pw_stream_connect &&
-                fft->fn_pw_stream_destroy && fft->fn_pw_stream_dequeue_buffer &&
-                fft->fn_pw_stream_queue_buffer) {
-                fn_pw_init(NULL, NULL);
-                fft->pw_loop = fn_pw_thread_loop_new("waywal-audio-fft", NULL);
+            if (daemon_running && g_pw_api.pw_init && g_pw_api.pw_thread_loop_new &&
+                g_pw_api.pw_thread_loop_get_loop && g_pw_api.pw_thread_loop_start &&
+                g_pw_api.pw_thread_loop_stop && g_pw_api.pw_thread_loop_destroy &&
+                g_pw_api.pw_properties_new && g_pw_api.pw_stream_new_simple &&
+                g_pw_api.pw_stream_connect && g_pw_api.pw_stream_destroy &&
+                g_pw_api.pw_stream_dequeue_buffer && g_pw_api.pw_stream_queue_buffer) {
+                (void)pthread_once(&g_pw_init_once, pw_library_init_once);
+                fft->pw_loop = g_pw_api.pw_thread_loop_new("waywal-audio-fft", NULL);
                 if (fft->pw_loop) {
-                    void *main_loop = fn_pw_thread_loop_get_loop(fft->pw_loop);
-                    if (fft->fn_pw_context_new && fft->fn_pw_context_connect &&
-                        fft->fn_pw_proxy_add_object_listener) {
-                        fft->pw_context = fft->fn_pw_context_new(main_loop, NULL, 0);
+                    void *main_loop = g_pw_api.pw_thread_loop_get_loop(fft->pw_loop);
+                    if (g_pw_api.pw_context_new && g_pw_api.pw_context_connect &&
+                        g_pw_api.pw_proxy_add_object_listener) {
+                        fft->pw_context = g_pw_api.pw_context_new(main_loop, NULL, 0);
                         if (fft->pw_context) {
-                            fft->pw_core = fft->fn_pw_context_connect(fft->pw_context, NULL, 0);
+                            fft->pw_core = g_pw_api.pw_context_connect(fft->pw_context, NULL, 0);
                             if (fft->pw_core) {
                                 fft->pw_registry = pw_core_get_registry_inline(fft->pw_core, 3u, 0);
                                 if (fft->pw_registry) {
@@ -1151,13 +1294,13 @@ waywal_audio_fft_t *waywal_audio_fft_create(uint32_t sample_rate, bool enable_pi
                         }
                     }
 
-                    void *props = fn_pw_properties_new("media.type", "Audio", "media.category",
-                                                       "Capture", "media.role", "Music",
-                                                       "stream.capture.sink", "true", NULL);
+                    void *props = g_pw_api.pw_properties_new(
+                        "media.type", "Audio", "media.category", "Capture", "media.role", "Music",
+                        "stream.capture.sink", "true", NULL);
                     fft->pw_events.version = 2u;
                     fft->pw_events.process = on_pw_process;
-                    fft->pw_stream = fn_pw_stream_new_simple(main_loop, "waywal-audio-capture",
-                                                             props, &fft->pw_events, fft);
+                    fft->pw_stream = g_pw_api.pw_stream_new_simple(
+                        main_loop, "waywal-audio-capture", props, &fft->pw_events, fft);
                     if (fft->pw_stream) {
                         struct spa_audio_format_pod fmt_pod = {
                             .pod = {.size = sizeof(struct spa_audio_format_pod) -
@@ -1194,90 +1337,43 @@ waywal_audio_fft_t *waywal_audio_fft_create(uint32_t sample_rate, bool enable_pi
                         const struct spa_pod *params[1] = {&fmt_pod.pod};
                         int flags = (1 << 0) | (1 << 2) |
                                     (1 << 4); /* AUTOCONNECT | MAP_BUFFERS | RT_PROCESS */
-                        if (fn_pw_stream_connect(fft->pw_stream, 0 /* PW_DIRECTION_INPUT */,
-                                                 0xFFFFFFFFu /* PW_ID_ANY */, flags, params,
-                                                 1u) >= 0) {
-                            void *play_props = fn_pw_properties_new(
+                        if (g_pw_api.pw_stream_connect(fft->pw_stream, 0 /* PW_DIRECTION_INPUT */,
+                                                       0xFFFFFFFFu /* PW_ID_ANY */, flags, params,
+                                                       1u) >= 0) {
+                            void *play_props = g_pw_api.pw_properties_new(
                                 "media.type", "Audio", "media.category", "Playback", "media.role",
                                 "Music", "node.name", "waywal-audio-playback", NULL);
                             fft->pw_play_events.version = 2u;
                             fft->pw_play_events.process = on_pw_playback_process;
-                            fft->pw_play_stream =
-                                fn_pw_stream_new_simple(main_loop, "waywal-audio-playback",
-                                                        play_props, &fft->pw_play_events, fft);
+                            fft->pw_play_stream = g_pw_api.pw_stream_new_simple(
+                                main_loop, "waywal-audio-playback", play_props,
+                                &fft->pw_play_events, fft);
                             if (fft->pw_play_stream) {
                                 struct spa_audio_format_pod play_fmt_pod = fmt_pod;
                                 play_fmt_pod.audio_channels.val = 2u;
                                 const struct spa_pod *play_params[1] = {&play_fmt_pod.pod};
-                                if (fn_pw_stream_connect(
+                                if (g_pw_api.pw_stream_connect(
                                         fft->pw_play_stream, 1 /* PW_DIRECTION_OUTPUT */,
                                         0xFFFFFFFFu /* PW_ID_ANY */, flags, play_params, 1u) < 0) {
-                                    fft->fn_pw_stream_destroy(fft->pw_play_stream);
+                                    g_pw_api.pw_stream_destroy(fft->pw_play_stream);
                                     fft->pw_play_stream = NULL;
                                 }
                             }
-                            if (fn_pw_thread_loop_start(fft->pw_loop) >= 0) {
+                            atomic_store_explicit(&fft->pw_running, true, memory_order_release);
+                            if (g_pw_api.pw_thread_loop_start(fft->pw_loop) >= 0) {
                                 fft->pw_available = true;
                                 WAYWAL_LOG_INFO("PipeWire audio capture stream started (%u Hz F32)",
                                                 fft->sample_rate);
                             } else {
-                                if (fft->pw_play_stream && fft->fn_pw_stream_destroy) {
-                                    fft->fn_pw_stream_destroy(fft->pw_play_stream);
-                                    fft->pw_play_stream = NULL;
-                                }
-                                fft->fn_pw_stream_destroy(fft->pw_stream);
-                                fft->pw_stream = NULL;
-                                if (fft->pw_registry && fft->fn_pw_proxy_destroy) {
-                                    spa_hook_remove_inline(&fft->pw_registry_listener);
-                                    fft->fn_pw_proxy_destroy(fft->pw_registry);
-                                    fft->pw_registry = NULL;
-                                }
-                                if (fft->pw_core && fft->fn_pw_core_disconnect) {
-                                    fft->fn_pw_core_disconnect(fft->pw_core);
-                                    fft->pw_core = NULL;
-                                }
-                                if (fft->pw_context && fft->fn_pw_context_destroy) {
-                                    fft->fn_pw_context_destroy(fft->pw_context);
-                                    fft->pw_context = NULL;
-                                }
-                                fft->fn_pw_thread_loop_destroy(fft->pw_loop);
-                                fft->pw_loop = NULL;
+                                atomic_store_explicit(&fft->pw_running, false,
+                                                      memory_order_release);
+                                cleanup_pw_resources(fft);
                             }
                         } else {
-                            fft->fn_pw_stream_destroy(fft->pw_stream);
-                            fft->pw_stream = NULL;
-                            if (fft->pw_registry && fft->fn_pw_proxy_destroy) {
-                                spa_hook_remove_inline(&fft->pw_registry_listener);
-                                fft->fn_pw_proxy_destroy(fft->pw_registry);
-                                fft->pw_registry = NULL;
-                            }
-                            if (fft->pw_core && fft->fn_pw_core_disconnect) {
-                                fft->fn_pw_core_disconnect(fft->pw_core);
-                                fft->pw_core = NULL;
-                            }
-                            if (fft->pw_context && fft->fn_pw_context_destroy) {
-                                fft->fn_pw_context_destroy(fft->pw_context);
-                                fft->pw_context = NULL;
-                            }
-                            fft->fn_pw_thread_loop_destroy(fft->pw_loop);
-                            fft->pw_loop = NULL;
+                            cleanup_pw_resources(fft);
                         }
                     } else {
-                        if (fft->pw_registry && fft->fn_pw_proxy_destroy) {
-                            spa_hook_remove_inline(&fft->pw_registry_listener);
-                            fft->fn_pw_proxy_destroy(fft->pw_registry);
-                            fft->pw_registry = NULL;
-                        }
-                        if (fft->pw_core && fft->fn_pw_core_disconnect) {
-                            fft->fn_pw_core_disconnect(fft->pw_core);
-                            fft->pw_core = NULL;
-                        }
-                        if (fft->pw_context && fft->fn_pw_context_destroy) {
-                            fft->fn_pw_context_destroy(fft->pw_context);
-                            fft->pw_context = NULL;
-                        }
-                        fft->fn_pw_thread_loop_destroy(fft->pw_loop);
-                        fft->pw_loop = NULL;
+                        cleanup_pw_resources(fft);
                     }
                 }
             }
@@ -1293,47 +1389,12 @@ void waywal_audio_fft_destroy(waywal_audio_fft_t *fft)
         return;
     }
     if (fft->pw_loop) {
-        if (fft->fn_pw_thread_loop_stop) {
-            fft->fn_pw_thread_loop_stop(fft->pw_loop);
+        if (g_pw_api.pw_thread_loop_stop) {
+            g_pw_api.pw_thread_loop_stop(fft->pw_loop);
         }
-        if (fft->pw_play_stream && fft->fn_pw_stream_destroy) {
-            fft->fn_pw_stream_destroy(fft->pw_play_stream);
-            fft->pw_play_stream = NULL;
-        }
-        if (fft->pw_stream && fft->fn_pw_stream_destroy) {
-            fft->fn_pw_stream_destroy(fft->pw_stream);
-            fft->pw_stream = NULL;
-        }
-        for (size_t i = 0; i < 32; ++i) {
-            if (fft->tracked_nodes[i].active) {
-                spa_hook_remove_inline(&fft->tracked_nodes[i].listener);
-                if (fft->tracked_nodes[i].proxy && fft->fn_pw_proxy_destroy) {
-                    fft->fn_pw_proxy_destroy(fft->tracked_nodes[i].proxy);
-                }
-            }
-            memset(&fft->tracked_nodes[i], 0, sizeof(fft->tracked_nodes[i]));
-        }
-        if (fft->pw_registry && fft->fn_pw_proxy_destroy) {
-            spa_hook_remove_inline(&fft->pw_registry_listener);
-            fft->fn_pw_proxy_destroy(fft->pw_registry);
-            fft->pw_registry = NULL;
-        }
-        if (fft->pw_core && fft->fn_pw_core_disconnect) {
-            fft->fn_pw_core_disconnect(fft->pw_core);
-            fft->pw_core = NULL;
-        }
-        if (fft->pw_context && fft->fn_pw_context_destroy) {
-            fft->fn_pw_context_destroy(fft->pw_context);
-            fft->pw_context = NULL;
-        }
-        if (fft->fn_pw_thread_loop_destroy) {
-            fft->fn_pw_thread_loop_destroy(fft->pw_loop);
-        }
-        fft->pw_loop = NULL;
+        atomic_store_explicit(&fft->pw_running, false, memory_order_release);
     }
-    if (fft->pw_lib) {
-        dlclose(fft->pw_lib);
-    }
+    cleanup_pw_resources(fft);
     free(fft);
 }
 
@@ -1359,30 +1420,17 @@ static size_t push_mono_samples_internal(waywal_audio_fft_t *fft, const float *s
 
     atomic_store_explicit(&fft->self_playback_pushed, from_self_playback, memory_order_release);
 
-    uint32_t wp = atomic_load_explicit(&fft->write_pos, memory_order_relaxed);
-    const float *src = samples;
-    size_t copy_cnt = count;
-    uint32_t dst_wp = wp;
-    if (copy_cnt > WAYWAL_AUDIO_RING_SIZE) {
-        size_t skip = copy_cnt - WAYWAL_AUDIO_RING_SIZE;
-        src += skip;
-        copy_cnt = WAYWAL_AUDIO_RING_SIZE;
-        dst_wp += (uint32_t)skip;
+    uint32_t w = atomic_load_explicit(&fft->cap_write_idx, memory_order_relaxed);
+    uint32_t r = atomic_load_explicit(&fft->cap_read_idx, memory_order_acquire);
+    uint32_t used = w - r;
+    uint32_t space = (used < WAYWAL_AUDIO_RING_SIZE) ? (WAYWAL_AUDIO_RING_SIZE - used) : 0u;
+    size_t to_write = (count < (size_t)space) ? count : (size_t)space;
+    for (size_t i = 0; i < to_write; ++i) {
+        fft->ring[(w + (uint32_t)i) & (WAYWAL_AUDIO_RING_SIZE - 1u)] =
+            sanitize_pcm_sample(samples[i]);
     }
-    for (size_t i = 0; i < copy_cnt; ++i) {
-        float s = src[i];
-        if (!isfinite(s)) {
-            s = 0.0f;
-        } else if (s < -4.0f) {
-            s = -4.0f;
-        } else if (s > 4.0f) {
-            s = 4.0f;
-        }
-        fft->ring[(dst_wp + (uint32_t)i) & (WAYWAL_AUDIO_RING_SIZE - 1u)] = s;
-    }
-    atomic_store_explicit(&fft->write_pos, wp + (uint32_t)count, memory_order_release);
-    atomic_fetch_add_explicit(&fft->total_pushed, (uint32_t)count, memory_order_release);
-    return count;
+    atomic_store_explicit(&fft->cap_write_idx, w + (uint32_t)to_write, memory_order_release);
+    return to_write;
 }
 
 size_t waywal_audio_fft_push_samples(waywal_audio_fft_t *fft, const float *samples, size_t count)
@@ -1411,8 +1459,9 @@ bool waywal_audio_fft_process(waywal_audio_fft_t *fft, waywal_audio_frame_t *out
         return false;
     }
 
-    uint32_t wp = atomic_load_explicit(&fft->write_pos, memory_order_acquire);
-    uint32_t avail = wp - fft->last_consumed;
+    uint32_t w = atomic_load_explicit(&fft->cap_write_idx, memory_order_acquire);
+    uint32_t r = atomic_load_explicit(&fft->cap_read_idx, memory_order_relaxed);
+    uint32_t avail = w - r;
 
     if (avail == 0) {
         if (fft->current_frame.envelope < 1e-4f && fft->current_frame.beat_pulse < 1e-4f) {
@@ -1482,13 +1531,13 @@ bool waywal_audio_fft_process(waywal_audio_fft_t *fft, waywal_audio_frame_t *out
     }
 
     if (avail >= WAYWAL_AUDIO_FFT_SIZE) {
-        copy_from_ring(fft->ring, wp - WAYWAL_AUDIO_FFT_SIZE, fft->history, WAYWAL_AUDIO_FFT_SIZE);
+        copy_from_ring(fft->ring, w - WAYWAL_AUDIO_FFT_SIZE, fft->history, WAYWAL_AUDIO_FFT_SIZE);
     } else {
         uint32_t keep = WAYWAL_AUDIO_FFT_SIZE - avail;
         memmove(fft->history, fft->history + avail, keep * sizeof(float));
-        copy_from_ring(fft->ring, wp - avail, fft->history + keep, avail);
+        copy_from_ring(fft->ring, r, fft->history + keep, avail);
     }
-    fft->last_consumed = wp;
+    atomic_store_explicit(&fft->cap_read_idx, w, memory_order_release);
 
     float peak_sample = 0.0f;
 #ifdef WAYWAL_HAVE_X86_AVX2_TARGET
@@ -1772,16 +1821,16 @@ void waywal_audio_fft_set_capture_active(waywal_audio_fft_t *fft, bool active)
     if (prev == active) {
         return;
     }
-    if (fft->pw_loop && fft->pw_stream && fft->fn_pw_thread_loop_lock &&
-        fft->fn_pw_thread_loop_unlock) {
-        fft->fn_pw_thread_loop_lock(fft->pw_loop);
-        if (!active && fft->fn_pw_stream_flush) {
-            fft->fn_pw_stream_flush(fft->pw_stream, false);
+    if (fft->pw_loop && fft->pw_stream && g_pw_api.pw_thread_loop_lock &&
+        g_pw_api.pw_thread_loop_unlock) {
+        g_pw_api.pw_thread_loop_lock(fft->pw_loop);
+        if (!active && g_pw_api.pw_stream_flush) {
+            g_pw_api.pw_stream_flush(fft->pw_stream, false);
         }
-        if (fft->fn_pw_stream_set_active) {
-            fft->fn_pw_stream_set_active(fft->pw_stream, active);
+        if (g_pw_api.pw_stream_set_active) {
+            g_pw_api.pw_stream_set_active(fft->pw_stream, active);
         }
-        fft->fn_pw_thread_loop_unlock(fft->pw_loop);
+        g_pw_api.pw_thread_loop_unlock(fft->pw_loop);
     }
 }
 
@@ -1856,7 +1905,13 @@ void waywal_audio_clear_playback(waywal_audio_fft_t *fft)
         return;
     }
     uint32_t w = atomic_load_explicit(&fft->play_write_idx, memory_order_relaxed);
-    atomic_store_explicit(&fft->play_read_idx, w, memory_order_release);
+    if (!atomic_load_explicit(&fft->pw_running, memory_order_acquire)) {
+        atomic_store_explicit(&fft->play_read_idx, w, memory_order_release);
+        return;
+    }
+    atomic_store_explicit(&fft->play_clear_target, w, memory_order_relaxed);
+    uint32_t seq = atomic_load_explicit(&fft->play_clear_seq, memory_order_relaxed);
+    atomic_store_explicit(&fft->play_clear_seq, seq + 1u, memory_order_release);
 }
 
 size_t waywal_audio_submit_pcm_f32(waywal_audio_fft_t *fft, const float *stereo_interleaved,
@@ -1866,6 +1921,11 @@ size_t waywal_audio_submit_pcm_f32(waywal_audio_fft_t *fft, const float *stereo_
         return 0;
     }
     float eff_vol = waywal_audio_get_effective_volume(fft);
+    if (!isfinite(eff_vol) || eff_vol < 0.0f) {
+        eff_vol = 0.0f;
+    } else if (eff_vol > 1.0f) {
+        eff_vol = 1.0f;
+    }
 
     uint32_t w = atomic_load_explicit(&fft->play_write_idx, memory_order_relaxed);
     uint32_t r = atomic_load_explicit(&fft->play_read_idx, memory_order_acquire);
@@ -1881,8 +1941,10 @@ size_t waywal_audio_submit_pcm_f32(waywal_audio_fft_t *fft, const float *stereo_
 
     for (size_t i = 0; i < to_write; ++i) {
         uint32_t slot = (w + (uint32_t)i) & (PLAYBACK_RING_FRAMES - 1u);
-        float l = stereo_interleaved[i * 2u + 0u] * eff_vol;
-        float r_ch = stereo_interleaved[i * 2u + 1u] * eff_vol;
+        float raw_l = sanitize_pcm_sample(stereo_interleaved[i * 2u + 0u]);
+        float raw_r = sanitize_pcm_sample(stereo_interleaved[i * 2u + 1u]);
+        float l = sanitize_pcm_sample(raw_l * eff_vol);
+        float r_ch = sanitize_pcm_sample(raw_r * eff_vol);
         fft->play_ring[slot * 2u + 0u] = l;
         fft->play_ring[slot * 2u + 1u] = r_ch;
 

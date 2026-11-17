@@ -52,6 +52,10 @@ struct waywal_power_governor {
     ipc_backend_t ipc_backend;
     int ipc_fd;
     bool ipc_reconnected;
+    bool ipc_connecting;
+    uint8_t ipc_tx_buf[64];
+    size_t ipc_tx_len;
+    size_t ipc_tx_off;
     char ipc_buf[16384];
     size_t ipc_buf_len;
     size_t ipc_skip_bytes;
@@ -138,8 +142,11 @@ static void sync_battery_mask(waywal_power_governor_t *gov)
     }
 }
 
-static int connect_unix_nonblock(const char *sock_path)
+static int connect_unix_nonblock(const char *sock_path, bool *out_in_progress)
 {
+    if (out_in_progress) {
+        *out_in_progress = false;
+    }
     if (!sock_path || sock_path[0] == '\0') {
         return -1;
     }
@@ -155,29 +162,98 @@ static int connect_unix_nonblock(const char *sock_path)
     if (fd < 0) {
         return -1;
     }
-    if (connect(fd, (const struct sockaddr *)&addr, sizeof(addr)) < 0 && errno != EINPROGRESS) {
+    int rc = connect(fd, (const struct sockaddr *)&addr, sizeof(addr));
+    if (rc < 0 && errno != EINPROGRESS) {
         close(fd);
         return -1;
     }
+    if (out_in_progress) {
+        *out_in_progress = (rc < 0 && errno == EINPROGRESS);
+    }
     return fd;
+}
+
+static bool flush_ipc_handshake(waywal_power_governor_t *gov)
+{
+    if (!gov || gov->ipc_fd < 0) {
+        return false;
+    }
+    if (gov->ipc_connecting) {
+        int so_err = 0;
+        socklen_t slen = (socklen_t)sizeof(so_err);
+        if (getsockopt(gov->ipc_fd, SOL_SOCKET, SO_ERROR, &so_err, &slen) < 0) {
+            return false;
+        }
+        if (so_err == EINPROGRESS || so_err == EALREADY) {
+            return true;
+        }
+        if (so_err != 0) {
+            return false;
+        }
+        gov->ipc_connecting = false;
+    }
+    while (gov->ipc_tx_off < gov->ipc_tx_len) {
+        ssize_t wr = send(gov->ipc_fd, gov->ipc_tx_buf + gov->ipc_tx_off,
+                          gov->ipc_tx_len - gov->ipc_tx_off, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (wr > 0) {
+            gov->ipc_tx_off += (size_t)wr;
+            continue;
+        }
+        if (wr < 0 && errno == EINTR) {
+            continue;
+        }
+        if (wr < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS)) {
+            break;
+        }
+        return false;
+    }
+    return true;
+}
+
+static void close_ipc_socket(waywal_power_governor_t *gov)
+{
+    if (!gov) {
+        return;
+    }
+    if (gov->ipc_fd >= 0) {
+        close(gov->ipc_fd);
+        gov->ipc_fd = -1;
+    }
+    gov->ipc_connecting = false;
+    gov->ipc_tx_len = 0;
+    gov->ipc_tx_off = 0;
+    gov->ipc_buf_len = 0;
+    gov->ipc_skip_bytes = 0;
+    gov->ipc_drop_line = false;
 }
 
 static void init_compositor_ipc(waywal_power_governor_t *gov)
 {
     gov->ipc_fd = -1;
     gov->ipc_backend = IPC_BACKEND_NONE;
+    gov->ipc_connecting = false;
+    gov->ipc_tx_len = 0;
+    gov->ipc_tx_off = 0;
 
     const char *his = getenv("HYPRLAND_INSTANCE_SIGNATURE");
     if (his && his[0] != '\0') {
         char path[512];
         const char *xdg = getenv("XDG_RUNTIME_DIR");
         if (xdg && xdg[0] != '\0') {
-            snprintf(path, sizeof(path), "%s/hypr/%s/.socket2.sock", xdg, his);
-            gov->ipc_fd = connect_unix_nonblock(path);
+            int n = snprintf(path, sizeof(path), "%s/hypr/%s/.socket2.sock", xdg, his);
+            if (n > 0 && (size_t)n < sizeof(path)) {
+                bool in_prog = false;
+                gov->ipc_fd = connect_unix_nonblock(path, &in_prog);
+                gov->ipc_connecting = in_prog;
+            }
         }
         if (gov->ipc_fd < 0) {
-            snprintf(path, sizeof(path), "/tmp/hypr/%s/.socket2.sock", his);
-            gov->ipc_fd = connect_unix_nonblock(path);
+            int n = snprintf(path, sizeof(path), "/tmp/hypr/%s/.socket2.sock", his);
+            if (n > 0 && (size_t)n < sizeof(path)) {
+                bool in_prog = false;
+                gov->ipc_fd = connect_unix_nonblock(path, &in_prog);
+                gov->ipc_connecting = in_prog;
+            }
         }
         if (gov->ipc_fd >= 0) {
             gov->ipc_backend = IPC_BACKEND_HYPRLAND;
@@ -191,18 +267,24 @@ static void init_compositor_ipc(waywal_power_governor_t *gov)
         swaysock = getenv("I3SOCK");
     }
     if (swaysock && swaysock[0] != '\0') {
-        gov->ipc_fd = connect_unix_nonblock(swaysock);
+        bool in_prog = false;
+        gov->ipc_fd = connect_unix_nonblock(swaysock, &in_prog);
         if (gov->ipc_fd >= 0) {
             static const char sub_payload[] = "[\"window\",\"workspace\"]";
-            uint8_t pkt[14 + sizeof(sub_payload) - 1];
-            memcpy(pkt, "i3-ipc", 6);
             uint32_t len = (uint32_t)(sizeof(sub_payload) - 1);
             uint32_t type = 2u; /* IPC_SUBSCRIBE */
-            memcpy(pkt + 6, &len, 4);
-            memcpy(pkt + 10, &type, 4);
-            memcpy(pkt + 14, sub_payload, len);
-            ssize_t wr = send(gov->ipc_fd, pkt, sizeof(pkt), MSG_NOSIGNAL);
-            (void)wr;
+            size_t total = 14u + len;
+            memcpy(gov->ipc_tx_buf, "i3-ipc", 6);
+            memcpy(gov->ipc_tx_buf + 6, &len, 4);
+            memcpy(gov->ipc_tx_buf + 10, &type, 4);
+            memcpy(gov->ipc_tx_buf + 14, sub_payload, len);
+            gov->ipc_tx_len = total;
+            gov->ipc_tx_off = 0;
+            gov->ipc_connecting = in_prog;
+            if (!in_prog && !flush_ipc_handshake(gov)) {
+                close_ipc_socket(gov);
+                return;
+            }
             gov->ipc_backend = IPC_BACKEND_SWAY;
             WAYWAL_LOG_INFO("Power governor attached to Sway/i3 IPC socket");
             return;
@@ -211,11 +293,19 @@ static void init_compositor_ipc(waywal_power_governor_t *gov)
 
     const char *nirisock = getenv("NIRI_SOCKET");
     if (nirisock && nirisock[0] != '\0') {
-        gov->ipc_fd = connect_unix_nonblock(nirisock);
+        bool in_prog = false;
+        gov->ipc_fd = connect_unix_nonblock(nirisock, &in_prog);
         if (gov->ipc_fd >= 0) {
             static const char niri_sub[] = "\"EventStream\"\n";
-            ssize_t wr = send(gov->ipc_fd, niri_sub, sizeof(niri_sub) - 1, MSG_NOSIGNAL);
-            (void)wr;
+            size_t total = sizeof(niri_sub) - 1;
+            memcpy(gov->ipc_tx_buf, niri_sub, total);
+            gov->ipc_tx_len = total;
+            gov->ipc_tx_off = 0;
+            gov->ipc_connecting = in_prog;
+            if (!in_prog && !flush_ipc_handshake(gov)) {
+                close_ipc_socket(gov);
+                return;
+            }
             gov->ipc_backend = IPC_BACKEND_NIRI;
             WAYWAL_LOG_INFO("Power governor attached to Niri IPC event socket");
             return;
@@ -410,85 +500,612 @@ void waywal_power_governor_feed_hyprland_event(waywal_power_governor_t *gov, con
     }
 }
 
+#define IPC_JSON_MAX_DEPTH 32
+
+static const char *json_skip_ws(const char *p)
+{
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+        p++;
+    }
+    return p;
+}
+
+static bool json_parse_string(const char **pp, char *dst, size_t cap, bool *truncated)
+{
+    if (truncated) {
+        *truncated = false;
+    }
+    const char *p = json_skip_ws(*pp);
+    if (*p != '"') {
+        return false;
+    }
+    p++;
+    size_t out = 0;
+    while (*p != '\0' && *p != '"') {
+        unsigned char ch = (unsigned char)*p;
+        if (ch < 0x20u) {
+            return false;
+        }
+        if (ch == '\\') {
+            p++;
+            if (*p == '\0') {
+                return false;
+            }
+            char esc = *p++;
+            switch (esc) {
+            case '"':
+            case '\\':
+            case '/':
+                ch = (unsigned char)esc;
+                break;
+            case 'b':
+                ch = '\b';
+                break;
+            case 'f':
+                ch = '\f';
+                break;
+            case 'n':
+                ch = '\n';
+                break;
+            case 'r':
+                ch = '\r';
+                break;
+            case 't':
+                ch = '\t';
+                break;
+            case 'u': {
+                unsigned int code = 0;
+                for (int i = 0; i < 4; ++i) {
+                    if (!isxdigit((unsigned char)p[i])) {
+                        return false;
+                    }
+                    int d = isdigit((unsigned char)p[i])
+                                ? (p[i] - '0')
+                                : (tolower((unsigned char)p[i]) - 'a' + 10);
+                    code = (code << 4) | (unsigned int)d;
+                }
+                p += 4;
+                ch = (code >= 0x20u && code < 0x80u) ? (unsigned char)code : '?';
+                break;
+            }
+            default:
+                return false;
+            }
+        } else {
+            p++;
+        }
+        if (dst && cap > 0) {
+            if (out + 1u < cap) {
+                dst[out++] = (char)ch;
+            } else if (truncated) {
+                *truncated = true;
+            }
+        }
+    }
+    if (*p != '"') {
+        return false;
+    }
+    if (dst && cap > 0) {
+        dst[out] = '\0';
+    }
+    *pp = p + 1;
+    return true;
+}
+
+static bool json_parse_uint64(const char **pp, uint64_t *out_val)
+{
+    const char *p = json_skip_ws(*pp);
+    if (!isdigit((unsigned char)*p)) {
+        return false;
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long long val = strtoull(p, &end, 10);
+    if (end == p || errno == ERANGE) {
+        return false;
+    }
+    if (out_val) {
+        *out_val = (uint64_t)val;
+    }
+    *pp = end;
+    return true;
+}
+
+static bool json_parse_int64(const char **pp, int64_t *out_val)
+{
+    const char *p = json_skip_ws(*pp);
+    if (*p != '-' && !isdigit((unsigned char)*p)) {
+        return false;
+    }
+    errno = 0;
+    char *end = NULL;
+    long long val = strtoll(p, &end, 10);
+    if (end == p || errno == ERANGE) {
+        return false;
+    }
+    if (out_val) {
+        *out_val = (int64_t)val;
+    }
+    *pp = end;
+    return true;
+}
+
+static bool json_skip_value(const char **pp, int depth)
+{
+    if (depth >= IPC_JSON_MAX_DEPTH) {
+        return false;
+    }
+    const char *p = json_skip_ws(*pp);
+    if (*p == '"') {
+        return json_parse_string(&p, NULL, 0, NULL) ? (*pp = p, true) : false;
+    }
+    if (*p == '{') {
+        p = json_skip_ws(p + 1);
+        if (*p == '}') {
+            *pp = p + 1;
+            return true;
+        }
+        for (;;) {
+            if (!json_parse_string(&p, NULL, 0, NULL)) {
+                return false;
+            }
+            p = json_skip_ws(p);
+            if (*p != ':') {
+                return false;
+            }
+            p++;
+            if (!json_skip_value(&p, depth + 1)) {
+                return false;
+            }
+            p = json_skip_ws(p);
+            if (*p == ',') {
+                p = json_skip_ws(p + 1);
+                continue;
+            }
+            if (*p == '}') {
+                *pp = p + 1;
+                return true;
+            }
+            return false;
+        }
+    }
+    if (*p == '[') {
+        p = json_skip_ws(p + 1);
+        if (*p == ']') {
+            *pp = p + 1;
+            return true;
+        }
+        for (;;) {
+            if (!json_skip_value(&p, depth + 1)) {
+                return false;
+            }
+            p = json_skip_ws(p);
+            if (*p == ',') {
+                p = json_skip_ws(p + 1);
+                continue;
+            }
+            if (*p == ']') {
+                *pp = p + 1;
+                return true;
+            }
+            return false;
+        }
+    }
+    if (strncmp(p, "true", 4) == 0) {
+        *pp = p + 4;
+        return true;
+    }
+    if (strncmp(p, "false", 5) == 0) {
+        *pp = p + 5;
+        return true;
+    }
+    if (strncmp(p, "null", 4) == 0) {
+        *pp = p + 4;
+        return true;
+    }
+    if (*p == '-' || isdigit((unsigned char)*p)) {
+        if (*p == '-') {
+            p++;
+        }
+        if (!isdigit((unsigned char)*p)) {
+            return false;
+        }
+        while (isdigit((unsigned char)*p)) {
+            p++;
+        }
+        if (*p == '.') {
+            p++;
+            if (!isdigit((unsigned char)*p)) {
+                return false;
+            }
+            while (isdigit((unsigned char)*p)) {
+                p++;
+            }
+        }
+        if (*p == 'e' || *p == 'E') {
+            p++;
+            if (*p == '+' || *p == '-') {
+                p++;
+            }
+            if (!isdigit((unsigned char)*p)) {
+                return false;
+            }
+            while (isdigit((unsigned char)*p)) {
+                p++;
+            }
+        }
+        *pp = p;
+        return true;
+    }
+    return false;
+}
+
+typedef struct {
+    bool has_output;
+    char output[64];
+    bool has_ws_name;
+    char ws_name[64];
+    bool has_fs;
+    bool is_fs;
+} sway_parsed_event_t;
+
+static bool parse_sway_object(const char **pp, sway_parsed_event_t *ev, bool in_current,
+                              bool in_container, int depth)
+{
+    if (depth >= IPC_JSON_MAX_DEPTH) {
+        return false;
+    }
+    const char *p = json_skip_ws(*pp);
+    if (*p != '{') {
+        return json_skip_value(pp, depth);
+    }
+    p = json_skip_ws(p + 1);
+    if (*p == '}') {
+        *pp = p + 1;
+        return true;
+    }
+    for (;;) {
+        char key[64];
+        bool key_trunc = false;
+        if (!json_parse_string(&p, key, sizeof(key), &key_trunc)) {
+            return false;
+        }
+        p = json_skip_ws(p);
+        if (*p != ':') {
+            return false;
+        }
+        p = json_skip_ws(p + 1);
+
+        if (!key_trunc && strcmp(key, "current") == 0 && !in_current && !in_container &&
+            *p == '{') {
+            if (!parse_sway_object(&p, ev, true, false, depth + 1)) {
+                return false;
+            }
+        } else if (!key_trunc && strcmp(key, "container") == 0 && !in_current && !in_container &&
+                   *p == '{') {
+            if (!parse_sway_object(&p, ev, false, true, depth + 1)) {
+                return false;
+            }
+        } else if (!key_trunc && strcmp(key, "output") == 0 && *p == '"') {
+            char val[64];
+            bool val_trunc = false;
+            if (!json_parse_string(&p, val, sizeof(val), &val_trunc)) {
+                return false;
+            }
+            if (!val_trunc && val[0] != '\0' && (in_current || in_container || !ev->has_output)) {
+                snprintf(ev->output, sizeof(ev->output), "%s", val);
+                ev->has_output = true;
+            }
+        } else if (!key_trunc && in_current && strcmp(key, "name") == 0 && *p == '"') {
+            char val[64];
+            bool val_trunc = false;
+            if (!json_parse_string(&p, val, sizeof(val), &val_trunc)) {
+                return false;
+            }
+            if (!val_trunc && val[0] != '\0') {
+                snprintf(ev->ws_name, sizeof(ev->ws_name), "%s", val);
+                ev->has_ws_name = true;
+            }
+        } else if (!key_trunc && strcmp(key, "fullscreen_mode") == 0 &&
+                   (in_container || (!in_current && depth == 0)) &&
+                   (*p == '-' || isdigit((unsigned char)*p))) {
+            int64_t mode = 0;
+            if (!json_parse_int64(&p, &mode)) {
+                return false;
+            }
+            ev->has_fs = true;
+            ev->is_fs = (mode == 1 || mode == 2);
+        } else {
+            if (!json_skip_value(&p, depth + 1)) {
+                return false;
+            }
+        }
+
+        p = json_skip_ws(p);
+        if (*p == ',') {
+            p = json_skip_ws(p + 1);
+            continue;
+        }
+        if (*p == '}') {
+            *pp = p + 1;
+            return true;
+        }
+        return false;
+    }
+}
+
 void waywal_power_governor_feed_sway_payload(waywal_power_governor_t *gov, const char *json)
 {
     if (!gov || !json) {
         return;
     }
 
-    char target_output[64];
-    target_output[0] = '\0';
-
-    const char *cur_obj = strstr(json, "\"current\"");
-    const char *search_base = cur_obj ? cur_obj : json;
-
-    const char *out_key = strstr(search_base, "\"output\"");
-    if (!out_key && cur_obj) {
-        out_key = strstr(json, "\"output\"");
-    }
-    if (out_key) {
-        const char *colon = strchr(out_key + 8, ':');
-        if (colon) {
-            const char *q1 = strchr(colon + 1, '"');
-            if (q1) {
-                const char *q2 = strchr(q1 + 1, '"');
-                if (q2 && (size_t)(q2 - (q1 + 1)) < sizeof(target_output)) {
-                    size_t len = (size_t)(q2 - (q1 + 1));
-                    memcpy(target_output, q1 + 1, len);
-                    target_output[len] = '\0';
-                }
-            }
-        }
+    sway_parsed_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    const char *p = json;
+    if (!parse_sway_object(&p, &ev, false, false, 0)) {
+        return;
     }
 
-    if (target_output[0] != '\0') {
-        snprintf(gov->focused_output, sizeof(gov->focused_output), "%s", target_output);
+    if (ev.has_output && ev.output[0] != '\0') {
+        snprintf(gov->focused_output, sizeof(gov->focused_output), "%s", ev.output);
         find_or_create_output(gov, gov->focused_output, true);
     }
 
-    if (cur_obj || strstr(json, "\"change\":\"focus\"") || strstr(json, "\"change\": \"focus\"")) {
-        const char *name_key = strstr(search_base, "\"name\"");
-        if (name_key) {
-            const char *colon = strchr(name_key + 6, ':');
-            if (colon) {
-                const char *q1 = strchr(colon + 1, '"');
-                if (q1) {
-                    const char *q2 = strchr(q1 + 1, '"');
-                    if (q2 && q2 > q1 + 1 &&
-                        (size_t)(q2 - (q1 + 1)) < sizeof(gov->active_workspace)) {
-                        size_t len = (size_t)(q2 - (q1 + 1));
-                        memcpy(gov->active_workspace, q1 + 1, len);
-                        gov->active_workspace[len] = '\0';
-                        gov->workspace_changed = true;
-                    }
-                }
-            }
-        }
+    if (ev.has_ws_name && ev.ws_name[0] != '\0') {
+        snprintf(gov->active_workspace, sizeof(gov->active_workspace), "%s", ev.ws_name);
+        gov->workspace_changed = true;
     }
 
-    const char *fs_key = strstr(json, "\"fullscreen_mode\"");
-    if (!fs_key) {
+    if (!ev.has_fs) {
         return;
     }
-    const char *colon = strchr(fs_key + 17, ':');
-    if (!colon) {
-        return;
-    }
-    const char *p = colon + 1;
-    while (*p && isspace((unsigned char)*p)) {
-        p++;
-    }
-    bool is_fs = (*p == '1' || *p == '2');
-    if (!is_fs) {
+    if (!ev.is_fs) {
         gov->global_mask &= ~(uint32_t)WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN;
     }
 
-    const char *out_name = target_output[0] != '\0' ? target_output : gov->focused_output;
+    const char *out_name =
+        (ev.has_output && ev.output[0] != '\0') ? ev.output : gov->focused_output;
     if (out_name[0] != '\0') {
         waywal_power_governor_set_output_reason(gov, out_name, WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN,
-                                                is_fs);
+                                                ev.is_fs);
     } else {
-        waywal_power_governor_set_global_reason(gov, WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, is_fs);
+        waywal_power_governor_set_global_reason(gov, WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, ev.is_fs);
+    }
+}
+
+typedef struct {
+    bool has_id;
+    uint64_t id;
+    bool has_output;
+    char output[64];
+    bool has_fs;
+    bool is_fs;
+    bool has_focused;
+    bool focused;
+} niri_obj_fields_t;
+
+static bool parse_niri_object(const char **pp, niri_obj_fields_t *out, int depth);
+
+static bool parse_niri_fields_in_object(const char **pp, niri_obj_fields_t *out, int depth,
+                                        bool check_window_sub)
+{
+    if (depth >= IPC_JSON_MAX_DEPTH) {
+        return false;
+    }
+    const char *p = json_skip_ws(*pp);
+    if (*p != '{') {
+        return json_skip_value(pp, depth);
+    }
+    p = json_skip_ws(p + 1);
+    if (*p == '}') {
+        *pp = p + 1;
+        return true;
+    }
+    for (;;) {
+        char key[64];
+        bool key_trunc = false;
+        if (!json_parse_string(&p, key, sizeof(key), &key_trunc)) {
+            return false;
+        }
+        p = json_skip_ws(p);
+        if (*p != ':') {
+            return false;
+        }
+        p = json_skip_ws(p + 1);
+
+        if (!key_trunc && check_window_sub && strcmp(key, "window") == 0 && *p == '{') {
+            if (!parse_niri_object(&p, out, depth + 1)) {
+                return false;
+            }
+        } else if (!key_trunc && strcmp(key, "id") == 0 && isdigit((unsigned char)*p)) {
+            if (!json_parse_uint64(&p, &out->id)) {
+                return false;
+            }
+            out->has_id = true;
+        } else if (!key_trunc && strcmp(key, "output") == 0 && *p == '"') {
+            char val[64];
+            bool val_trunc = false;
+            if (!json_parse_string(&p, val, sizeof(val), &val_trunc)) {
+                return false;
+            }
+            if (!val_trunc && val[0] != '\0') {
+                snprintf(out->output, sizeof(out->output), "%s", val);
+                out->has_output = true;
+            }
+        } else if (!key_trunc &&
+                   (strcmp(key, "is_fullscreen") == 0 || strcmp(key, "fullscreen") == 0)) {
+            if (strncmp(p, "true", 4) == 0) {
+                p += 4;
+                out->has_fs = true;
+                out->is_fs = true;
+            } else if (strncmp(p, "false", 5) == 0) {
+                p += 5;
+                out->has_fs = true;
+                out->is_fs = false;
+            } else if (*p == '1' || *p == '0') {
+                out->has_fs = true;
+                out->is_fs = (*p == '1');
+                p++;
+            } else if (!json_skip_value(&p, depth + 1)) {
+                return false;
+            }
+        } else if (!key_trunc && strcmp(key, "focused") == 0) {
+            if (strncmp(p, "true", 4) == 0) {
+                p += 4;
+                out->has_focused = true;
+                out->focused = true;
+            } else if (strncmp(p, "false", 5) == 0) {
+                p += 5;
+                out->has_focused = true;
+                out->focused = false;
+            } else if (!json_skip_value(&p, depth + 1)) {
+                return false;
+            }
+        } else {
+            if (!json_skip_value(&p, depth + 1)) {
+                return false;
+            }
+        }
+
+        p = json_skip_ws(p);
+        if (*p == ',') {
+            p = json_skip_ws(p + 1);
+            continue;
+        }
+        if (*p == '}') {
+            *pp = p + 1;
+            return true;
+        }
+        return false;
+    }
+}
+
+static bool parse_niri_object(const char **pp, niri_obj_fields_t *out, int depth)
+{
+    memset(out, 0, sizeof(*out));
+    return parse_niri_fields_in_object(pp, out, depth, true);
+}
+
+static void apply_niri_window_fullscreen(waywal_power_governor_t *gov, const niri_obj_fields_t *f)
+{
+    if (!gov || !f || !f->has_fs) {
+        return;
+    }
+    const char *out_name =
+        (f->has_output && f->output[0] != '\0') ? f->output : gov->focused_output;
+    if (f->is_fs) {
+        if (gov->niri_fs_output[0] != '\0' && out_name[0] != '\0' &&
+            strcmp(gov->niri_fs_output, out_name) != 0 &&
+            (!f->has_id || f->id == 0 || gov->niri_fs_win_id == 0 ||
+             f->id == gov->niri_fs_win_id)) {
+            waywal_power_governor_set_output_reason(gov, gov->niri_fs_output,
+                                                    WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, false);
+        }
+        if (out_name[0] != '\0') {
+            snprintf(gov->niri_fs_output, sizeof(gov->niri_fs_output), "%s", out_name);
+            gov->niri_fs_win_id = f->has_id ? f->id : 0;
+            waywal_power_governor_set_output_reason(gov, out_name, WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN,
+                                                    true);
+        } else {
+            waywal_power_governor_set_global_reason(gov, WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, true);
+        }
+    } else {
+        gov->global_mask &= ~(uint32_t)WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN;
+        if (gov->niri_fs_output[0] != '\0' &&
+            (!f->has_id || f->id == 0 || gov->niri_fs_win_id == 0 ||
+             f->id == gov->niri_fs_win_id)) {
+            waywal_power_governor_set_output_reason(gov, gov->niri_fs_output,
+                                                    WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, false);
+            gov->niri_fs_output[0] = '\0';
+            gov->niri_fs_win_id = 0;
+        }
+        if (out_name[0] != '\0') {
+            waywal_power_governor_set_output_reason(gov, out_name, WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN,
+                                                    false);
+        }
+    }
+}
+
+static bool handle_niri_windows_changed(waywal_power_governor_t *gov, const char **pp, int depth)
+{
+    const char *p = json_skip_ws(*pp);
+    if (*p != '{') {
+        return json_skip_value(pp, depth);
+    }
+
+    gov->global_mask &= ~(uint32_t)WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN;
+    for (size_t i = 0; i < gov->output_count; ++i) {
+        if (gov->outputs[i].in_use) {
+            gov->outputs[i].mask &= ~(uint32_t)WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN;
+        }
+    }
+    gov->niri_fs_output[0] = '\0';
+    gov->niri_fs_win_id = 0;
+
+    p = json_skip_ws(p + 1);
+    if (*p == '}') {
+        *pp = p + 1;
+        return true;
+    }
+    for (;;) {
+        char key[64];
+        bool key_trunc = false;
+        if (!json_parse_string(&p, key, sizeof(key), &key_trunc)) {
+            return false;
+        }
+        p = json_skip_ws(p);
+        if (*p != ':') {
+            return false;
+        }
+        p = json_skip_ws(p + 1);
+
+        if (!key_trunc && strcmp(key, "windows") == 0 && *p == '[') {
+            p = json_skip_ws(p + 1);
+            if (*p == ']') {
+                p++;
+            } else {
+                for (;;) {
+                    niri_obj_fields_t win;
+                    if (!parse_niri_object(&p, &win, depth + 2)) {
+                        return false;
+                    }
+                    if (win.has_output && win.output[0] != '\0') {
+                        find_or_create_output(gov, win.output, true);
+                        if (win.has_focused && win.focused) {
+                            snprintf(gov->focused_output, sizeof(gov->focused_output), "%s",
+                                     win.output);
+                        }
+                    }
+                    if (win.has_fs && win.is_fs) {
+                        apply_niri_window_fullscreen(gov, &win);
+                    }
+                    p = json_skip_ws(p);
+                    if (*p == ',') {
+                        p = json_skip_ws(p + 1);
+                        continue;
+                    }
+                    if (*p == ']') {
+                        p++;
+                        break;
+                    }
+                    return false;
+                }
+            }
+        } else if (!json_skip_value(&p, depth + 1)) {
+            return false;
+        }
+
+        p = json_skip_ws(p);
+        if (*p == ',') {
+            p = json_skip_ws(p + 1);
+            continue;
+        }
+        if (*p == '}') {
+            *pp = p + 1;
+            return true;
+        }
+        return false;
     }
 }
 
@@ -498,159 +1115,143 @@ void waywal_power_governor_feed_niri_event(waywal_power_governor_t *gov, const c
         return;
     }
 
-    char target_output[64];
-    target_output[0] = '\0';
-    const char *out_key = strstr(json, "\"output\"");
-    if (out_key) {
-        const char *colon = strchr(out_key + 8, ':');
-        if (colon) {
-            const char *q1 = strchr(colon + 1, '"');
-            if (q1) {
-                const char *q2 = strchr(q1 + 1, '"');
-                if (q2 && (size_t)(q2 - (q1 + 1)) < sizeof(target_output)) {
-                    size_t len = (size_t)(q2 - (q1 + 1));
-                    memcpy(target_output, q1 + 1, len);
-                    target_output[len] = '\0';
-                }
+    const char *p = json_skip_ws(json);
+    if (*p != '{') {
+        return;
+    }
+    p = json_skip_ws(p + 1);
+    if (*p == '}') {
+        return;
+    }
+
+    niri_obj_fields_t flat;
+    memset(&flat, 0, sizeof(flat));
+
+    for (;;) {
+        char key[64];
+        bool key_trunc = false;
+        if (!json_parse_string(&p, key, sizeof(key), &key_trunc)) {
+            return;
+        }
+        p = json_skip_ws(p);
+        if (*p != ':') {
+            return;
+        }
+        p = json_skip_ws(p + 1);
+
+        if (!key_trunc &&
+            (strcmp(key, "WorkspaceActivated") == 0 || strcmp(key, "WorkspaceFocused") == 0) &&
+            *p == '{') {
+            niri_obj_fields_t ev;
+            if (!parse_niri_object(&p, &ev, 1)) {
+                return;
             }
-        }
-    }
-    if (target_output[0] != '\0') {
-        snprintf(gov->focused_output, sizeof(gov->focused_output), "%s", target_output);
-        find_or_create_output(gov, gov->focused_output, true);
-    }
-
-    uint64_t ev_win_id = 0;
-    const char *id_field = strstr(json, "\"id\"");
-    if (id_field) {
-        const char *colon = strchr(id_field + 4, ':');
-        if (colon) {
-            const char *p = colon + 1;
-            while (*p && isspace((unsigned char)*p))
-                p++;
-            if (isdigit((unsigned char)*p)) {
-                ev_win_id = (uint64_t)strtoull(p, NULL, 10);
+            if (ev.has_output && ev.output[0] != '\0') {
+                snprintf(gov->focused_output, sizeof(gov->focused_output), "%s", ev.output);
+                find_or_create_output(gov, gov->focused_output, true);
             }
-        }
-    }
-
-    if (strstr(json, "\"WorkspaceActivated\"") || strstr(json, "\"WorkspaceFocused\"")) {
-        if (id_field) {
-            const char *colon = strchr(id_field + 4, ':');
-            if (colon) {
-                const char *p = colon + 1;
-                while (*p && isspace((unsigned char)*p)) {
-                    p++;
-                }
-                size_t len = 0;
-                while (p[len] && isdigit((unsigned char)p[len]) &&
-                       len < sizeof(gov->active_workspace) - 1) {
-                    gov->active_workspace[len] = p[len];
-                    len++;
-                }
-                if (len > 0) {
-                    gov->active_workspace[len] = '\0';
-                    gov->workspace_changed = true;
-                }
+            if (ev.has_id) {
+                snprintf(gov->active_workspace, sizeof(gov->active_workspace), "%llu",
+                         (unsigned long long)ev.id);
+                gov->workspace_changed = true;
             }
-        }
-        gov->global_mask &= ~(uint32_t)WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN;
-        const char *out_name = target_output[0] != '\0' ? target_output : gov->focused_output;
-        if (out_name[0] != '\0') {
-            waywal_power_governor_set_output_reason(gov, out_name, WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN,
-                                                    false);
-        }
-    } else if (strstr(json, "\"WindowClosed\"")) {
-        gov->global_mask &= ~(uint32_t)WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN;
-        if (gov->niri_fs_output[0] != '\0' &&
-            (ev_win_id == 0 || gov->niri_fs_win_id == 0 || ev_win_id == gov->niri_fs_win_id)) {
-            waywal_power_governor_set_output_reason(gov, gov->niri_fs_output,
-                                                    WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, false);
-            gov->niri_fs_output[0] = '\0';
-            gov->niri_fs_win_id = 0;
-        }
-        if (gov->focused_output[0] != '\0') {
-            waywal_power_governor_set_output_reason(gov, gov->focused_output,
-                                                    WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, false);
-        }
-    }
-
-    if (strstr(json, "\"WindowsChanged\"")) {
-        gov->global_mask &= ~(uint32_t)WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN;
-        for (size_t i = 0; i < gov->output_count; ++i) {
-            if (gov->outputs[i].in_use) {
-                gov->outputs[i].mask &= ~(uint32_t)WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN;
-            }
-        }
-        gov->niri_fs_output[0] = '\0';
-        gov->niri_fs_win_id = 0;
-    }
-
-    bool saw_fs_field = false;
-    bool is_fs = false;
-    const char *scan = json;
-    while (*scan) {
-        const char *k1 = strstr(scan, "\"is_fullscreen\"");
-        const char *k2 = strstr(scan, "\"fullscreen\"");
-        const char *fs_key = NULL;
-        size_t key_len = 0;
-        if (k1 && (!k2 || k1 <= k2)) {
-            fs_key = k1;
-            key_len = 15;
-        } else if (k2) {
-            fs_key = k2;
-            key_len = 12;
-        } else {
-            break;
-        }
-        const char *colon = strchr(fs_key + key_len, ':');
-        if (!colon)
-            break;
-        const char *p = colon + 1;
-        while (*p && isspace((unsigned char)*p))
-            p++;
-        if (strncmp(p, "true", 4) == 0 || *p == '1') {
-            saw_fs_field = true;
-            is_fs = true;
-            break;
-        } else if (strncmp(p, "false", 5) == 0 || *p == '0') {
-            saw_fs_field = true;
-        }
-        scan = colon + 1;
-    }
-
-    if (saw_fs_field) {
-        const char *out_name = target_output[0] != '\0' ? target_output : gov->focused_output;
-        if (is_fs) {
-            if (gov->niri_fs_output[0] != '\0' && out_name[0] != '\0' &&
-                strcmp(gov->niri_fs_output, out_name) != 0 &&
-                (ev_win_id == 0 || gov->niri_fs_win_id == 0 || ev_win_id == gov->niri_fs_win_id)) {
-                waywal_power_governor_set_output_reason(gov, gov->niri_fs_output,
+            gov->global_mask &= ~(uint32_t)WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN;
+            const char *out_name =
+                (ev.has_output && ev.output[0] != '\0') ? ev.output : gov->focused_output;
+            if (out_name[0] != '\0') {
+                waywal_power_governor_set_output_reason(gov, out_name,
                                                         WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, false);
             }
-            if (out_name[0] != '\0') {
-                snprintf(gov->niri_fs_output, sizeof(gov->niri_fs_output), "%s", out_name);
-                gov->niri_fs_win_id = ev_win_id;
-                waywal_power_governor_set_output_reason(gov, out_name,
-                                                        WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, true);
-            } else {
-                waywal_power_governor_set_global_reason(gov, WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN,
-                                                        true);
+        } else if (!key_trunc && strcmp(key, "WindowClosed") == 0 && *p == '{') {
+            niri_obj_fields_t ev;
+            if (!parse_niri_object(&p, &ev, 1)) {
+                return;
             }
-        } else {
             gov->global_mask &= ~(uint32_t)WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN;
             if (gov->niri_fs_output[0] != '\0' &&
-                (ev_win_id == 0 || gov->niri_fs_win_id == 0 || ev_win_id == gov->niri_fs_win_id)) {
+                (!ev.has_id || ev.id == 0 || gov->niri_fs_win_id == 0 ||
+                 ev.id == gov->niri_fs_win_id)) {
                 waywal_power_governor_set_output_reason(gov, gov->niri_fs_output,
                                                         WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, false);
                 gov->niri_fs_output[0] = '\0';
                 gov->niri_fs_win_id = 0;
             }
-            if (out_name[0] != '\0') {
-                waywal_power_governor_set_output_reason(gov, out_name,
+            if (gov->focused_output[0] != '\0') {
+                waywal_power_governor_set_output_reason(gov, gov->focused_output,
                                                         WAYWAL_PAUSE_TOPLEVEL_FULLSCREEN, false);
             }
+        } else if (!key_trunc && strcmp(key, "WindowsChanged") == 0 && *p == '{') {
+            if (!handle_niri_windows_changed(gov, &p, 1)) {
+                return;
+            }
+        } else if (!key_trunc &&
+                   (strcmp(key, "WindowOpenedOrChanged") == 0 ||
+                    strcmp(key, "WindowFocusChanged") == 0) &&
+                   *p == '{') {
+            niri_obj_fields_t ev;
+            if (!parse_niri_object(&p, &ev, 1)) {
+                return;
+            }
+            if (ev.has_output && ev.output[0] != '\0') {
+                snprintf(gov->focused_output, sizeof(gov->focused_output), "%s", ev.output);
+                find_or_create_output(gov, gov->focused_output, true);
+            }
+            apply_niri_window_fullscreen(gov, &ev);
+        } else if (!key_trunc && strcmp(key, "id") == 0 && isdigit((unsigned char)*p)) {
+            if (!json_parse_uint64(&p, &flat.id)) {
+                return;
+            }
+            flat.has_id = true;
+        } else if (!key_trunc && strcmp(key, "output") == 0 && *p == '"') {
+            char val[64];
+            bool val_trunc = false;
+            if (!json_parse_string(&p, val, sizeof(val), &val_trunc)) {
+                return;
+            }
+            if (!val_trunc && val[0] != '\0') {
+                snprintf(flat.output, sizeof(flat.output), "%s", val);
+                flat.has_output = true;
+            }
+        } else if (!key_trunc &&
+                   (strcmp(key, "is_fullscreen") == 0 || strcmp(key, "fullscreen") == 0)) {
+            if (strncmp(p, "true", 4) == 0) {
+                p += 4;
+                flat.has_fs = true;
+                flat.is_fs = true;
+            } else if (strncmp(p, "false", 5) == 0) {
+                p += 5;
+                flat.has_fs = true;
+                flat.is_fs = false;
+            } else if (*p == '1' || *p == '0') {
+                flat.has_fs = true;
+                flat.is_fs = (*p == '1');
+                p++;
+            } else if (!json_skip_value(&p, 1)) {
+                return;
+            }
+        } else {
+            if (!json_skip_value(&p, 1)) {
+                return;
+            }
         }
+
+        p = json_skip_ws(p);
+        if (*p == ',') {
+            p = json_skip_ws(p + 1);
+            continue;
+        }
+        if (*p == '}') {
+            break;
+        }
+        return;
+    }
+
+    if (flat.has_output && flat.output[0] != '\0') {
+        snprintf(gov->focused_output, sizeof(gov->focused_output), "%s", flat.output);
+        find_or_create_output(gov, gov->focused_output, true);
+    }
+    if (flat.has_fs) {
+        apply_niri_window_fullscreen(gov, &flat);
     }
 }
 
@@ -694,6 +1295,17 @@ void waywal_power_governor_dispatch_ipc(waywal_power_governor_t *gov)
     }
 
     for (;;) {
+        if (gov->ipc_connecting || gov->ipc_tx_off < gov->ipc_tx_len) {
+            if (!flush_ipc_handshake(gov)) {
+                close_ipc_socket(gov);
+                init_compositor_ipc(gov);
+                gov->ipc_reconnected = (gov->ipc_fd >= 0);
+                break;
+            }
+            if (gov->ipc_connecting) {
+                break;
+            }
+        }
         if (gov->ipc_buf_len >= sizeof(gov->ipc_buf) - 1) {
             if (gov->ipc_backend == IPC_BACKEND_HYPRLAND || gov->ipc_backend == IPC_BACKEND_NIRI) {
                 gov->ipc_drop_line = true;
@@ -703,11 +1315,7 @@ void waywal_power_governor_dispatch_ipc(waywal_power_governor_t *gov)
         ssize_t n = recv(gov->ipc_fd, gov->ipc_buf + gov->ipc_buf_len,
                          sizeof(gov->ipc_buf) - 1 - gov->ipc_buf_len, MSG_DONTWAIT);
         if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
-            close(gov->ipc_fd);
-            gov->ipc_fd = -1;
-            gov->ipc_buf_len = 0;
-            gov->ipc_skip_bytes = 0;
-            gov->ipc_drop_line = false;
+            close_ipc_socket(gov);
             init_compositor_ipc(gov);
             gov->ipc_reconnected = (gov->ipc_fd >= 0);
             break;
@@ -810,13 +1418,19 @@ bool waywal_power_governor_poll_battery(waywal_power_governor_t *gov)
     }
 
     if (!discharging) {
+        bool any_ac_readable = false;
+        bool any_ac_online = false;
         for (size_t i = 0; i < WAYWAL_SYSFS_AC_COUNT; ++i) {
             if (pread_first_line(gov->ac_fds[i], buf, sizeof(buf))) {
-                if (buf[0] == '0') {
-                    discharging = true;
+                any_ac_readable = true;
+                if (buf[0] == '1') {
+                    any_ac_online = true;
+                    break;
                 }
-                break;
             }
+        }
+        if (any_ac_readable && !any_ac_online) {
+            discharging = true;
         }
     }
 
@@ -910,6 +1524,13 @@ void waywal_power_governor_remove_output(waywal_power_governor_t *gov, const cha
     }
     while (gov->output_count > 0 && !gov->outputs[gov->output_count - 1].in_use) {
         gov->output_count--;
+    }
+    if (strcmp(gov->focused_output, output_name) == 0) {
+        gov->focused_output[0] = '\0';
+    }
+    if (strcmp(gov->niri_fs_output, output_name) == 0) {
+        gov->niri_fs_output[0] = '\0';
+        gov->niri_fs_win_id = 0;
     }
 }
 
