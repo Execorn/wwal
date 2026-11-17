@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "command_bus.hpp"
+#include "command_ring_arena.hpp"
 
 #include <QFileInfo>
 #include <QPointer>
 #include <QStringList>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <exception>
+#include <typeinfo>
 
 namespace waywal::studio {
 
@@ -17,12 +23,23 @@ namespace {
 
 [[nodiscard]] bool allFiniteVec(const std::vector<float> &vals) noexcept
 {
-    for (float v : vals) {
-        if (!std::isfinite(v)) {
+    const size_t n = vals.size();
+    const float *p = vals.data();
+    for (size_t i = 0; i < n; ++i) {
+        if (!std::isfinite(p[i])) {
             return false;
         }
     }
     return true;
+}
+
+[[nodiscard]] bool qStringsEqualFast(const QString &a, const QString &b) noexcept
+{
+    const qsizetype n = a.size();
+    if (n != b.size()) {
+        return false;
+    }
+    return n == 0 || a.constData() == b.constData() || a == b;
 }
 
 [[nodiscard]] bool allFiniteArr4(const std::array<float, 4> &vals) noexcept
@@ -47,8 +64,7 @@ namespace {
     return static_cast<size_t>(std::max<qsizetype>(0, s.capacity())) * sizeof(QChar);
 }
 
-template <typename Stack>
-[[nodiscard]] size_t recalculateStackBytes(const Stack &stack)
+template <typename Stack> [[nodiscard]] size_t recalculateStackBytes(const Stack &stack)
 {
     size_t total = 0;
     for (const auto &entry : stack) {
@@ -78,9 +94,9 @@ template <typename Stack>
     return outputs;
 }
 
-[[nodiscard]] WallpaperApplyOptions
-wallpaperOptionsFromMetadata(const QString &outputSpec, const waywal_img_metadata_t &meta,
-                               const QString &path)
+[[nodiscard]] WallpaperApplyOptions wallpaperOptionsFromMetadata(const QString &outputSpec,
+                                                                 const waywal_img_metadata_t &meta,
+                                                                 const QString &path)
 {
     WallpaperApplyOptions opts;
     opts.targetOutputs = parseTargetOutputsSpec(outputSpec);
@@ -133,10 +149,285 @@ wallpaperOptionsFromMetadata(const QString &outputSpec, const waywal_img_metadat
     return opts;
 }
 
+class BusArenaState;
+
+std::atomic<uint64_t> g_busArenaEpoch{1ULL};
+
+struct ThreadLocalBusCache {
+    const CommandBus *bus{nullptr};
+    BusArenaState *state{nullptr};
+    uint64_t epoch{0ULL};
+    uint32_t lastCoarseMonoMs{0U};
+};
+
+thread_local ThreadLocalBusCache t_busArenaCache{};
+
+[[nodiscard]] std::chrono::steady_clock::time_point fastMonotonicNow() noexcept
+{
+#if defined(CLOCK_MONOTONIC_COARSE)
+    struct timespec ts{};
+    if (::clock_gettime(CLOCK_MONOTONIC_COARSE, &ts) == 0) {
+        t_busArenaCache.lastCoarseMonoMs =
+            static_cast<uint32_t>(static_cast<uint64_t>(ts.tv_sec) * 1000ULL +
+                                  static_cast<uint64_t>(ts.tv_nsec) / 1000000ULL);
+        const auto durNs = std::chrono::nanoseconds(static_cast<int64_t>(ts.tv_sec) * 1000000000LL +
+                                                    static_cast<int64_t>(ts.tv_nsec));
+        return std::chrono::steady_clock::time_point(
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(durNs));
+    }
+#endif
+    const auto now = std::chrono::steady_clock::now();
+    t_busArenaCache.lastCoarseMonoMs = static_cast<uint32_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
+    return now;
+}
+
+[[nodiscard]] uint32_t fastMonotonicMs() noexcept
+{
+#if defined(CLOCK_MONOTONIC_COARSE)
+    struct timespec ts{};
+    if (::clock_gettime(CLOCK_MONOTONIC_COARSE, &ts) == 0) {
+        const uint32_t ms = static_cast<uint32_t>(static_cast<uint64_t>(ts.tv_sec) * 1000ULL +
+                                                  static_cast<uint64_t>(ts.tv_nsec) / 1000000ULL);
+        t_busArenaCache.lastCoarseMonoMs = ms;
+        return ms;
+    }
+#endif
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    t_busArenaCache.lastCoarseMonoMs = static_cast<uint32_t>(ms);
+    return t_busArenaCache.lastCoarseMonoMs;
+}
+
+[[nodiscard]] uint32_t hashUniformKey(const QString &output, const QString &name) noexcept
+{
+    uint32_t h = 2166136261U;
+    auto mixBytes = [&h](const void *data, std::size_t len) noexcept {
+        const auto *p = static_cast<const uint8_t *>(data);
+        for (std::size_t i = 0; i < len; ++i) {
+            h ^= p[i];
+            h *= 16777619U;
+        }
+    };
+    const uint32_t outLen = static_cast<uint32_t>(std::max<qsizetype>(0, output.size()));
+    const uint32_t nameLen = static_cast<uint32_t>(std::max<qsizetype>(0, name.size()));
+    mixBytes(&outLen, sizeof(outLen));
+    if (outLen > 0U) {
+        mixBytes(output.utf16(), static_cast<std::size_t>(outLen) * sizeof(char16_t));
+    }
+    mixBytes(&nameLen, sizeof(nameLen));
+    if (nameLen > 0U) {
+        mixBytes(name.utf16(), static_cast<std::size_t>(nameLen) * sizeof(char16_t));
+    }
+    return h;
+}
+
+constexpr uint32_t kRingTagSetUniform = 1U;
+constexpr uint32_t kRingTagSetBezier = 2U;
+constexpr uint32_t kRingTagSetNodeConst = 3U;
+
+class BusArenaState final : public QObject {
+  public:
+    static constexpr std::size_t kRingCapacity = 4096U;
+
+    explicit BusArenaState(CommandBus *owner) : QObject(owner) {}
+    ~BusArenaState() override;
+
+    void drainCommitted() noexcept
+    {
+        CommandRingArena<kRingCapacity>::EntryHeader hdr{};
+        std::array<uint8_t, CommandRingArena<kRingCapacity>::kMaxCoalescedPayload> scratch{};
+        while (arena.used_bytes() > (kRingCapacity / 2U)) {
+            if (!arena.try_pop(hdr, scratch.data(), scratch.size())) {
+                break;
+            }
+        }
+    }
+
+    void drainAll() noexcept
+    {
+        CommandRingArena<kRingCapacity>::EntryHeader hdr{};
+        std::array<uint8_t, CommandRingArena<kRingCapacity>::kMaxCoalescedPayload> scratch{};
+        while (arena.try_pop(hdr, scratch.data(), scratch.size())) {
+        }
+    }
+
+    void flushAndDrain() noexcept
+    {
+        if (!arena.flush_coalesced()) {
+            drainAll();
+            (void)arena.flush_coalesced();
+        }
+        if (arena.used_bytes() > (kRingCapacity / 2U)) {
+            drainCommitted();
+        }
+    }
+
+    void pushToArena(uint32_t typeTag, uint32_t hash, uint32_t nowMs, const void *payload,
+                     uint32_t payloadBytes) noexcept
+    {
+        if (!arena.try_push_or_coalesce(typeTag, hash, nowMs, payload, payloadBytes)) {
+            drainAll();
+            (void)arena.try_push_or_coalesce(typeTag, hash, nowMs, payload, payloadBytes);
+        }
+        if (arena.used_bytes() > (kRingCapacity / 2U)) {
+            drainCommitted();
+        }
+    }
+
+    [[gnu::noinline]] void pushFallback(uint32_t typeTag, uint32_t hash, uint32_t nowMs,
+                                        const void *payload, uint32_t payloadBytes) noexcept
+    {
+        pushToArena(typeTag, hash, nowMs, payload, payloadBytes);
+    }
+
+    [[gnu::noinline]] void bindAndPushSetUniform(ICommand *rawTail, const SetUniformCommand *cmd,
+                                                 uint32_t nowMs) noexcept
+    {
+        const auto &vals = cmd->newValues();
+        const uint32_t payloadBytes = static_cast<uint32_t>(vals.size() * sizeof(float));
+        const uint32_t uniformHash = hashUniformKey(cmd->output(), cmd->uniformName());
+        topCmdPtr = rawTail;
+        topTypeTag = kRingTagSetUniform;
+        topUniformHash = uniformHash;
+        topOutput = cmd->output();
+        topUniformName = cmd->uniformName();
+        topValueCount = static_cast<uint32_t>(vals.size());
+        pushToArena(kRingTagSetUniform, uniformHash, nowMs, vals.data(), payloadBytes);
+    }
+
+    void clearTop() noexcept
+    {
+        topCmdPtr = nullptr;
+        topTypeTag = 0U;
+        topUniformHash = 0U;
+        topValueCount = 0U;
+    }
+
+    bool *activeDestroyFlag{nullptr};
+    CommandRingArena<kRingCapacity> arena;
+    ICommand *topCmdPtr{nullptr};
+    uint32_t topTypeTag{0U};
+    uint32_t topUniformHash{0U};
+    uint32_t topValueCount{0U};
+    QString topOutput;
+    QString topUniformName;
+};
+
+BusArenaState::~BusArenaState()
+{
+    if (activeDestroyFlag) {
+        *activeDestroyFlag = true;
+    }
+    g_busArenaEpoch.fetch_add(1ULL, std::memory_order_acq_rel);
+    if (t_busArenaCache.state == this) {
+        t_busArenaCache.bus = nullptr;
+        t_busArenaCache.state = nullptr;
+        t_busArenaCache.epoch = 0ULL;
+    }
+}
+
+struct FastArenaDispatchGuard {
+    FastArenaDispatchGuard(bool &dispatching, BusArenaState *state, bool &destroyed) noexcept
+        : m_dispatching(dispatching), m_state(state), m_destroyed(destroyed)
+    {
+        m_prevFlag = m_state->activeDestroyFlag;
+        m_state->activeDestroyFlag = &m_destroyed;
+        m_dispatching = true;
+    }
+    ~FastArenaDispatchGuard() noexcept
+    {
+        if (!m_destroyed) {
+            m_dispatching = false;
+            m_state->activeDestroyFlag = m_prevFlag;
+        }
+    }
+    FastArenaDispatchGuard(const FastArenaDispatchGuard &) = delete;
+    FastArenaDispatchGuard &operator=(const FastArenaDispatchGuard &) = delete;
+
+  private:
+    bool &m_dispatching;
+    BusArenaState *m_state;
+    bool &m_destroyed;
+    bool *m_prevFlag{nullptr};
+};
+
+[[gnu::noinline]] BusArenaState *findArenaStateSlow(const CommandBus *bus, bool createIfMissing,
+                                                    ThreadLocalBusCache &cache)
+{
+    BusArenaState *found = nullptr;
+    for (QObject *child : bus->children()) {
+        if (auto *candidate = dynamic_cast<BusArenaState *>(child)) {
+            found = candidate;
+            break;
+        }
+    }
+    if (!found && createIfMissing) {
+        found = new BusArenaState(const_cast<CommandBus *>(bus));
+    }
+    if (found) {
+        cache.bus = bus;
+        cache.state = found;
+        cache.epoch = g_busArenaEpoch.load(std::memory_order_acquire);
+    }
+    return found;
+}
+
+[[nodiscard]] BusArenaState *findArenaState(const CommandBus *bus, bool createIfMissing,
+                                            uint32_t *nowMsOut = nullptr)
+{
+    ThreadLocalBusCache &cache = t_busArenaCache;
+    if (nowMsOut) {
+        *nowMsOut = (cache.lastCoarseMonoMs != 0U) ? cache.lastCoarseMonoMs : fastMonotonicMs();
+    }
+    const uint64_t epoch = g_busArenaEpoch.load(std::memory_order_acquire);
+    if (cache.bus == bus && cache.epoch == epoch) [[likely]] {
+        return cache.state;
+    }
+    return findArenaStateSlow(bus, createIfMissing, cache);
+}
+
+[[nodiscard]] bool hasStableDescribeAcrossMerge(const ICommand &cmd) noexcept
+{
+    const std::type_info &ti = typeid(cmd);
+    return ti == typeid(SetUniformCommand) || ti == typeid(SetBezierCurveCommand) ||
+           ti == typeid(MoveNodesCommand) || ti == typeid(SetNodeConstantCommand) ||
+           ti == typeid(SetCamera3DCommand) || ti == typeid(SetPhysicsSpringCommand);
+}
+
+template <typename T>
+[[gnu::noinline]] const T *dynamicCastCommandFallback(const ICommand *other) noexcept
+{
+    return dynamic_cast<const T *>(other);
+}
+
+template <typename T> [[nodiscard]] const T *fastCastCommand(const ICommand *other) noexcept
+{
+    if (!other) [[unlikely]] {
+        return nullptr;
+    }
+    if (typeid(*other) == typeid(T)) [[likely]] {
+        return static_cast<const T *>(other);
+    }
+    return dynamicCastCommandFallback<T>(other);
+}
+
+constexpr int64_t kCoalesceWindowTicks =
+    std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::milliseconds(500))
+        .count();
+
+[[nodiscard]] bool withinCoalesceWindowMs(std::chrono::steady_clock::time_point prev,
+                                          std::chrono::steady_clock::time_point next) noexcept
+{
+    const auto delta = (next - prev).count();
+    return static_cast<uint64_t>(delta) <= static_cast<uint64_t>(kCoalesceWindowTicks);
+}
+
 } // namespace
 
 struct CommandBus::DispatchGuard {
-    explicit DispatchGuard(CommandBus *owner) : m_owner(owner)
+    explicit DispatchGuard(QPointer<CommandBus> &owner) : m_owner(owner)
     {
         if (m_owner) {
             m_owner->m_dispatching = true;
@@ -152,7 +443,7 @@ struct CommandBus::DispatchGuard {
     DispatchGuard &operator=(const DispatchGuard &) = delete;
 
   private:
-    QPointer<CommandBus> m_owner;
+    QPointer<CommandBus> &m_owner;
 };
 
 /* ========================================================================= */
@@ -176,9 +467,8 @@ bool CommandBus::evictExcessHistory()
            (!m_undoStack.empty() && m_undoBytes > m_maxHistoryBytes)) {
         const size_t frontBytes = commandFootprint(*m_undoStack.front());
         m_undoStack.pop_front();
-        m_undoBytes =
-            (m_undoBytes >= frontBytes) ? (m_undoBytes - frontBytes)
-                                        : recalculateStackBytes(m_undoStack);
+        m_undoBytes = (m_undoBytes >= frontBytes) ? (m_undoBytes - frontBytes)
+                                                  : recalculateStackBytes(m_undoStack);
         evicted = true;
     }
     return evicted;
@@ -191,12 +481,17 @@ void CommandBus::setMaxHistoryBytes(size_t maxBytes)
     while (!m_redoStack.empty() && m_redoBytes > m_maxHistoryBytes) {
         const size_t frontBytes = commandFootprint(*m_redoStack.front());
         m_redoStack.erase(m_redoStack.begin());
-        m_redoBytes =
-            (m_redoBytes >= frontBytes) ? (m_redoBytes - frontBytes)
-                                        : recalculateStackBytes(m_redoStack);
+        m_redoBytes = (m_redoBytes >= frontBytes) ? (m_redoBytes - frontBytes)
+                                                  : recalculateStackBytes(m_redoStack);
         changed = true;
     }
     if (changed) {
+        if (BusArenaState *state = findArenaState(this, false)) {
+            if (m_undoStack.empty() || m_undoStack.back().get() != state->topCmdPtr) {
+                state->flushAndDrain();
+                state->clearTop();
+            }
+        }
         notifyHistoryChanged();
         emit stateChanged();
     }
@@ -218,6 +513,117 @@ bool CommandBus::tryExecute(std::unique_ptr<ICommand> cmd)
         return false;
     }
 
+    if (typeid(*cmd) == typeid(SetUniformCommand)) [[likely]] {
+        auto *inCmd = static_cast<SetUniformCommand *>(cmd.get());
+        uint32_t nowMs = 0U;
+        BusArenaState *state = findArenaState(this, true, &nowMs);
+        const auto &newVals = inCmd->newValues();
+        const uint32_t payloadBytes = static_cast<uint32_t>(newVals.size() * sizeof(float));
+
+        if (!m_undoStack.empty()) [[likely]] {
+            ICommand *rawTail = m_undoStack.back().get();
+            if (typeid(*rawTail) == typeid(SetUniformCommand)) [[likely]] {
+                auto *tail = static_cast<SetUniformCommand *>(rawTail);
+                if (tail->SetUniformCommand::mergeWith(inCmd)) [[likely]] {
+                    if (state->topCmdPtr == rawTail && state->topTypeTag == kRingTagSetUniform)
+                        [[likely]] {
+                        if (!state->arena.try_coalesce_staged(
+                                kRingTagSetUniform, state->topUniformHash, nowMs, newVals.data(),
+                                payloadBytes)) [[unlikely]] {
+                            state->pushFallback(kRingTagSetUniform, state->topUniformHash, nowMs,
+                                                newVals.data(), payloadBytes);
+                        }
+                    } else {
+                        state->bindAndPushSetUniform(rawTail, inCmd, nowMs);
+                    }
+
+                    bool busDestroyed = false;
+                    QString errorReason;
+                    {
+                        FastArenaDispatchGuard guard(m_dispatching, state, busDestroyed);
+                        try {
+                            tail->SetUniformCommand::execute();
+                        } catch (const std::exception &ex) {
+                            errorReason = QString::fromUtf8(ex.what());
+                        } catch (...) {
+                            errorReason =
+                                QStringLiteral("Unknown exception during coalesced execute()");
+                        }
+                    }
+                    if (busDestroyed) [[unlikely]] {
+                        return false;
+                    }
+
+                    bool historyMetaChanged = false;
+                    if (!m_redoStack.empty()) [[unlikely]] {
+                        m_redoStack.clear();
+                        m_redoBytes = 0;
+                        historyMetaChanged = true;
+                    }
+
+                    if (!errorReason.isEmpty()) [[unlikely]] {
+                        emit commandFailed(errorReason);
+                        notifyHistoryChanged();
+                        emit stateChanged();
+                        return false;
+                    }
+                    if (historyMetaChanged) [[unlikely]] {
+                        notifyHistoryChanged();
+                        emit stateChanged();
+                    }
+                    return true;
+                }
+            }
+        }
+
+        if (!inCmd->SetUniformCommand::isValid()) {
+            emit commandFailed(
+                QStringLiteral("CommandBus rejected invalid command: %1").arg(inCmd->describe()));
+            return false;
+        }
+
+        bool busDestroyed = false;
+        QString errorReason;
+        {
+            FastArenaDispatchGuard guard(m_dispatching, state, busDestroyed);
+            try {
+                inCmd->SetUniformCommand::execute();
+            } catch (const std::exception &ex) {
+                errorReason = QString::fromUtf8(ex.what());
+            } catch (...) {
+                errorReason = QStringLiteral("Unknown exception during command execute()");
+            }
+        }
+
+        if (busDestroyed) {
+            return false;
+        }
+        if (!errorReason.isEmpty()) {
+            emit commandFailed(errorReason);
+            return false;
+        }
+
+        state->flushAndDrain();
+        state->bindAndPushSetUniform(inCmd, inCmd, nowMs);
+
+        const size_t cmdBytes = commandFootprint(*inCmd);
+
+        m_undoStack.push_back(std::move(cmd));
+        m_undoBytes += cmdBytes;
+        if (!m_redoStack.empty()) {
+            m_redoStack.clear();
+            m_redoBytes = 0;
+        }
+        evictExcessHistory();
+        if (m_undoStack.empty() || m_undoStack.back().get() != state->topCmdPtr) {
+            state->flushAndDrain();
+            state->clearTop();
+        }
+        notifyHistoryChanged();
+        emit stateChanged();
+        return true;
+    }
+
     if (!cmd->isValid()) {
         emit commandFailed(
             QStringLiteral("CommandBus rejected invalid command: %1").arg(cmd->describe()));
@@ -230,9 +636,29 @@ bool CommandBus::tryExecute(std::unique_ptr<ICommand> cmd)
     if (!m_undoStack.empty()) {
         ICommand *tail = m_undoStack.back().get();
         const size_t oldTailBytes = commandFootprint(*tail);
+        const bool stableLabel = hasStableDescribeAcrossMerge(*tail);
+        const QString prevDesc = stableLabel ? QString() : tail->describe();
         if (tail->mergeWith(cmd.get())) {
+            if (typeid(*tail) == typeid(SetBezierCurveCommand)) {
+                auto *bTail = static_cast<SetBezierCurveCommand *>(tail);
+                BusArenaState *state = findArenaState(this, true);
+                state->pushToArena(kRingTagSetBezier, hashUniformKey(bTail->output(), QString()),
+                                   fastMonotonicMs(), &bTail->newCurve(),
+                                   static_cast<uint32_t>(sizeof(bezier_curve_t)));
+                state->topCmdPtr = tail;
+                state->topTypeTag = kRingTagSetBezier;
+            } else if (typeid(*tail) == typeid(SetNodeConstantCommand)) {
+                auto *cTail = static_cast<SetNodeConstantCommand *>(tail);
+                BusArenaState *state = findArenaState(this, true);
+                state->pushToArena(kRingTagSetNodeConst, cTail->nodeId(), fastMonotonicMs(),
+                                   cTail->newVal().data(),
+                                   static_cast<uint32_t>(sizeof(std::array<float, 4>)));
+                state->topCmdPtr = tail;
+                state->topTypeTag = kRingTagSetNodeConst;
+            }
+
             {
-                DispatchGuard guard(this);
+                DispatchGuard guard(self);
                 try {
                     tail->execute();
                 } catch (const std::exception &ex) {
@@ -245,13 +671,24 @@ bool CommandBus::tryExecute(std::unique_ptr<ICommand> cmd)
                 return false;
             }
             // A coalesced edit starts a fresh future branch just like an unmerged execute().
-            m_redoStack.clear();
-            m_redoBytes = 0;
+            const bool hadRedo = !m_redoStack.empty();
+            if (hadRedo) {
+                m_redoStack.clear();
+                m_redoBytes = 0;
+            }
 
             const size_t newTailBytes = commandFootprint(*tail);
             m_undoBytes =
                 (m_undoBytes >= oldTailBytes ? m_undoBytes - oldTailBytes : 0) + newTailBytes;
-            evictExcessHistory();
+            const bool evicted = evictExcessHistory();
+            if (evicted) {
+                if (BusArenaState *state = findArenaState(this, false)) {
+                    if (m_undoStack.empty() || m_undoStack.back().get() != state->topCmdPtr) {
+                        state->flushAndDrain();
+                        state->clearTop();
+                    }
+                }
+            }
 
             if (!errorReason.isEmpty()) {
                 emit commandFailed(errorReason);
@@ -259,14 +696,17 @@ bool CommandBus::tryExecute(std::unique_ptr<ICommand> cmd)
                 emit stateChanged();
                 return false;
             }
-            notifyHistoryChanged();
-            emit stateChanged();
+            const bool labelChanged = !stableLabel && (tail->describe() != prevDesc);
+            if (hadRedo || evicted || labelChanged) {
+                notifyHistoryChanged();
+                emit stateChanged();
+            }
             return true;
         }
     }
 
     {
-        DispatchGuard guard(this);
+        DispatchGuard guard(self);
         try {
             cmd->execute();
         } catch (const std::exception &ex) {
@@ -285,13 +725,44 @@ bool CommandBus::tryExecute(std::unique_ptr<ICommand> cmd)
         return false;
     }
 
+    if (typeid(*cmd) == typeid(SetBezierCurveCommand)) {
+        auto *bCmd = static_cast<SetBezierCurveCommand *>(cmd.get());
+        BusArenaState *state = findArenaState(this, true);
+        state->flushAndDrain();
+        state->pushToArena(kRingTagSetBezier, hashUniformKey(bCmd->output(), QString()),
+                           fastMonotonicMs(), &bCmd->newCurve(),
+                           static_cast<uint32_t>(sizeof(bezier_curve_t)));
+        state->topCmdPtr = bCmd;
+        state->topTypeTag = kRingTagSetBezier;
+    } else if (typeid(*cmd) == typeid(SetNodeConstantCommand)) {
+        auto *cCmd = static_cast<SetNodeConstantCommand *>(cmd.get());
+        BusArenaState *state = findArenaState(this, true);
+        state->flushAndDrain();
+        state->pushToArena(kRingTagSetNodeConst, cCmd->nodeId(), fastMonotonicMs(),
+                           cCmd->newVal().data(),
+                           static_cast<uint32_t>(sizeof(std::array<float, 4>)));
+        state->topCmdPtr = cCmd;
+        state->topTypeTag = kRingTagSetNodeConst;
+    } else if (BusArenaState *state = findArenaState(this, false)) {
+        state->flushAndDrain();
+        state->clearTop();
+    }
+
     const size_t cmdBytes = commandFootprint(*cmd);
     m_undoStack.push_back(std::move(cmd));
     m_undoBytes += cmdBytes;
-    m_redoStack.clear();
-    m_redoBytes = 0;
+    if (!m_redoStack.empty()) {
+        m_redoStack.clear();
+        m_redoBytes = 0;
+    }
 
     evictExcessHistory();
+    if (BusArenaState *state = findArenaState(this, false)) {
+        if (m_undoStack.empty() || m_undoStack.back().get() != state->topCmdPtr) {
+            state->flushAndDrain();
+            state->clearTop();
+        }
+    }
 
     notifyHistoryChanged();
     emit stateChanged();
@@ -307,11 +778,16 @@ bool CommandBus::tryUndo()
     if (m_undoStack.empty())
         return false;
 
+    if (BusArenaState *state = findArenaState(this, false)) {
+        state->flushAndDrain();
+        state->clearTop();
+    }
+
     auto cmd = std::move(m_undoStack.back());
     m_undoStack.pop_back();
     const size_t cmdBytes = commandFootprint(*cmd);
-    m_undoBytes = (m_undoBytes >= cmdBytes) ? (m_undoBytes - cmdBytes)
-                                            : recalculateStackBytes(m_undoStack);
+    m_undoBytes =
+        (m_undoBytes >= cmdBytes) ? (m_undoBytes - cmdBytes) : recalculateStackBytes(m_undoStack);
 
     // Move onto destination stack before invoking callbacks so listeners see consistent stacks.
     ICommand *rawCmd = cmd.get();
@@ -321,7 +797,7 @@ bool CommandBus::tryUndo()
     QPointer<CommandBus> self(this);
     QString errorReason;
     {
-        DispatchGuard guard(this);
+        DispatchGuard guard(self);
         try {
             rawCmd->undo();
         } catch (const std::exception &ex) {
@@ -362,11 +838,16 @@ bool CommandBus::tryRedo()
     if (m_redoStack.empty())
         return false;
 
+    if (BusArenaState *state = findArenaState(this, false)) {
+        state->flushAndDrain();
+        state->clearTop();
+    }
+
     auto cmd = std::move(m_redoStack.back());
     m_redoStack.pop_back();
     const size_t cmdBytes = commandFootprint(*cmd);
-    m_redoBytes = (m_redoBytes >= cmdBytes) ? (m_redoBytes - cmdBytes)
-                                            : recalculateStackBytes(m_redoStack);
+    m_redoBytes =
+        (m_redoBytes >= cmdBytes) ? (m_redoBytes - cmdBytes) : recalculateStackBytes(m_redoStack);
 
     // Move onto destination stack before invoking callbacks so listeners see consistent stacks.
     ICommand *rawCmd = cmd.get();
@@ -376,7 +857,7 @@ bool CommandBus::tryRedo()
     QPointer<CommandBus> self(this);
     QString errorReason;
     {
-        DispatchGuard guard(this);
+        DispatchGuard guard(self);
         try {
             rawCmd->redo();
         } catch (const std::exception &ex) {
@@ -414,6 +895,10 @@ void CommandBus::clear()
     if (m_dispatching) {
         emit commandFailed(QStringLiteral("CommandBus::clear() re-entrant call rejected"));
         return;
+    }
+    if (BusArenaState *state = findArenaState(this, false)) {
+        state->arena.reset();
+        state->clearTop();
     }
     m_undoStack.clear();
     m_redoStack.clear();
@@ -459,15 +944,15 @@ SetUniformCommand::SetUniformCommand(QString output, QString uniformName,
                                      uint32_t flags, ApplyFunction applyFunc)
     : m_output(std::move(output)), m_uniformName(std::move(uniformName)),
       m_oldValues(std::move(oldValues)), m_newValues(std::move(newValues)), m_flags(flags),
-      m_applyFunc(std::move(applyFunc)), m_timestamp(std::chrono::steady_clock::now())
+      m_applyFunc(std::move(applyFunc)), m_timestamp(fastMonotonicNow())
 {
 }
 
 void SetUniformCommand::execute()
 {
-    if (m_applyFunc) {
-        m_applyFunc(m_output, m_uniformName, m_newValues.data(),
-                    static_cast<uint32_t>(m_newValues.size()), m_flags);
+    if (const ApplyFunction fn = m_applyFunc) {
+        fn(m_output, m_uniformName, m_newValues.data(), static_cast<uint32_t>(m_newValues.size()),
+           m_flags);
     } else if (!m_newValues.empty()) {
         if (auto *ipc = Services::instance().ipcClient()) {
             ipc->sendSetUniform(m_output, m_uniformName, m_newValues.data(),
@@ -479,9 +964,9 @@ void SetUniformCommand::execute()
 
 void SetUniformCommand::undo()
 {
-    if (m_applyFunc) {
-        m_applyFunc(m_output, m_uniformName, m_oldValues.data(),
-                    static_cast<uint32_t>(m_oldValues.size()), m_flags);
+    if (const ApplyFunction fn = m_applyFunc) {
+        fn(m_output, m_uniformName, m_oldValues.data(), static_cast<uint32_t>(m_oldValues.size()),
+           m_flags);
     } else if (!m_oldValues.empty()) {
         if (auto *ipc = Services::instance().ipcClient()) {
             ipc->sendSetUniform(m_output, m_uniformName, m_oldValues.data(),
@@ -501,25 +986,25 @@ QString SetUniformCommand::describe() const
 
 bool SetUniformCommand::mergeWith(const ICommand *other)
 {
-    const auto *otherCmd = dynamic_cast<const SetUniformCommand *>(other);
-    if (!otherCmd || !otherCmd->isValid())
-        return false;
-
-    if (m_output != otherCmd->m_output || m_uniformName != otherCmd->m_uniformName ||
-        m_flags != otherCmd->m_flags || m_newValues.size() != otherCmd->m_newValues.size()) {
+    const auto *otherCmd = fastCastCommand<SetUniformCommand>(other);
+    if (!otherCmd || m_flags != otherCmd->m_flags ||
+        m_newValues.size() != otherCmd->m_newValues.size() ||
+        !qStringsEqualFast(m_uniformName, otherCmd->m_uniformName) ||
+        !qStringsEqualFast(m_output, otherCmd->m_output)) {
         return false;
     }
-
-    auto diff =
-        std::chrono::duration_cast<std::chrono::milliseconds>(otherCmd->m_timestamp - m_timestamp)
-            .count();
 
     // Coalesce continuous slider/color micro-drags within 500 ms into a single undo step
-    if (diff < 0 || diff > 500) {
+    if (!withinCoalesceWindowMs(m_timestamp, otherCmd->m_timestamp) || !otherCmd->isValid()) {
         return false;
     }
 
-    m_newValues = otherCmd->m_newValues;
+    const size_t valCount = m_newValues.size();
+    if (valCount == 1u) {
+        m_newValues.data()[0] = otherCmd->m_newValues.data()[0];
+    } else if (valCount > 1u) {
+        std::memcpy(m_newValues.data(), otherCmd->m_newValues.data(), valCount * sizeof(float));
+    }
     if (otherCmd->m_applyFunc) {
         m_applyFunc = otherCmd->m_applyFunc;
     }
@@ -546,21 +1031,21 @@ bool SetUniformCommand::isValid() const
 SetBezierCurveCommand::SetBezierCurveCommand(QString output, bezier_curve_t oldCurve,
                                              bezier_curve_t newCurve, ApplyFunction applyFunc)
     : m_output(std::move(output)), m_oldCurve(oldCurve), m_newCurve(newCurve),
-      m_applyFunc(std::move(applyFunc)), m_timestamp(std::chrono::steady_clock::now())
+      m_applyFunc(std::move(applyFunc)), m_timestamp(fastMonotonicNow())
 {
 }
 
 void SetBezierCurveCommand::execute()
 {
-    if (m_applyFunc) {
-        m_applyFunc(m_output, m_newCurve);
+    if (const ApplyFunction fn = m_applyFunc) {
+        fn(m_output, m_newCurve);
     }
 }
 
 void SetBezierCurveCommand::undo()
 {
-    if (m_applyFunc) {
-        m_applyFunc(m_output, m_oldCurve);
+    if (const ApplyFunction fn = m_applyFunc) {
+        fn(m_output, m_oldCurve);
     }
 }
 
@@ -574,19 +1059,9 @@ QString SetBezierCurveCommand::describe() const
 
 bool SetBezierCurveCommand::mergeWith(const ICommand *other)
 {
-    const auto *otherCmd = dynamic_cast<const SetBezierCurveCommand *>(other);
-    if (!otherCmd || !otherCmd->isValid())
-        return false;
-
-    if (m_output != otherCmd->m_output) {
-        return false;
-    }
-
-    auto diff =
-        std::chrono::duration_cast<std::chrono::milliseconds>(otherCmd->m_timestamp - m_timestamp)
-            .count();
-
-    if (diff < 0 || diff > 500) {
+    const auto *otherCmd = fastCastCommand<SetBezierCurveCommand>(other);
+    if (!otherCmd || !qStringsEqualFast(m_output, otherCmd->m_output) ||
+        !withinCoalesceWindowMs(m_timestamp, otherCmd->m_timestamp) || !otherCmd->isValid()) {
         return false;
     }
 
@@ -623,18 +1098,19 @@ ApplyWallpaperCommand::ApplyWallpaperCommand(QString output, waywal_img_metadata
 
 void ApplyWallpaperCommand::execute()
 {
-    if (m_applyFunc) {
-        m_applyFunc(m_output, m_newMeta, m_newPath);
+    if (const ApplyFunction fn = m_applyFunc) {
+        fn(m_output, m_newMeta, m_newPath);
     } else if (auto *ipc = Services::instance().ipcClient()) {
-        // Fallback dispatch must preserve target monitor routing and explicit path via WallpaperApplyOptions.
+        // Fallback dispatch must preserve target monitor routing and explicit path via
+        // WallpaperApplyOptions.
         ipc->setWallpaper(wallpaperOptionsFromMetadata(m_output, m_newMeta, m_newPath));
     }
 }
 
 void ApplyWallpaperCommand::undo()
 {
-    if (m_applyFunc) {
-        m_applyFunc(m_output, m_oldMeta, m_oldPath);
+    if (const ApplyFunction fn = m_applyFunc) {
+        fn(m_output, m_oldMeta, m_oldPath);
     } else if (auto *ipc = Services::instance().ipcClient()) {
         ipc->setWallpaper(wallpaperOptionsFromMetadata(m_output, m_oldMeta, m_oldPath));
     }
@@ -675,8 +1151,8 @@ SetPowerPolicyCommand::SetPowerPolicyCommand(uint32_t oldPolicy, uint32_t newPol
 
 void SetPowerPolicyCommand::execute()
 {
-    if (m_applyFunc) {
-        m_applyFunc(m_newPolicy);
+    if (const ApplyFunction fn = m_applyFunc) {
+        fn(m_newPolicy);
     } else if (auto *ipc = Services::instance().ipcClient()) {
         ipc->sendAudioPowerConfig(-1.0f, -1, -1, static_cast<uint8_t>(m_newPolicy));
     }
@@ -684,8 +1160,8 @@ void SetPowerPolicyCommand::execute()
 
 void SetPowerPolicyCommand::undo()
 {
-    if (m_applyFunc) {
-        m_applyFunc(m_oldPolicy);
+    if (const ApplyFunction fn = m_applyFunc) {
+        fn(m_oldPolicy);
     } else if (auto *ipc = Services::instance().ipcClient()) {
         ipc->sendAudioPowerConfig(-1.0f, -1, -1, static_cast<uint8_t>(m_oldPolicy));
     }
@@ -710,10 +1186,7 @@ QString SetPowerPolicyCommand::describe() const
 
 size_t SetPowerPolicyCommand::memoryFootprint() const { return sizeof(*this); }
 
-bool SetPowerPolicyCommand::isValid() const
-{
-    return (m_oldPolicy <= 255u && m_newPolicy <= 255u);
-}
+bool SetPowerPolicyCommand::isValid() const { return (m_oldPolicy <= 255u && m_newPolicy <= 255u); }
 
 /* ========================================================================= */
 /* Shader Graph, 3D Camera & Puppet Physics Commands                         */
@@ -726,15 +1199,15 @@ AddNodeCommand::AddNodeCommand(waywal_graph_node_t node, MutateFn mutateFn)
 
 void AddNodeCommand::execute()
 {
-    if (m_mutateFn) {
-        m_mutateFn(m_node, true);
+    if (const MutateFn fn = m_mutateFn) {
+        fn(m_node, true);
     }
 }
 
 void AddNodeCommand::undo()
 {
-    if (m_mutateFn) {
-        m_mutateFn(m_node, false);
+    if (const MutateFn fn = m_mutateFn) {
+        fn(m_node, false);
     }
 }
 
@@ -756,15 +1229,15 @@ RemoveNodeCommand::RemoveNodeCommand(waywal_graph_node_t removedNode,
 
 void RemoveNodeCommand::execute()
 {
-    if (m_restoreFn) {
-        m_restoreFn(m_removedNode, m_detachedEdges, false);
+    if (const RestoreFn fn = m_restoreFn) {
+        fn(m_removedNode, m_detachedEdges, false);
     }
 }
 
 void RemoveNodeCommand::undo()
 {
-    if (m_restoreFn) {
-        m_restoreFn(m_removedNode, m_detachedEdges, true);
+    if (const RestoreFn fn = m_restoreFn) {
+        fn(m_removedNode, m_detachedEdges, true);
     }
 }
 
@@ -780,22 +1253,21 @@ size_t RemoveNodeCommand::memoryFootprint() const
 }
 
 MoveNodesCommand::MoveNodesCommand(std::vector<NodeMoveDelta> deltas, ApplyMoveFn applyFn)
-    : m_deltas(std::move(deltas)), m_applyFn(std::move(applyFn)),
-      m_timestamp(std::chrono::steady_clock::now())
+    : m_deltas(std::move(deltas)), m_applyFn(std::move(applyFn)), m_timestamp(fastMonotonicNow())
 {
 }
 
 void MoveNodesCommand::execute()
 {
-    if (m_applyFn) {
-        m_applyFn(m_deltas, true);
+    if (const ApplyMoveFn fn = m_applyFn) {
+        fn(m_deltas, true);
     }
 }
 
 void MoveNodesCommand::undo()
 {
-    if (m_applyFn) {
-        m_applyFn(m_deltas, false);
+    if (const ApplyMoveFn fn = m_applyFn) {
+        fn(m_deltas, false);
     }
 }
 
@@ -806,19 +1278,9 @@ QString MoveNodesCommand::describe() const
 
 bool MoveNodesCommand::mergeWith(const ICommand *other)
 {
-    const auto *otherCmd = dynamic_cast<const MoveNodesCommand *>(other);
-    if (!otherCmd || !otherCmd->isValid()) {
-        return false;
-    }
-
-    auto diff =
-        std::chrono::duration_cast<std::chrono::milliseconds>(otherCmd->m_timestamp - m_timestamp)
-            .count();
-    if (diff < 0 || diff > 500) {
-        return false;
-    }
-
-    if (m_deltas.size() != otherCmd->m_deltas.size()) {
+    const auto *otherCmd = fastCastCommand<MoveNodesCommand>(other);
+    if (!otherCmd || m_deltas.size() != otherCmd->m_deltas.size() ||
+        !withinCoalesceWindowMs(m_timestamp, otherCmd->m_timestamp) || !otherCmd->isValid()) {
         return false;
     }
 
@@ -865,20 +1327,20 @@ ConnectWireCommand::ConnectWireCommand(waywal_graph_edge_t edge, WireFn wireFn,
 
 void ConnectWireCommand::execute()
 {
-    if (m_wireFn) {
+    if (const WireFn fn = m_wireFn) {
         if (m_replacedEdge.has_value()) {
-            m_wireFn(*m_replacedEdge, false);
+            fn(*m_replacedEdge, false);
         }
-        m_wireFn(m_edge, true);
+        fn(m_edge, true);
     }
 }
 
 void ConnectWireCommand::undo()
 {
-    if (m_wireFn) {
-        m_wireFn(m_edge, false);
+    if (const WireFn fn = m_wireFn) {
+        fn(m_edge, false);
         if (m_replacedEdge.has_value()) {
-            m_wireFn(*m_replacedEdge, true);
+            fn(*m_replacedEdge, true);
         }
     }
 }
@@ -898,15 +1360,15 @@ DisconnectWireCommand::DisconnectWireCommand(waywal_graph_edge_t edge, WireFn wi
 
 void DisconnectWireCommand::execute()
 {
-    if (m_wireFn) {
-        m_wireFn(m_edge, false);
+    if (const WireFn fn = m_wireFn) {
+        fn(m_edge, false);
     }
 }
 
 void DisconnectWireCommand::undo()
 {
-    if (m_wireFn) {
-        m_wireFn(m_edge, true);
+    if (const WireFn fn = m_wireFn) {
+        fn(m_edge, true);
     }
 }
 
@@ -922,21 +1384,21 @@ SetNodeConstantCommand::SetNodeConstantCommand(uint32_t nodeId, QString nodeTitl
                                                std::array<float, 4> oldVal,
                                                std::array<float, 4> newVal, ApplyConstFn applyFn)
     : m_nodeId(nodeId), m_nodeTitle(std::move(nodeTitle)), m_oldVal(oldVal), m_newVal(newVal),
-      m_applyFn(std::move(applyFn)), m_timestamp(std::chrono::steady_clock::now())
+      m_applyFn(std::move(applyFn)), m_timestamp(fastMonotonicNow())
 {
 }
 
 void SetNodeConstantCommand::execute()
 {
-    if (m_applyFn) {
-        m_applyFn(m_nodeId, m_newVal);
+    if (const ApplyConstFn fn = m_applyFn) {
+        fn(m_nodeId, m_newVal);
     }
 }
 
 void SetNodeConstantCommand::undo()
 {
-    if (m_applyFn) {
-        m_applyFn(m_nodeId, m_oldVal);
+    if (const ApplyConstFn fn = m_applyFn) {
+        fn(m_nodeId, m_oldVal);
     }
 }
 
@@ -947,15 +1409,9 @@ QString SetNodeConstantCommand::describe() const
 
 bool SetNodeConstantCommand::mergeWith(const ICommand *other)
 {
-    const auto *otherCmd = dynamic_cast<const SetNodeConstantCommand *>(other);
-    if (!otherCmd || m_nodeId != otherCmd->m_nodeId || !otherCmd->isValid()) {
-        return false;
-    }
-
-    auto diff =
-        std::chrono::duration_cast<std::chrono::milliseconds>(otherCmd->m_timestamp - m_timestamp)
-            .count();
-    if (diff < 0 || diff > 500) {
+    const auto *otherCmd = fastCastCommand<SetNodeConstantCommand>(other);
+    if (!otherCmd || m_nodeId != otherCmd->m_nodeId ||
+        !withinCoalesceWindowMs(m_timestamp, otherCmd->m_timestamp) || !otherCmd->isValid()) {
         return false;
     }
 
@@ -981,22 +1437,21 @@ SetCamera3DCommand::SetCamera3DCommand(QString output, we_camera3d_t oldCam, we_
                                        we_lighting_uniforms_t oldLights,
                                        we_lighting_uniforms_t newLights, ApplyCamFn applyFn)
     : m_output(std::move(output)), m_oldCam(oldCam), m_newCam(newCam), m_oldLights(oldLights),
-      m_newLights(newLights), m_applyFn(std::move(applyFn)),
-      m_timestamp(std::chrono::steady_clock::now())
+      m_newLights(newLights), m_applyFn(std::move(applyFn)), m_timestamp(fastMonotonicNow())
 {
 }
 
 void SetCamera3DCommand::execute()
 {
-    if (m_applyFn) {
-        m_applyFn(m_output, m_newCam, m_newLights);
+    if (const ApplyCamFn fn = m_applyFn) {
+        fn(m_output, m_newCam, m_newLights);
     }
 }
 
 void SetCamera3DCommand::undo()
 {
-    if (m_applyFn) {
-        m_applyFn(m_output, m_oldCam, m_oldLights);
+    if (const ApplyCamFn fn = m_applyFn) {
+        fn(m_output, m_oldCam, m_oldLights);
     }
 }
 
@@ -1010,15 +1465,9 @@ QString SetCamera3DCommand::describe() const
 
 bool SetCamera3DCommand::mergeWith(const ICommand *other)
 {
-    const auto *otherCmd = dynamic_cast<const SetCamera3DCommand *>(other);
-    if (!otherCmd || m_output != otherCmd->m_output) {
-        return false;
-    }
-
-    auto diff =
-        std::chrono::duration_cast<std::chrono::milliseconds>(otherCmd->m_timestamp - m_timestamp)
-            .count();
-    if (diff < 0 || diff > 500) {
+    const auto *otherCmd = fastCastCommand<SetCamera3DCommand>(other);
+    if (!otherCmd || !qStringsEqualFast(m_output, otherCmd->m_output) ||
+        !withinCoalesceWindowMs(m_timestamp, otherCmd->m_timestamp)) {
         return false;
     }
 
@@ -1044,22 +1493,21 @@ SetPhysicsSpringCommand::SetPhysicsSpringCommand(QString output, int32_t objectI
                                                  we_cursor_force_t newCursor, ApplyPhysFn applyFn)
     : m_output(std::move(output)), m_objectId(objectId), m_boneIndex(boneIndex), m_oldCfg(oldCfg),
       m_newCfg(newCfg), m_oldWind(oldWind), m_newWind(newWind), m_oldCursor(oldCursor),
-      m_newCursor(newCursor), m_applyFn(std::move(applyFn)),
-      m_timestamp(std::chrono::steady_clock::now())
+      m_newCursor(newCursor), m_applyFn(std::move(applyFn)), m_timestamp(fastMonotonicNow())
 {
 }
 
 void SetPhysicsSpringCommand::execute()
 {
-    if (m_applyFn) {
-        m_applyFn(m_output, m_objectId, m_boneIndex, m_newCfg, m_newWind, m_newCursor);
+    if (const ApplyPhysFn fn = m_applyFn) {
+        fn(m_output, m_objectId, m_boneIndex, m_newCfg, m_newWind, m_newCursor);
     }
 }
 
 void SetPhysicsSpringCommand::undo()
 {
-    if (m_applyFn) {
-        m_applyFn(m_output, m_objectId, m_boneIndex, m_oldCfg, m_oldWind, m_oldCursor);
+    if (const ApplyPhysFn fn = m_applyFn) {
+        fn(m_output, m_objectId, m_boneIndex, m_oldCfg, m_oldWind, m_oldCursor);
     }
 }
 
@@ -1073,16 +1521,10 @@ QString SetPhysicsSpringCommand::describe() const
 
 bool SetPhysicsSpringCommand::mergeWith(const ICommand *other)
 {
-    const auto *otherCmd = dynamic_cast<const SetPhysicsSpringCommand *>(other);
-    if (!otherCmd || m_output != otherCmd->m_output || m_objectId != otherCmd->m_objectId ||
-        m_boneIndex != otherCmd->m_boneIndex) {
-        return false;
-    }
-
-    auto diff =
-        std::chrono::duration_cast<std::chrono::milliseconds>(otherCmd->m_timestamp - m_timestamp)
-            .count();
-    if (diff < 0 || diff > 500) {
+    const auto *otherCmd = fastCastCommand<SetPhysicsSpringCommand>(other);
+    if (!otherCmd || !qStringsEqualFast(m_output, otherCmd->m_output) ||
+        m_objectId != otherCmd->m_objectId || m_boneIndex != otherCmd->m_boneIndex ||
+        !withinCoalesceWindowMs(m_timestamp, otherCmd->m_timestamp)) {
         return false;
     }
 
