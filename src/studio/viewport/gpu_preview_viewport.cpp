@@ -495,15 +495,23 @@ void zeroFillTexture2D(GLuint tex, int width, int height, bool isHalfFloat)
 #ifdef GL_UNPACK_ROW_LENGTH
     gl->glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 #endif
-    const size_t texels = static_cast<size_t>(width) * static_cast<size_t>(height);
+    // Upload in bounded row strips so 4K/8K RGBA16F FBO init avoids 66-264 MiB transient buffers.
+    const int stripRows = std::min(height, 64);
+    const size_t stripTexels = static_cast<size_t>(width) * static_cast<size_t>(stripRows);
     if (isHalfFloat) {
-        std::vector<uint16_t> zeroBuf(texels * 4u, 0u);
-        gl->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_HALF_FLOAT,
-                            zeroBuf.data());
+        std::vector<uint16_t> zeroBuf(stripTexels * 4u, 0u);
+        for (int y = 0; y < height; y += stripRows) {
+            const int rows = std::min(stripRows, height - y);
+            gl->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, width, rows, GL_RGBA, GL_HALF_FLOAT,
+                                zeroBuf.data());
+        }
     } else {
-        std::vector<uint8_t> zeroBuf(texels * 4u, 0u);
-        gl->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE,
-                            zeroBuf.data());
+        std::vector<uint8_t> zeroBuf(stripTexels * 4u, 0u);
+        for (int y = 0; y < height; y += stripRows) {
+            const int rows = std::min(stripRows, height - y);
+            gl->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, width, rows, GL_RGBA, GL_UNSIGNED_BYTE,
+                                zeroBuf.data());
+        }
     }
     gl->glBindTexture(GL_TEXTURE_2D, 0);
 }
@@ -523,6 +531,680 @@ void zeroFillTexture2D(GLuint tex, int width, int height, bool isHalfFloat)
     }
     outStride = static_cast<int>(stride);
     return true;
+}
+
+struct ProgramUniformCache {
+    GLuint programId{0};
+    GLint iResolution{-1};
+    GLint iTime{-1};
+    GLint iTimeDelta{-1};
+    GLint iFrame{-1};
+    GLint iMouse{-1};
+    GLint iDate{-1};
+    GLint uTime{-1};
+    GLint uResolution{-1};
+    GLint uPointer{-1};
+    GLint uAudioBands{-1};
+    GLint uMvp{-1};
+    std::array<GLint, 5> passSamplers{-1, -1, -1, -1, -1};
+    std::unordered_map<std::string, GLint> customUniforms{};
+
+    void ensureResolved(QOpenGLShaderProgram &prog)
+    {
+        const GLuint pid = prog.programId();
+        if (programId == pid && pid != 0u) {
+            return;
+        }
+        programId = pid;
+        iResolution = prog.uniformLocation("iResolution");
+        iTime = prog.uniformLocation("iTime");
+        iTimeDelta = prog.uniformLocation("iTimeDelta");
+        iFrame = prog.uniformLocation("iFrame");
+        iMouse = prog.uniformLocation("iMouse");
+        iDate = prog.uniformLocation("iDate");
+        uTime = prog.uniformLocation("u_Time");
+        uResolution = prog.uniformLocation("u_Resolution");
+        uPointer = prog.uniformLocation("u_Pointer");
+        uAudioBands = prog.uniformLocation("u_AudioBands");
+        uMvp = prog.uniformLocation("u_mvp");
+        static constexpr const char *kPassSamplerNames[5] = {
+            "u_BufferA", "u_BufferB", "u_BufferC", "u_BufferD", "u_DepthMap",
+        };
+        for (size_t i = 0; i < 5u; ++i) {
+            passSamplers[i] = prog.uniformLocation(kPassSamplerNames[i]);
+        }
+        customUniforms.clear();
+    }
+
+    [[nodiscard]] GLint resolveCustom(QOpenGLShaderProgram &prog, const std::string &name)
+    {
+        auto it = customUniforms.find(name);
+        if (it != customUniforms.end()) {
+            return it->second;
+        }
+        const GLint loc = prog.uniformLocation(name.c_str());
+        customUniforms.emplace(name, loc);
+        return loc;
+    }
+};
+
+struct ExtraRendererState {
+    bool computeProcsResolved{false};
+    GlTexStorage2DProc texStorage2D{nullptr};
+    GlBindImageTextureProc bindImageTex{nullptr};
+    GlDispatchComputeProc dispatchCompute{nullptr};
+    GlMemoryBarrierProc memoryBarrier{nullptr};
+
+    GLuint blitProgramId{0};
+    GLint blitUMvp{-1};
+    GLint blitUTexture{-1};
+    GLint blitUFlipY{-1};
+    GLint blitUIsBgr{-1};
+
+    GLuint gizmoProgramId{0};
+    GLint gizmoUMvp{-1};
+
+    std::unordered_map<const QOpenGLShaderProgram *, ProgramUniformCache> programUniforms{};
+
+    QOpenGLVertexArrayObject heatmapVao{};
+    QOpenGLBuffer heatmapVbo{QOpenGLBuffer::VertexBuffer};
+    size_t heatmapVboCapBytes{0};
+    size_t cachedHeatmapVertCount{0};
+    uint64_t cachedHeatmapGen{0};
+    uint32_t cachedHeatCW{0};
+    uint32_t cachedHeatCH{0};
+    uint32_t cachedHeatBone{0};
+    float cachedHeatOpacity{-1.0f};
+    we_heatmap_palette_t cachedHeatPalette{WE_HEATMAP_PALETTE_TURBO};
+    const void *cachedHeatVertsPtr{nullptr};
+    size_t cachedHeatVertsCount{0};
+    const void *cachedHeatIndicesPtr{nullptr};
+    size_t cachedHeatIndicesCount{0};
+
+    QOpenGLVertexArrayObject wireframeVao{};
+    QOpenGLBuffer wireframeVbo{QOpenGLBuffer::VertexBuffer};
+    size_t wireframeVboCapBytes{0};
+    size_t cachedWireframeVertCount{0};
+    uint64_t cachedWireframeGen{0};
+    uint32_t cachedWireCW{0};
+    uint32_t cachedWireCH{0};
+    bool cachedWireHighlight{false};
+    const void *cachedWireVertsPtr{nullptr};
+    size_t cachedWireVertsCount{0};
+    const void *cachedWireIndicesPtr{nullptr};
+    size_t cachedWireIndicesCount{0};
+
+    QOpenGLVertexArrayObject contourVao{};
+    QOpenGLBuffer contourVbo{QOpenGLBuffer::VertexBuffer};
+    size_t contourVboCapBytes{0};
+    size_t cachedContourVertCount{0};
+    uint64_t cachedContourGen{0};
+    uint32_t cachedContourCH{0};
+
+    QOpenGLVertexArrayObject dynVao2{};
+    QOpenGLBuffer dynVbo2{QOpenGLBuffer::VertexBuffer};
+    size_t dynVbo2CapBytes{0};
+    uint8_t dynPingPongIdx{0};
+    uint8_t dynSmallFrames{0};
+
+    void destroyGl(bool glAlive) noexcept
+    {
+        if (glAlive) {
+            heatmapVao.destroy();
+            heatmapVbo.destroy();
+            wireframeVao.destroy();
+            wireframeVbo.destroy();
+            contourVao.destroy();
+            contourVbo.destroy();
+            dynVao2.destroy();
+            dynVbo2.destroy();
+        }
+        computeProcsResolved = false;
+        texStorage2D = nullptr;
+        bindImageTex = nullptr;
+        dispatchCompute = nullptr;
+        memoryBarrier = nullptr;
+        blitProgramId = 0;
+        gizmoProgramId = 0;
+        programUniforms.clear();
+        heatmapVboCapBytes = 0;
+        cachedHeatmapVertCount = 0;
+        cachedHeatmapGen = 0;
+        wireframeVboCapBytes = 0;
+        cachedWireframeVertCount = 0;
+        cachedWireframeGen = 0;
+        contourVboCapBytes = 0;
+        cachedContourVertCount = 0;
+        cachedContourGen = 0;
+        dynVbo2CapBytes = 0;
+        dynPingPongIdx = 0;
+        dynSmallFrames = 0;
+    }
+};
+
+std::unordered_map<const GlSceneRenderer *, std::unique_ptr<ExtraRendererState>> &
+extraRendererStates()
+{
+    static std::unordered_map<const GlSceneRenderer *, std::unique_ptr<ExtraRendererState>> s_map;
+    return s_map;
+}
+
+ExtraRendererState &getExtraRendererState(const GlSceneRenderer *r)
+{
+    auto &map = extraRendererStates();
+    auto &ptr = map[r];
+    if (!ptr) {
+        ptr = std::make_unique<ExtraRendererState>();
+    }
+    return *ptr;
+}
+
+struct ExtraViewportState {
+    QString sourceImagePath{};
+    uint64_t wireframeGen{1};
+    uint64_t heatmapGen{1};
+    uint64_t contourGen{1};
+    QSize lastLayoutSize{};
+
+    PreviewMode cachedStatusMode{PreviewMode::OfflineEmpty};
+    uint32_t cachedStatusCW{0};
+    uint32_t cachedStatusCH{0};
+    int cachedStatusZoomPct{-1};
+    int cachedStatusFps{-1};
+    int cachedStatusWidgetW{-1};
+    QString cachedTelemetryStr{};
+    float cachedHudW{80.0f};
+};
+
+std::unordered_map<const GpuPreviewViewport *, ExtraViewportState> &extraViewportStates()
+{
+    static std::unordered_map<const GpuPreviewViewport *, ExtraViewportState> s_map;
+    return s_map;
+}
+
+struct WeightBridgeExtraState {
+    static constexpr size_t kGridDim = 64u;
+    std::vector<uint64_t> dirtyBits{};
+    std::vector<uint64_t> preBlockBits{};
+    bool gridValid{false};
+    const void *gridVertsPtr{nullptr};
+    size_t gridVertsCount{0};
+    float sampleFirstX{0.0f};
+    float sampleFirstY{0.0f};
+    float sampleLastX{0.0f};
+    float sampleLastY{0.0f};
+    float minX{0.0f};
+    float minY{0.0f};
+    float invCellW{1.0f};
+    float invCellH{1.0f};
+    std::array<uint32_t, kGridDim * kGridDim + 1u> cellOffsets{};
+    std::vector<uint32_t> cellVerts{};
+    std::vector<uint32_t> dabCandidates{};
+
+    void clearStrokeBits()
+    {
+        dirtyBits.clear();
+        preBlockBits.clear();
+    }
+
+    void invalidateGrid()
+    {
+        gridValid = false;
+        gridVertsPtr = nullptr;
+        gridVertsCount = 0;
+        cellVerts.clear();
+    }
+};
+
+std::unordered_map<const WeightPaintBrushBridge *, WeightBridgeExtraState> &weightBridgeStates()
+{
+    static std::unordered_map<const WeightPaintBrushBridge *, WeightBridgeExtraState> s_map;
+    return s_map;
+}
+
+void ensureWeightGrid(WeightBridgeExtraState &ws, const std::vector<we_mdl_vertex_t> &verts)
+{
+    const size_t n = verts.size();
+    if (n < 512u) {
+        ws.invalidateGrid();
+        return;
+    }
+    const float fX = verts.front().pos[0];
+    const float fY = verts.front().pos[1];
+    const float lX = verts.back().pos[0];
+    const float lY = verts.back().pos[1];
+    if (ws.gridValid && ws.gridVertsPtr == verts.data() && ws.gridVertsCount == n &&
+        ws.sampleFirstX == fX && ws.sampleFirstY == fY && ws.sampleLastX == lX &&
+        ws.sampleLastY == lY) {
+        return;
+    }
+
+    float minX = std::numeric_limits<float>::max();
+    float minY = std::numeric_limits<float>::max();
+    float maxX = std::numeric_limits<float>::lowest();
+    float maxY = std::numeric_limits<float>::lowest();
+    size_t finiteCount = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const float x = verts[i].pos[0];
+        const float y = verts[i].pos[1];
+        if (!std::isfinite(x) || !std::isfinite(y)) {
+            continue;
+        }
+        minX = std::min(minX, x);
+        minY = std::min(minY, y);
+        maxX = std::max(maxX, x);
+        maxY = std::max(maxY, y);
+        ++finiteCount;
+    }
+
+    ws.gridVertsPtr = verts.data();
+    ws.gridVertsCount = n;
+    ws.sampleFirstX = fX;
+    ws.sampleFirstY = fY;
+    ws.sampleLastX = lX;
+    ws.sampleLastY = lY;
+
+    if (finiteCount == 0u) {
+        ws.minX = 0.0f;
+        ws.minY = 0.0f;
+        ws.invCellW = 1.0f;
+        ws.invCellH = 1.0f;
+        ws.cellOffsets.fill(0u);
+        ws.cellVerts.clear();
+        ws.gridValid = true;
+        return;
+    }
+
+    constexpr size_t G = WeightBridgeExtraState::kGridDim;
+    const float spanX = std::max(1.0f, maxX - minX);
+    const float spanY = std::max(1.0f, maxY - minY);
+    ws.minX = minX;
+    ws.minY = minY;
+    ws.invCellW = static_cast<float>(G) / spanX;
+    ws.invCellH = static_cast<float>(G) / spanY;
+
+    std::array<uint32_t, G * G> counts{};
+    for (size_t i = 0; i < n; ++i) {
+        const float x = verts[i].pos[0];
+        const float y = verts[i].pos[1];
+        if (!std::isfinite(x) || !std::isfinite(y)) {
+            continue;
+        }
+        const size_t cx =
+            std::min(G - 1u, static_cast<size_t>(std::max(0.0f, (x - ws.minX) * ws.invCellW)));
+        const size_t cy =
+            std::min(G - 1u, static_cast<size_t>(std::max(0.0f, (y - ws.minY) * ws.invCellH)));
+        ++counts[cy * G + cx];
+    }
+
+    ws.cellOffsets[0] = 0u;
+    for (size_t c = 0; c < G * G; ++c) {
+        ws.cellOffsets[c + 1u] = ws.cellOffsets[c] + counts[c];
+    }
+    ws.cellVerts.resize(ws.cellOffsets[G * G]);
+    std::array<uint32_t, G * G> writeCursor = {};
+    std::memcpy(writeCursor.data(), ws.cellOffsets.data(), sizeof(writeCursor));
+
+    for (size_t i = 0; i < n; ++i) {
+        const float x = verts[i].pos[0];
+        const float y = verts[i].pos[1];
+        if (!std::isfinite(x) || !std::isfinite(y)) {
+            continue;
+        }
+        const size_t cx =
+            std::min(G - 1u, static_cast<size_t>(std::max(0.0f, (x - ws.minX) * ws.invCellW)));
+        const size_t cy =
+            std::min(G - 1u, static_cast<size_t>(std::max(0.0f, (y - ws.minY) * ws.invCellH)));
+        ws.cellVerts[writeCursor[cy * G + cx]++] = static_cast<uint32_t>(i);
+    }
+    ws.gridValid = true;
+}
+
+void buildWireframeLinesLinear(const GizmoMeshWireframeData &mesh, uint32_t cw, uint32_t ch,
+                               std::vector<GizmoVertex> &outLineVerts)
+{
+    outLineVerts.clear();
+    if (!mesh.visible || mesh.vertices.empty() || mesh.indices.size() < 3u) {
+        return;
+    }
+
+    const size_t vertCount = mesh.vertices.size();
+    const size_t triCount = mesh.indices.size() / 3u;
+    const size_t effectiveVertCap = std::min<size_t>(vertCount, 65536u);
+
+    std::vector<uint32_t> counts(effectiveVertCap, 0u);
+    for (size_t t = 0; t < triCount; ++t) {
+        const uint16_t i0 = mesh.indices[t * 3u + 0u];
+        const uint16_t i1 = mesh.indices[t * 3u + 1u];
+        const uint16_t i2 = mesh.indices[t * 3u + 2u];
+        if (i0 >= vertCount || i1 >= vertCount || i2 >= vertCount) {
+            continue;
+        }
+        ++counts[std::min(i0, i1)];
+        ++counts[std::min(i1, i2)];
+        ++counts[std::min(i2, i0)];
+    }
+
+    std::vector<uint32_t> offsets(effectiveVertCap + 1u, 0u);
+    for (size_t v = 0; v < effectiveVertCap; ++v) {
+        offsets[v + 1u] = offsets[v] + counts[v];
+    }
+    const uint32_t totalHalfEdges = offsets[effectiveVertCap];
+    if (totalHalfEdges == 0u) {
+        return;
+    }
+
+    std::vector<uint16_t> edgeTargets(totalHalfEdges);
+    std::vector<uint32_t> writeCursor = offsets;
+    for (size_t t = 0; t < triCount; ++t) {
+        const uint16_t i0 = mesh.indices[t * 3u + 0u];
+        const uint16_t i1 = mesh.indices[t * 3u + 1u];
+        const uint16_t i2 = mesh.indices[t * 3u + 2u];
+        if (i0 >= vertCount || i1 >= vertCount || i2 >= vertCount) {
+            continue;
+        }
+        auto pushEdge = [&](uint16_t u, uint16_t v) {
+            const uint16_t a = std::min(u, v);
+            const uint16_t b = std::max(u, v);
+            edgeTargets[writeCursor[a]++] = b;
+        };
+        pushEdge(i0, i1);
+        pushEdge(i1, i2);
+        pushEdge(i2, i0);
+    }
+
+    std::vector<uint32_t> seenStamp(effectiveVertCap, 0u);
+    std::vector<uint32_t> seenCount(effectiveVertCap, 0u);
+    std::vector<uint16_t> uniqueNeighbors;
+    uniqueNeighbors.reserve(16u);
+
+    const float halfW = 0.5f * static_cast<float>(cw);
+    const float halfH = 0.5f * static_cast<float>(ch);
+    outLineVerts.reserve(std::min<size_t>(static_cast<size_t>(totalHalfEdges) * 2u,
+                                          ViewportGizmoOverlay::kMaxDynamicVertices));
+
+    for (size_t a = 0; a < effectiveVertCap; ++a) {
+        const uint32_t start = offsets[a];
+        const uint32_t end = offsets[a + 1u];
+        if (start == end) {
+            continue;
+        }
+        const uint32_t stamp = static_cast<uint32_t>(a + 1u);
+        uniqueNeighbors.clear();
+        for (uint32_t p = start; p < end; ++p) {
+            const uint16_t b = edgeTargets[p];
+            if (seenStamp[b] != stamp) {
+                seenStamp[b] = stamp;
+                seenCount[b] = 1u;
+                uniqueNeighbors.push_back(b);
+            } else {
+                ++seenCount[b];
+            }
+        }
+
+        const auto &va = mesh.vertices[a];
+        const float ax = va.pos[0] + halfW;
+        const float ay = va.pos[1] + halfH;
+        const float az = va.pos[2];
+        if (!std::isfinite(ax) || !std::isfinite(ay) || !std::isfinite(az)) {
+            continue;
+        }
+        for (const uint16_t b : uniqueNeighbors) {
+            if (outLineVerts.size() + 2u > ViewportGizmoOverlay::kMaxDynamicVertices) {
+                return;
+            }
+            const auto &vb = mesh.vertices[b];
+            const float bx = vb.pos[0] + halfW;
+            const float by = vb.pos[1] + halfH;
+            const float bz = vb.pos[2];
+            if (!std::isfinite(bx) || !std::isfinite(by) || !std::isfinite(bz)) {
+                continue;
+            }
+            const bool isBoundary = (seenCount[b] == 1u) && mesh.highlightContourEdges;
+            const float r = isBoundary ? 0.220f : 0.580f;
+            const float g = isBoundary ? 0.741f : 0.639f;
+            const float bl = isBoundary ? 0.973f : 0.722f;
+            const float al = isBoundary ? 0.85f : 0.45f;
+            outLineVerts.push_back({ax, ay, az, r, g, bl, al});
+            outLineVerts.push_back({bx, by, bz, r, g, bl, al});
+        }
+    }
+}
+
+void buildHeatmapTrianglesFast(const GizmoMeshWireframeData &mesh, uint32_t activeBoneIdx,
+                               float opacity, we_heatmap_palette_t palette, uint32_t cw,
+                               uint32_t ch, std::vector<GizmoVertex> &outTriVerts)
+{
+    outTriVerts.clear();
+    if (mesh.vertices.empty() || mesh.indices.size() < 3u) {
+        return;
+    }
+
+    const size_t vertCount = mesh.vertices.size();
+    const size_t triCount = mesh.indices.size() / 3u;
+    const float alpha = std::clamp(opacity, 0.05f, 0.95f);
+    const float halfW = 0.5f * static_cast<float>(cw);
+    const float halfH = 0.5f * static_cast<float>(ch);
+
+    struct CachedVert {
+        GizmoVertex gv;
+        bool finite;
+    };
+    std::vector<CachedVert> cachedVerts(vertCount);
+    for (size_t i = 0; i < vertCount; ++i) {
+        const auto &v = mesh.vertices[i];
+        const float wx = v.pos[0] + halfW;
+        const float wy = v.pos[1] + halfH;
+        const float wz = v.pos[2];
+        const bool ok = std::isfinite(wx) && std::isfinite(wy) && std::isfinite(wz);
+        cachedVerts[i].finite = ok;
+        if (!ok) {
+            continue;
+        }
+        float w = 0.0f;
+        for (int k = 0; k < 4; ++k) {
+            if (v.blend_indices[k] == activeBoneIdx && std::isfinite(v.weight[k])) {
+                w += v.weight[k];
+            }
+        }
+        float r = 0.0f;
+        float g = 0.0f;
+        float b = 0.0f;
+        ViewportGizmoOverlay::evaluateHeatmapColor(palette, std::clamp(w, 0.0f, 1.0f), r, g, b);
+        cachedVerts[i].gv = {wx, wy, wz, r, g, b, alpha};
+    }
+
+    outTriVerts.reserve(std::min<size_t>(triCount * 3u, ViewportGizmoOverlay::kMaxDynamicVertices));
+    for (size_t t = 0; t < triCount; ++t) {
+        if (outTriVerts.size() + 3u > ViewportGizmoOverlay::kMaxDynamicVertices) {
+            break;
+        }
+        const uint16_t i0 = mesh.indices[t * 3u + 0u];
+        const uint16_t i1 = mesh.indices[t * 3u + 1u];
+        const uint16_t i2 = mesh.indices[t * 3u + 2u];
+        if (i0 >= vertCount || i1 >= vertCount || i2 >= vertCount) {
+            continue;
+        }
+        const auto &c0 = cachedVerts[i0];
+        const auto &c1 = cachedVerts[i1];
+        const auto &c2 = cachedVerts[i2];
+        if (!c0.finite || !c1.finite || !c2.finite) {
+            continue;
+        }
+        outTriVerts.push_back(c0.gv);
+        outTriVerts.push_back(c1.gv);
+        outTriVerts.push_back(c2.gv);
+    }
+}
+
+void appendContourPinDiamonds(const GizmoMeshWireframeData &mesh, uint32_t ch,
+                              std::vector<GizmoVertex> &out)
+{
+    auto pushLine = [&](float ax, float ay, float bx, float by, float r, float g, float b,
+                        float a) {
+        if (out.size() + 2u > ViewportGizmoOverlay::kMaxDynamicVertices) {
+            return;
+        }
+        out.push_back({ax, ay, 0.0f, r, g, b, a});
+        out.push_back({bx, by, 0.0f, r, g, b, a});
+    };
+    const double chD = static_cast<double>(std::max<uint32_t>(1u, ch));
+    for (size_t i = 0; i < mesh.pins.size(); ++i) {
+        if (out.size() + 8u > ViewportGizmoOverlay::kMaxDynamicVertices) {
+            break;
+        }
+        const auto &pin = mesh.pins[i];
+        const float px = static_cast<float>(pin.px);
+        const float py = static_cast<float>(chD - pin.py);
+        if (!std::isfinite(px) || !std::isfinite(py)) {
+            continue;
+        }
+        const bool sel = (static_cast<int32_t>(i) == mesh.selectedPinIndex);
+        const float pr = sel ? 10.0f : 7.0f;
+        const float r = sel ? 0.220f : 0.976f;
+        const float g = sel ? 0.741f : 0.886f;
+        const float b = sel ? 0.973f : 0.686f;
+        const float a = sel ? 0.98f : 0.90f;
+        pushLine(px, py + pr, px + pr, py, r, g, b, a);
+        pushLine(px + pr, py, px, py - pr, r, g, b, a);
+        pushLine(px, py - pr, px - pr, py, r, g, b, a);
+        pushLine(px - pr, py, px, py + pr, r, g, b, a);
+    }
+}
+
+void setupGizmoVaoAndBuffer(QOpenGLFunctions *gl, QOpenGLVertexArrayObject &vao, QOpenGLBuffer &vbo,
+                            size_t &capBytes, size_t initialBytes)
+{
+    if (!vao.isCreated()) {
+        vao.create();
+    }
+    vao.bind();
+    if (!vbo.isCreated()) {
+        vbo.create();
+        vbo.setUsagePattern(QOpenGLBuffer::DynamicDraw);
+    }
+    vbo.bind();
+    if (capBytes < initialBytes) {
+        vbo.allocate(static_cast<int>(initialBytes));
+        capBytes = initialBytes;
+    }
+    gl->glEnableVertexAttribArray(0);
+    gl->glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(GizmoVertex),
+                              reinterpret_cast<void *>(offsetof(GizmoVertex, x)));
+    gl->glEnableVertexAttribArray(1);
+    gl->glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(GizmoVertex),
+                              reinterpret_cast<void *>(offsetof(GizmoVertex, r)));
+    vbo.release();
+    vao.release();
+}
+
+void uploadStaticGizmoBuffer(QOpenGLFunctions *gl, QOpenGLVertexArrayObject &vao,
+                             QOpenGLBuffer &vbo, size_t &capBytes,
+                             const std::vector<GizmoVertex> &verts)
+{
+    const size_t maxBytes = ViewportGizmoOverlay::kMaxDynamicVertices * sizeof(GizmoVertex);
+    const size_t bytes = std::min(verts.size() * sizeof(GizmoVertex), maxBytes);
+    if (bytes == 0u) {
+        if (vbo.isCreated() && capBytes > 65536u) {
+            vbo.bind();
+            gl->glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
+            vbo.release();
+            capBytes = 0u;
+        }
+        return;
+    }
+    if (!vao.isCreated() || !vbo.isCreated()) {
+        setupGizmoVaoAndBuffer(gl, vao, vbo, capBytes, bytes);
+    }
+    vbo.bind();
+    // glBufferData orphans the backing store so in-flight draws from prior frames do not stall.
+    gl->glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(bytes), verts.data(),
+                     GL_DYNAMIC_DRAW);
+    capBytes = bytes;
+    vbo.release();
+}
+
+void shrinkBufferIfOversized(QOpenGLFunctions *gl, QOpenGLBuffer &vbo, size_t &capBytes)
+{
+    if (vbo.isCreated() && capBytes > 65536u) {
+        vbo.bind();
+        gl->glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
+        vbo.release();
+        capBytes = 0u;
+    }
+}
+
+class WireframeVisibilityGuard {
+  public:
+    WireframeVisibilityGuard(ViewportGizmoOverlay &overlay, bool restoreVisible) noexcept
+        : m_overlay(overlay), m_restore(restoreVisible)
+    {
+        if (m_restore) {
+            m_overlay.setMeshWireframeVisible(false);
+        }
+    }
+    ~WireframeVisibilityGuard()
+    {
+        if (m_restore) {
+            m_overlay.setMeshWireframeVisible(true);
+        }
+    }
+    WireframeVisibilityGuard(const WireframeVisibilityGuard &) = delete;
+    WireframeVisibilityGuard &operator=(const WireframeVisibilityGuard &) = delete;
+
+  private:
+    ViewportGizmoOverlay &m_overlay;
+    bool m_restore{false};
+};
+
+[[nodiscard]] QImage decodeStillImageFile(const QString &targetPath)
+{
+    QImage img;
+    if (QFileInfo::exists(targetPath)) {
+        img.load(targetPath);
+        if (img.isNull()) {
+            const std::string stdPath = targetPath.toStdString();
+            uint8_t *rgba = nullptr;
+            uint32_t w = 0;
+            uint32_t h = 0;
+            int rgbaStride = 0;
+            if (image_load_rgba(stdPath.c_str(), &rgba, &w, &h) && rgba &&
+                validateRgbaImageBounds(w, h, rgbaStride)) {
+                img = QImage(
+                    rgba, static_cast<int>(w), static_cast<int>(h), rgbaStride,
+                    QImage::Format_RGBA8888,
+                    [](void *ptr) { image_free(static_cast<uint8_t *>(ptr)); }, rgba);
+                if (img.isNull()) {
+                    image_free(rgba);
+                }
+            } else if (rgba) {
+                image_free(rgba);
+            }
+        }
+    }
+
+    if (img.isNull() && targetPath.startsWith(QLatin1String("/usr/share/wwal/samples/"))) {
+        img = QImage(1280, 720, QImage::Format_RGBA8888);
+        const std::string stdPath = targetPath.toStdString();
+        uint32_t seed = 2166136261u;
+        for (char c : stdPath) {
+            seed ^= static_cast<uint8_t>(c);
+            seed *= 16777619u;
+        }
+        QColor c1(static_cast<int>((seed >> 16) & 0x7F) + 40,
+                  static_cast<int>((seed >> 8) & 0x7F) + 50, static_cast<int>(seed & 0x7F) + 80);
+        QColor c2(static_cast<int>((seed >> 12) & 0x7F) + 20,
+                  static_cast<int>((seed >> 4) & 0x7F) + 30,
+                  static_cast<int>((seed >> 20) & 0x7F) + 60);
+        QPainter p(&img);
+        QLinearGradient grad(0, 0, 1280, 720);
+        grad.setColorAt(0.0, c1.lighter(135));
+        grad.setColorAt(0.5, c2);
+        grad.setColorAt(1.0, c1.darker(165));
+        p.fillRect(img.rect(), grad);
+        p.end();
+    }
+    return img;
 }
 
 } // namespace
@@ -921,6 +1603,14 @@ void GlSceneRenderer::releaseGl(bool hasCurrentContext) noexcept
         m_gizmoVbo.destroy();
     }
 
+    auto &states = extraRendererStates();
+    if (auto it = states.find(this); it != states.end()) {
+        if (it->second) {
+            it->second->destroyGl(glAlive);
+        }
+        states.erase(it);
+    }
+
     m_inProcessImageTex = 0;
     m_neutralPassTex = 0;
     m_computeOutputTex = 0;
@@ -958,17 +1648,43 @@ void GlSceneRenderer::deleteInProcessImageTexture() noexcept
 void GlSceneRenderer::uploadFallbackImageTexture(const QImage &image)
 {
     auto *ctx = QOpenGLContext::currentContext();
-    if (!ctx || image.isNull()) {
-        return;
-    }
-    const QImage formatted = image.convertToFormat(QImage::Format_RGBA8888);
-    if (formatted.isNull()) {
+    if (!ctx || image.isNull() || image.width() <= 0 || image.height() <= 0) {
         return;
     }
     auto *gl = ctx->functions();
+    GLint maxTexSize = 0;
+    gl->glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTexSize);
+    if (maxTexSize > 0 && (image.width() > maxTexSize || image.height() > maxTexSize)) {
+        deleteInProcessImageTexture();
+        return;
+    }
+
+    QImage formatted = (image.format() == QImage::Format_RGBA8888)
+                           ? image
+                           : image.convertToFormat(QImage::Format_RGBA8888);
+    if (formatted.isNull()) {
+        return;
+    }
+
+    const int expectedRowBytes = formatted.width() * 4;
+    int unpackRowLength = 0;
+    if (formatted.bytesPerLine() != expectedRowBytes) {
+#ifdef GL_UNPACK_ROW_LENGTH
+        if (formatted.bytesPerLine() > expectedRowBytes && (formatted.bytesPerLine() % 4) == 0) {
+            unpackRowLength = formatted.bytesPerLine() / 4;
+        } else {
+            formatted = formatted.copy();
+        }
+#else
+        formatted = formatted.copy();
+#endif
+    }
+
+    while (gl->glGetError() != GL_NO_ERROR) {
+    }
     gl->glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
 #ifdef GL_UNPACK_ROW_LENGTH
-    gl->glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    gl->glPixelStorei(GL_UNPACK_ROW_LENGTH, unpackRowLength);
 #endif
     if (m_inProcessImageTex == 0) {
         gl->glGenTextures(1, &m_inProcessImageTex);
@@ -976,6 +1692,18 @@ void GlSceneRenderer::uploadFallbackImageTexture(const QImage &image)
     gl->glBindTexture(GL_TEXTURE_2D, m_inProcessImageTex);
     gl->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, formatted.width(), formatted.height(), 0, GL_RGBA,
                      GL_UNSIGNED_BYTE, formatted.constBits());
+    const GLenum uploadErr = gl->glGetError();
+#ifdef GL_UNPACK_ROW_LENGTH
+    if (unpackRowLength != 0) {
+        gl->glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    }
+#endif
+    if (uploadErr != GL_NO_ERROR) {
+        gl->glBindTexture(GL_TEXTURE_2D, 0);
+        gl->glDeleteTextures(1, &m_inProcessImageTex);
+        m_inProcessImageTex = 0;
+        return;
+    }
     gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1166,7 +1894,7 @@ void GlSceneRenderer::ensureGizmoGlInitialized(QObject *parent)
     }
     m_gizmoVbo.bind();
     m_gizmoVbo.setUsagePattern(QOpenGLBuffer::DynamicDraw);
-    m_gizmoVboCapacityBytes = 4096u * sizeof(GizmoVertex);
+    m_gizmoVboCapacityBytes = 1024u * sizeof(GizmoVertex);
     m_gizmoVbo.allocate(static_cast<int>(m_gizmoVboCapacityBytes));
 
     gl->glEnableVertexAttribArray(0);
@@ -1190,7 +1918,7 @@ void GlSceneRenderer::ensureGizmoVboCapacity(size_t requiredBytes)
     if (clampedReq <= m_gizmoVboCapacityBytes) {
         return;
     }
-    size_t newCap = std::max<size_t>(m_gizmoVboCapacityBytes * 2u, 4096u * sizeof(GizmoVertex));
+    size_t newCap = std::max<size_t>(m_gizmoVboCapacityBytes * 2u, 1024u * sizeof(GizmoVertex));
     while (newCap < clampedReq && newCap < maxBytes) {
         newCap = std::min(newCap * 2u, maxBytes);
     }
@@ -1287,6 +2015,7 @@ bool GlSceneRenderer::compileShader(QObject *parent, const QString &glslSource, 
         }
         m_computeTexWidth = 0;
         m_computeTexHeight = 0;
+        getExtraRendererState(this).programUniforms.clear();
         m_computeShaderProgram = std::move(csProg);
         m_shaderProgram.reset();
         for (auto &bp : m_bufferPassPrograms) {
@@ -1347,6 +2076,7 @@ bool GlSceneRenderer::compileShader(QObject *parent, const QString &glslSource, 
             }
         }
 
+        getExtraRendererState(this).programUniforms.clear();
         m_computeShaderProgram.reset();
         m_bufferPassPrograms = std::move(nextBufferProgs);
         m_shaderProgram = std::move(nextImageProg);
@@ -1390,6 +2120,7 @@ bool GlSceneRenderer::compileShader(QObject *parent, const QString &glslSource, 
         return false;
     }
 
+    getExtraRendererState(this).programUniforms.clear();
     m_computeShaderProgram.reset();
     for (auto &bp : m_bufferPassPrograms) {
         bp.reset();
@@ -1666,6 +2397,10 @@ void WeightPaintBrushBridge::beginStroke()
     m_pendingDabs.clear();
     m_preBlocks.clear();
     m_dirtyVertices.clear();
+    auto &wbMap = weightBridgeStates();
+    if (auto it = wbMap.find(this); it != wbMap.end()) {
+        it->second.clearStrokeBits();
+    }
 }
 
 void WeightPaintBrushBridge::applyDab(ViewportGizmoOverlay &overlay, uint32_t contentW,
@@ -1688,6 +2423,27 @@ void WeightPaintBrushBridge::applyDab(ViewportGizmoOverlay &overlay, uint32_t co
     const float dabLocalY = 0.5f * ch - dab.texelY;
     const float radiusSq = dab.radiusPx * dab.radiusPx;
     const size_t totalVerts = verts.size();
+
+    WeightBridgeExtraState *ws = nullptr;
+    {
+        auto &wbMap = weightBridgeStates();
+        if (auto it = wbMap.find(this); it != wbMap.end()) {
+            ws = &it->second;
+            ensureWeightGrid(*ws, verts);
+        }
+    }
+
+    const size_t dirtyWords = (totalVerts + 63u) >> 6u;
+    const size_t blockCount = (totalVerts + 255u) / 256u;
+    const size_t blockWords = (blockCount + 63u) >> 6u;
+    if (ws) {
+        if (ws->dirtyBits.size() < dirtyWords) {
+            ws->dirtyBits.resize(dirtyWords, 0ull);
+        }
+        if (ws->preBlockBits.size() < blockWords) {
+            ws->preBlockBits.resize(blockWords, 0ull);
+        }
+    }
 
     const uint32_t maxBones =
         std::clamp<uint32_t>(static_cast<uint32_t>(overlay.puppetBones().size()), 1u, 128u);
@@ -1714,12 +2470,63 @@ void WeightPaintBrushBridge::applyDab(ViewportGizmoOverlay &overlay, uint32_t co
     const float rawFalloff = (dab.falloff > 0.0f) ? dab.falloff : m_falloff;
     const float falloffExp = std::clamp(std::isfinite(rawFalloff) ? rawFalloff : 1.5f, 0.25f, 4.0f);
 
+    const bool useGrid = (ws && ws->gridValid);
+    size_t cx0 = 0;
+    size_t cx1 = 0;
+    size_t cy0 = 0;
+    size_t cy1 = 0;
+    if (useGrid) {
+        constexpr size_t G = WeightBridgeExtraState::kGridDim;
+        const float minDabX = dabLocalX - dab.radiusPx;
+        const float maxDabX = dabLocalX + dab.radiusPx;
+        const float minDabY = dabLocalY - dab.radiusPx;
+        const float maxDabY = dabLocalY + dab.radiusPx;
+        if (ws->cellVerts.empty()) {
+            return;
+        }
+        const float fx0 = (minDabX - ws->minX) * ws->invCellW;
+        const float fx1 = (maxDabX - ws->minX) * ws->invCellW;
+        const float fy0 = (minDabY - ws->minY) * ws->invCellH;
+        const float fy1 = (maxDabY - ws->minY) * ws->invCellH;
+        if (fx1 < 0.0f || fy1 < 0.0f || fx0 >= static_cast<float>(G) ||
+            fy0 >= static_cast<float>(G)) {
+            return;
+        }
+        cx0 = static_cast<size_t>(std::max(0.0f, std::floor(fx0)));
+        cx1 = std::min(G - 1u, static_cast<size_t>(std::max(0.0f, std::floor(fx1))));
+        cy0 = static_cast<size_t>(std::max(0.0f, std::floor(fy0)));
+        cy1 = std::min(G - 1u, static_cast<size_t>(std::max(0.0f, std::floor(fy1))));
+    }
+
+    auto forEachSpatialCandidate = [&](auto &&fn) {
+        if (useGrid) {
+            constexpr size_t G = WeightBridgeExtraState::kGridDim;
+            for (size_t cy = cy0; cy <= cy1; ++cy) {
+                for (size_t cx = cx0; cx <= cx1; ++cx) {
+                    const size_t cell = cy * G + cx;
+                    const uint32_t begin = ws->cellOffsets[cell];
+                    const uint32_t end = ws->cellOffsets[cell + 1u];
+                    for (uint32_t p = begin; p < end; ++p) {
+                        fn(static_cast<size_t>(ws->cellVerts[p]));
+                    }
+                }
+            }
+        } else {
+            for (size_t i = 0; i < totalVerts; ++i) {
+                fn(i);
+            }
+        }
+    };
+
     float neighborAvg = 0.0f;
     float neighborW = 0.0f;
     if (dab.op == WE_WEIGHT_OP_SMOOTH) {
-        for (size_t i = 0; i < totalVerts; ++i) {
+        if (ws) {
+            ws->dabCandidates.clear();
+        }
+        forEachSpatialCandidate([&](size_t i) {
             if (!std::isfinite(verts[i].pos[0]) || !std::isfinite(verts[i].pos[1])) {
-                continue;
+                return;
             }
             const float dx = verts[i].pos[0] - dabLocalX;
             const float dy = verts[i].pos[1] - dabLocalY;
@@ -1739,33 +2546,44 @@ void WeightPaintBrushBridge::applyDab(ViewportGizmoOverlay &overlay, uint32_t co
                 const float g = std::pow(cosFalloff, falloffExp);
                 neighborAvg += w * g;
                 neighborW += g;
+                if (ws && !isVertexLocked(i)) {
+                    ws->dabCandidates.push_back(static_cast<uint32_t>(i));
+                }
             }
-        }
+        });
         if (neighborW > 1e-6f) {
             neighborAvg /= neighborW;
         }
     }
 
-    for (size_t i = 0; i < totalVerts; ++i) {
+    auto paintVertex = [&](size_t i) {
         if (!std::isfinite(verts[i].pos[0]) || !std::isfinite(verts[i].pos[1])) {
-            continue;
+            return;
         }
         const float dx = verts[i].pos[0] - dabLocalX;
         const float dy = verts[i].pos[1] - dabLocalY;
         const float distSq = dx * dx + dy * dy;
         if (distSq > radiusSq || isVertexLocked(i)) {
-            continue;
+            return;
         }
 
         const uint32_t blockIdx = static_cast<uint32_t>(i / 256u);
-        if (!m_preBlocks.contains(blockIdx)) {
-            const size_t bStart = static_cast<size_t>(blockIdx) * 256u;
-            const size_t bEnd = std::min(bStart + 256u, totalVerts);
-            VertexWeightBlockSnapshot snap{};
-            snap.blockIndex = blockIdx;
-            snap.slice.assign(verts.begin() + static_cast<std::ptrdiff_t>(bStart),
-                              verts.begin() + static_cast<std::ptrdiff_t>(bEnd));
-            m_preBlocks.emplace(blockIdx, std::move(snap));
+        const bool blockCaptured =
+            ws ? ((ws->preBlockBits[blockIdx >> 6u] & (1ull << (blockIdx & 63u))) != 0ull)
+               : m_preBlocks.contains(blockIdx);
+        if (!blockCaptured) {
+            if (ws) {
+                ws->preBlockBits[blockIdx >> 6u] |= (1ull << (blockIdx & 63u));
+            }
+            if (!m_preBlocks.contains(blockIdx)) {
+                const size_t bStart = static_cast<size_t>(blockIdx) * 256u;
+                const size_t bEnd = std::min(bStart + 256u, totalVerts);
+                VertexWeightBlockSnapshot snap{};
+                snap.blockIndex = blockIdx;
+                snap.slice.assign(verts.begin() + static_cast<std::ptrdiff_t>(bStart),
+                                  verts.begin() + static_cast<std::ptrdiff_t>(bEnd));
+                m_preBlocks.emplace(blockIdx, std::move(snap));
+            }
         }
 
         const float dist = std::sqrt(distSq);
@@ -1871,7 +2689,29 @@ void WeightPaintBrushBridge::applyDab(ViewportGizmoOverlay &overlay, uint32_t co
             v.weight[firstOtherUnlocked] = targetFree;
         }
 
-        m_dirtyVertices.push_back(static_cast<uint32_t>(i));
+        if (ws) {
+            const uint64_t bit = 1ull << (i & 63u);
+            if ((ws->dirtyBits[i >> 6u] & bit) == 0ull) {
+                ws->dirtyBits[i >> 6u] |= bit;
+                m_dirtyVertices.push_back(static_cast<uint32_t>(i));
+            }
+        } else {
+            m_dirtyVertices.push_back(static_cast<uint32_t>(i));
+        }
+    };
+
+    if (dab.op == WE_WEIGHT_OP_SMOOTH && ws) {
+        for (const uint32_t cand : ws->dabCandidates) {
+            paintVertex(static_cast<size_t>(cand));
+        }
+    } else {
+        forEachSpatialCandidate(paintVertex);
+    }
+
+    if (!ws && m_dirtyVertices.size() >= std::max<size_t>(1024u, totalVerts)) {
+        std::sort(m_dirtyVertices.begin(), m_dirtyVertices.end());
+        m_dirtyVertices.erase(std::unique(m_dirtyVertices.begin(), m_dirtyVertices.end()),
+                              m_dirtyVertices.end());
     }
 }
 
@@ -2008,6 +2848,10 @@ GpuPreviewViewport::GpuPreviewViewport(QWidget *parent) : QOpenGLWidget(parent)
     fmt.setSwapInterval(0); // Non-blocking vsync
     setFormat(fmt);
 
+    extraViewportStates()[this];
+    weightBridgeStates()[&m_weightBridge];
+    m_weightBridge.m_pendingDabs.reserve(16u);
+
     m_lastFpsCalcTime = std::chrono::steady_clock::now();
     m_inputMapper.updateLayout(size());
 
@@ -2022,6 +2866,12 @@ GpuPreviewViewport::GpuPreviewViewport(QWidget *parent) : QOpenGLWidget(parent)
             constexpr float kDamping = 0.14f;
             m_currentTiltX += (m_targetTiltX - m_currentTiltX) * kDamping;
             m_currentTiltY += (m_targetTiltY - m_currentTiltY) * kDamping;
+            if (std::abs(m_targetTiltX - m_currentTiltX) <= 1e-4f) {
+                m_currentTiltX = m_targetTiltX;
+            }
+            if (std::abs(m_targetTiltY - m_currentTiltY) <= 1e-4f) {
+                m_currentTiltY = m_targetTiltY;
+            }
         }
         update();
         updateAnimationTimerState();
@@ -2073,6 +2923,8 @@ GpuPreviewViewport::~GpuPreviewViewport()
     m_gizmoOverlay.endDrag();
 
     releaseGlResources();
+    weightBridgeStates().erase(&m_weightBridge);
+    extraViewportStates().erase(this);
 }
 
 void GpuPreviewViewport::updateAnimationTimerState()
@@ -2083,9 +2935,9 @@ void GpuPreviewViewport::updateAnimationTimerState()
     const bool parallaxSettling =
         m_parallaxEnabled && (std::abs(m_targetTiltX - m_currentTiltX) > 1e-4f ||
                               std::abs(m_targetTiltY - m_currentTiltY) > 1e-4f);
+    // DmaBufLive repaints are driven by importFrame() arrival; do not spin at 144 Hz while static.
     const bool needsTick = isVisible() && !m_animationPaused &&
-                           (m_previewMode == PreviewMode::InProcessShader ||
-                            m_previewMode == PreviewMode::DmaBufLive || parallaxSettling);
+                           (m_previewMode == PreviewMode::InProcessShader || parallaxSettling);
 
     if (needsTick && !m_animationTimer->isActive()) {
         m_animationTimer->start();
@@ -2097,7 +2949,7 @@ void GpuPreviewViewport::updateAnimationTimerState()
 void GpuPreviewViewport::setTargetAnimationFps(int fps)
 {
     m_targetFps = std::clamp(fps, 10, 360);
-    int intervalMs = std::max(1, 1000 / m_targetFps);
+    int intervalMs = std::max(1, (1000 + m_targetFps / 2) / m_targetFps);
     if (m_animationTimer) {
         m_animationTimer->setInterval(intervalMs);
     }
@@ -2162,7 +3014,10 @@ void GpuPreviewViewport::clearLiveDmaBuf()
             m_swapchain.closeFds();
         }
     }
-    if (m_renderer.m_inProcessImageTex != 0 || !m_fallbackImage.isNull()) {
+    const bool hasInProcessImg = m_renderer.m_inProcessImageTex != 0 || !m_fallbackImage.isNull() ||
+                                 (m_imageWidth > 0 && m_imageHeight > 0 &&
+                                  !extraViewportStates()[this].sourceImagePath.isEmpty());
+    if (hasInProcessImg) {
         m_previewMode = PreviewMode::InProcessImage;
     } else if (m_renderer.m_shaderProgram || m_renderer.m_computeShaderProgram ||
                !m_shaderSource.isEmpty()) {
@@ -2214,8 +3069,21 @@ void GpuPreviewViewport::initializeGL()
     initBlitShader();
     ensureNeutralPassTexture();
 
-    if (!m_fallbackImage.isNull() && m_renderer.m_inProcessImageTex == 0) {
-        m_renderer.uploadFallbackImageTexture(m_fallbackImage);
+    if (m_renderer.m_inProcessImageTex == 0) {
+        if (!m_fallbackImage.isNull()) {
+            m_renderer.uploadFallbackImageTexture(m_fallbackImage);
+            if (m_renderer.m_inProcessImageTex != 0) {
+                m_fallbackImage = QImage();
+            }
+        } else if (m_previewMode == PreviewMode::InProcessImage) {
+            const QString &srcPath = extraViewportStates()[this].sourceImagePath;
+            if (!srcPath.isEmpty()) {
+                const QImage restored = decodeStillImageFile(srcPath);
+                if (!restored.isNull()) {
+                    m_renderer.uploadFallbackImageTexture(restored);
+                }
+            }
+        }
     }
 
     if (!m_shaderSource.isEmpty() && !m_renderer.m_shaderProgram &&
@@ -2253,7 +3121,9 @@ void GpuPreviewViewport::resizeGL(int w, int h)
 
 void GpuPreviewViewport::resizeEvent(QResizeEvent *event)
 {
-    m_inputMapper.updateLayout(size());
+    const QSize curSize = size();
+    m_inputMapper.updateLayout(curSize);
+    extraViewportStates()[this].lastLayoutSize = curSize;
     if (isOffscreenPlatform()) {
         QWidget::resizeEvent(event);
         return;
@@ -2295,30 +3165,34 @@ void GpuPreviewViewport::setPreviewImage(const QImage &image)
         return;
     }
 
-    QImage formatted = image.convertToFormat(QImage::Format_RGBA8888);
     int validatedStride = 0;
-    if (formatted.isNull() || formatted.width() <= 0 || formatted.height() <= 0 ||
-        !validateRgbaImageBounds(static_cast<uint32_t>(formatted.width()),
-                                 static_cast<uint32_t>(formatted.height()), validatedStride)) {
+    if (image.width() <= 0 || image.height() <= 0 ||
+        !validateRgbaImageBounds(static_cast<uint32_t>(image.width()),
+                                 static_cast<uint32_t>(image.height()), validatedStride)) {
         clearPreviewImage();
         return;
     }
 
-    m_fallbackImage = image;
-    m_imageWidth = static_cast<uint32_t>(formatted.width());
-    m_imageHeight = static_cast<uint32_t>(formatted.height());
+    m_videoLoadGeneration.fetch_add(1, std::memory_order_acq_rel);
+    extraViewportStates()[this].sourceImagePath.clear();
+    m_imageWidth = static_cast<uint32_t>(image.width());
+    m_imageHeight = static_cast<uint32_t>(image.height());
 
+    bool uploaded = false;
     {
         GlContextScope glScope(this);
         if (glScope.isReady()) {
-            m_renderer.uploadFallbackImageTexture(formatted);
+            m_renderer.uploadFallbackImageTexture(image);
+            uploaded = (m_renderer.m_inProcessImageTex != 0);
         }
     }
+    // Release CPU shadow residency once GPU upload succeeds to avoid 33-132 MB duplicate RAM.
+    m_fallbackImage = uploaded ? QImage() : image;
 
     m_previewMode = PreviewMode::InProcessImage;
     updateAnimationTimerState();
     update();
-    emit previewImageChanged(m_fallbackImage);
+    emit previewImageChanged(image);
 }
 
 bool GpuPreviewViewport::setPreviewImagePath(const QString &filePath)
@@ -2362,25 +3236,9 @@ bool GpuPreviewViewport::setPreviewImagePath(const QString &filePath)
         }
     }
 
-    // 2. Try standard Qt QImage reader
-    QImage img(targetPath);
-
-    // 3. Fallback to libwaywal_core's image_load_rgba (JXL, AVIF, WebP, SVG, QOI, HDR, etc.)
-    if (img.isNull() && QFileInfo::exists(targetPath)) {
-        uint8_t *rgba = nullptr;
-        uint32_t w = 0;
-        uint32_t h = 0;
-        int rgbaStride = 0;
-        if (image_load_rgba(stdPath.c_str(), &rgba, &w, &h) && rgba &&
-            validateRgbaImageBounds(w, h, rgbaStride)) {
-            QImage raw(rgba, static_cast<int>(w), static_cast<int>(h), rgbaStride,
-                       QImage::Format_RGBA8888);
-            img = raw.copy();
-            image_free(rgba);
-        } else if (rgba) {
-            image_free(rgba);
-        }
-    }
+    // 2. Try standard Qt QImage reader, libwaywal_core decoders, or synthetic sample fallback.
+    QImage img = decodeStillImageFile(targetPath);
+    QString persistentSourcePath = targetPath;
 
     // 4. Video wallpaper preview frame extraction via canonical cache resolver + async ffmpeg
     if (img.isNull() && QFileInfo::exists(targetPath) &&
@@ -2389,7 +3247,10 @@ bool GpuPreviewViewport::setPreviewImagePath(const QString &filePath)
         if (waywal_thumb_resolve_cache_path(stdPath.c_str(), thumbPathBuf, sizeof(thumbPathBuf))) {
             std::error_code ec;
             if (std::filesystem::exists(thumbPathBuf, ec)) {
-                img.load(QString::fromUtf8(thumbPathBuf));
+                const QString thumbQPath = QString::fromUtf8(thumbPathBuf);
+                if (img.load(thumbQPath)) {
+                    persistentSourcePath = thumbQPath;
+                }
             }
         }
 
@@ -2495,38 +3356,18 @@ bool GpuPreviewViewport::setPreviewImagePath(const QString &filePath)
         }
     }
 
-    // 5. Synthetic showcase preview fallback for built-in /usr/share/wwal/samples/* cards
-    if (img.isNull() && filePath.startsWith(QLatin1String("/usr/share/wwal/samples/"))) {
-        img = QImage(1280, 720, QImage::Format_RGBA8888);
-        uint32_t seed = 2166136261u;
-        for (char c : stdPath) {
-            seed ^= static_cast<uint8_t>(c);
-            seed *= 16777619u;
-        }
-        QColor c1(static_cast<int>((seed >> 16) & 0x7F) + 40,
-                  static_cast<int>((seed >> 8) & 0x7F) + 50, static_cast<int>(seed & 0x7F) + 80);
-        QColor c2(static_cast<int>((seed >> 12) & 0x7F) + 20,
-                  static_cast<int>((seed >> 4) & 0x7F) + 30,
-                  static_cast<int>((seed >> 20) & 0x7F) + 60);
-        QPainter p(&img);
-        QLinearGradient grad(0, 0, 1280, 720);
-        grad.setColorAt(0.0, c1.lighter(135));
-        grad.setColorAt(0.5, c2);
-        grad.setColorAt(1.0, c1.darker(165));
-        p.fillRect(img.rect(), grad);
-        p.end();
-    }
-
     if (img.isNull()) {
         return false;
     }
     setPreviewImage(img);
+    extraViewportStates()[this].sourceImagePath = std::move(persistentSourcePath);
     return true;
 }
 
 void GpuPreviewViewport::clearPreviewImage()
 {
     m_videoLoadGeneration.fetch_add(1, std::memory_order_acq_rel);
+    extraViewportStates()[this].sourceImagePath.clear();
     m_fallbackImage = QImage();
     {
         GlContextScope glScope(this);
@@ -2622,9 +3463,13 @@ void GpuPreviewViewport::clearPreviewShader()
     m_shaderSource.clear();
 
     if (m_previewMode == PreviewMode::InProcessShader) {
+        const bool hasInProcessImg = m_renderer.m_inProcessImageTex != 0 ||
+                                     !m_fallbackImage.isNull() ||
+                                     (m_imageWidth > 0 && m_imageHeight > 0 &&
+                                      !extraViewportStates()[this].sourceImagePath.isEmpty());
         if (m_swapchain.hasLiveFrame()) {
             m_previewMode = PreviewMode::DmaBufLive;
-        } else if (m_renderer.m_inProcessImageTex != 0 || !m_fallbackImage.isNull()) {
+        } else if (hasInProcessImg) {
             m_previewMode = PreviewMode::InProcessImage;
         } else {
             m_previewMode = PreviewMode::OfflineEmpty;
@@ -2793,42 +3638,61 @@ void GpuPreviewViewport::applyShaderUniforms(QOpenGLShaderProgram &prog, float f
     const float safeH = std::max(1.0f, fboH);
     const float safeW = std::max(1.0f, fboW);
 
-    // Standard Shadertoy uniforms
-    prog.setUniformValue("iResolution", QVector3D(safeW, safeH, safeW / safeH));
-    prog.setUniformValue("iTime", timeSec);
-    prog.setUniformValue("iTimeDelta", timeDeltaSec);
-    prog.setUniformValue("iFrame", m_shaderFrameIndex);
-    prog.setUniformValue("iMouse", QVector4D(static_cast<float>(m_mouseGlCoord.x()),
-                                             static_cast<float>(m_mouseGlCoord.y()),
-                                             static_cast<float>(m_mouseClickCoord.x()),
-                                             static_cast<float>(m_mouseClickCoord.y())));
+    ProgramUniformCache &uc = getExtraRendererState(&m_renderer).programUniforms[&prog];
+    uc.ensureResolved(prog);
 
-    const QDateTime dt = QDateTime::currentDateTime();
-    const float secOfDay = dt.time().msecsSinceStartOfDay() / 1000.0f;
-    prog.setUniformValue("iDate", QVector4D(static_cast<float>(dt.date().year()),
-                                            static_cast<float>(dt.date().month()),
-                                            static_cast<float>(dt.date().day()), secOfDay));
+    // Standard Shadertoy uniforms
+    if (uc.iResolution >= 0) {
+        prog.setUniformValue(uc.iResolution, QVector3D(safeW, safeH, safeW / safeH));
+    }
+    if (uc.iTime >= 0) {
+        prog.setUniformValue(uc.iTime, timeSec);
+    }
+    if (uc.iTimeDelta >= 0) {
+        prog.setUniformValue(uc.iTimeDelta, timeDeltaSec);
+    }
+    if (uc.iFrame >= 0) {
+        prog.setUniformValue(uc.iFrame, m_shaderFrameIndex);
+    }
+    if (uc.iMouse >= 0) {
+        prog.setUniformValue(uc.iMouse, QVector4D(static_cast<float>(m_mouseGlCoord.x()),
+                                                  static_cast<float>(m_mouseGlCoord.y()),
+                                                  static_cast<float>(m_mouseClickCoord.x()),
+                                                  static_cast<float>(m_mouseClickCoord.y())));
+    }
+    if (uc.iDate >= 0) {
+        const QDateTime dt = QDateTime::currentDateTime();
+        const float secOfDay = dt.time().msecsSinceStartOfDay() / 1000.0f;
+        prog.setUniformValue(uc.iDate, QVector4D(static_cast<float>(dt.date().year()),
+                                                 static_cast<float>(dt.date().month()),
+                                                 static_cast<float>(dt.date().day()), secOfDay));
+    }
 
     // Standard wwald / .wwgraph uniforms
-    prog.setUniformValue("u_Time", timeSec);
-    prog.setUniformValue("u_Resolution", QVector2D(safeW, safeH));
-    const float ptrX = std::clamp(static_cast<float>(m_mouseGlCoord.x()) /
-                                      std::max(1.0f, static_cast<float>(width())),
-                                  0.0f, 1.0f);
-    const float ptrY = std::clamp(static_cast<float>(m_mouseGlCoord.y()) /
-                                      std::max(1.0f, static_cast<float>(height())),
-                                  0.0f, 1.0f);
-    prog.setUniformValue("u_Pointer", QVector2D(ptrX, ptrY));
+    if (uc.uTime >= 0) {
+        prog.setUniformValue(uc.uTime, timeSec);
+    }
+    if (uc.uResolution >= 0) {
+        prog.setUniformValue(uc.uResolution, QVector2D(safeW, safeH));
+    }
+    if (uc.uPointer >= 0) {
+        const float ptrX = std::clamp(static_cast<float>(m_mouseGlCoord.x()) /
+                                          std::max(1.0f, static_cast<float>(width())),
+                                      0.0f, 1.0f);
+        const float ptrY = std::clamp(static_cast<float>(m_mouseGlCoord.y()) /
+                                          std::max(1.0f, static_cast<float>(height())),
+                                      0.0f, 1.0f);
+        prog.setUniformValue(uc.uPointer, QVector2D(ptrX, ptrY));
+    }
 
-    static const QVector4D kZeroAudio[4] = {
-        QVector4D(0.0f, 0.0f, 0.0f, 0.0f),
-        QVector4D(0.0f, 0.0f, 0.0f, 0.0f),
-        QVector4D(0.0f, 0.0f, 0.0f, 0.0f),
-        QVector4D(0.0f, 0.0f, 0.0f, 0.0f),
-    };
-    const int audioLoc = prog.uniformLocation("u_AudioBands");
-    if (audioLoc >= 0) {
-        prog.setUniformValueArray(audioLoc, kZeroAudio, 4);
+    if (uc.uAudioBands >= 0) {
+        static const QVector4D kZeroAudio[4] = {
+            QVector4D(0.0f, 0.0f, 0.0f, 0.0f),
+            QVector4D(0.0f, 0.0f, 0.0f, 0.0f),
+            QVector4D(0.0f, 0.0f, 0.0f, 0.0f),
+            QVector4D(0.0f, 0.0f, 0.0f, 0.0f),
+        };
+        prog.setUniformValueArray(uc.uAudioBands, kZeroAudio, 4);
     }
 
     ensureNeutralPassTexture();
@@ -2849,49 +3713,53 @@ void GpuPreviewViewport::applyShaderUniforms(QOpenGLShaderProgram &prog, float f
             passTex[u] = fbo->texture();
         }
     }
-    static constexpr const char *kPassSamplerNames[5] = {
-        "u_BufferA", "u_BufferB", "u_BufferC", "u_BufferD", "u_DepthMap",
-    };
     for (int unit = 0; unit < 5; ++unit) {
-        glActiveTexture(GL_TEXTURE0 + unit);
-        glBindTexture(GL_TEXTURE_2D, passTex[unit]);
-        prog.setUniformValue(kPassSamplerNames[unit], unit);
+        if (uc.passSamplers[static_cast<size_t>(unit)] >= 0) {
+            glActiveTexture(GL_TEXTURE0 + unit);
+            glBindTexture(GL_TEXTURE_2D, passTex[unit]);
+            prog.setUniformValue(uc.passSamplers[static_cast<size_t>(unit)], unit);
+        }
     }
     glActiveTexture(GL_TEXTURE0);
 
     // Custom inspector & graph node constant uniforms
     for (const auto &[name, val] : m_customUniforms) {
-        const char *cName = name.c_str();
+        const GLint loc = uc.resolveCustom(prog, name);
+        if (loc < 0) {
+            continue;
+        }
         switch (val.type) {
         case ShaderUniformValue::Type::Float:
             if (!val.fVals.empty())
-                prog.setUniformValue(cName, val.fVals[0]);
+                prog.setUniformValue(loc, val.fVals[0]);
             break;
         case ShaderUniformValue::Type::Vec2:
             if (val.fVals.size() >= 2)
-                prog.setUniformValue(cName, QVector2D(val.fVals[0], val.fVals[1]));
+                prog.setUniformValue(loc, QVector2D(val.fVals[0], val.fVals[1]));
             break;
         case ShaderUniformValue::Type::Vec3:
             if (val.fVals.size() >= 3)
-                prog.setUniformValue(cName, QVector3D(val.fVals[0], val.fVals[1], val.fVals[2]));
+                prog.setUniformValue(loc, QVector3D(val.fVals[0], val.fVals[1], val.fVals[2]));
             break;
         case ShaderUniformValue::Type::Vec4:
             if (val.fVals.size() >= 4)
                 prog.setUniformValue(
-                    cName, QVector4D(val.fVals[0], val.fVals[1], val.fVals[2], val.fVals[3]));
+                    loc, QVector4D(val.fVals[0], val.fVals[1], val.fVals[2], val.fVals[3]));
             break;
         case ShaderUniformValue::Type::Int:
             if (!val.iVals.empty())
-                prog.setUniformValue(cName, val.iVals[0]);
+                prog.setUniformValue(loc, val.iVals[0]);
             break;
         case ShaderUniformValue::Type::Mat4:
-            prog.setUniformValue(cName, val.matVal);
+            prog.setUniformValue(loc, val.matVal);
             break;
         }
     }
 
-    QMatrix4x4 ident;
-    prog.setUniformValue("u_mvp", ident);
+    if (uc.uMvp >= 0) {
+        QMatrix4x4 ident;
+        prog.setUniformValue(uc.uMvp, ident);
+    }
 }
 
 void GpuPreviewViewport::renderInProcessShaderPass()
@@ -2905,14 +3773,18 @@ void GpuPreviewViewport::renderInProcessShaderPass()
 
     if (m_renderer.m_computeShaderProgram && QOpenGLContext::currentContext()) {
         QOpenGLContext *ctx = QOpenGLContext::currentContext();
-        auto texStorage2D =
-            reinterpret_cast<GlTexStorage2DProc>(ctx->getProcAddress("glTexStorage2D"));
-        auto bindImageTex =
-            reinterpret_cast<GlBindImageTextureProc>(ctx->getProcAddress("glBindImageTexture"));
-        auto dispatchCompute =
-            reinterpret_cast<GlDispatchComputeProc>(ctx->getProcAddress("glDispatchCompute"));
-        auto memoryBarrier =
-            reinterpret_cast<GlMemoryBarrierProc>(ctx->getProcAddress("glMemoryBarrier"));
+        ExtraRendererState &extra = getExtraRendererState(&m_renderer);
+        if (!extra.computeProcsResolved) {
+            extra.texStorage2D =
+                reinterpret_cast<GlTexStorage2DProc>(ctx->getProcAddress("glTexStorage2D"));
+            extra.bindImageTex =
+                reinterpret_cast<GlBindImageTextureProc>(ctx->getProcAddress("glBindImageTexture"));
+            extra.dispatchCompute =
+                reinterpret_cast<GlDispatchComputeProc>(ctx->getProcAddress("glDispatchCompute"));
+            extra.memoryBarrier =
+                reinterpret_cast<GlMemoryBarrierProc>(ctx->getProcAddress("glMemoryBarrier"));
+            extra.computeProcsResolved = true;
+        }
 
         const QSize fbSize = physicalFramebufferSize();
         const int targetW = std::clamp(fbSize.width(), 64, 7680);
@@ -2920,7 +3792,8 @@ void GpuPreviewViewport::renderInProcessShaderPass()
         const GLenum imgFmt = (m_renderer.m_computeInternalFormat != 0)
                                   ? m_renderer.m_computeInternalFormat
                                   : GL_RGBA16F;
-        if (texStorage2D && bindImageTex && dispatchCompute && memoryBarrier) {
+        if (extra.texStorage2D && extra.bindImageTex && extra.dispatchCompute &&
+            extra.memoryBarrier) {
             if (m_renderer.m_computeOutputTex == 0 || m_renderer.m_computeTexWidth != targetW ||
                 m_renderer.m_computeTexHeight != targetH) {
                 if (m_renderer.m_computeOutputTex != 0) {
@@ -2929,7 +3802,7 @@ void GpuPreviewViewport::renderInProcessShaderPass()
                 }
                 glGenTextures(1, &m_renderer.m_computeOutputTex);
                 glBindTexture(GL_TEXTURE_2D, m_renderer.m_computeOutputTex);
-                texStorage2D(GL_TEXTURE_2D, 1, imgFmt, targetW, targetH);
+                extra.texStorage2D(GL_TEXTURE_2D, 1, imgFmt, targetW, targetH);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -2946,12 +3819,13 @@ void GpuPreviewViewport::renderInProcessShaderPass()
             m_renderer.m_computeShaderProgram->bind();
             applyShaderUniforms(*m_renderer.m_computeShaderProgram, static_cast<float>(targetW),
                                 static_cast<float>(targetH), timeSec, timeDeltaSec);
-            bindImageTex(m_renderer.m_computeBindingUnit, m_renderer.m_computeOutputTex, 0,
-                         GL_FALSE, 0, GL_WRITE_ONLY, imgFmt);
-            dispatchCompute(static_cast<GLuint>((targetW + 15) / 16),
-                            static_cast<GLuint>((targetH + 15) / 16), 1u);
-            memoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
-            bindImageTex(m_renderer.m_computeBindingUnit, 0, 0, GL_FALSE, 0, GL_READ_ONLY, imgFmt);
+            extra.bindImageTex(m_renderer.m_computeBindingUnit, m_renderer.m_computeOutputTex, 0,
+                               GL_FALSE, 0, GL_WRITE_ONLY, imgFmt);
+            extra.dispatchCompute(static_cast<GLuint>((targetW + 15) / 16),
+                                  static_cast<GLuint>((targetH + 15) / 16), 1u);
+            extra.memoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+            extra.bindImageTex(m_renderer.m_computeBindingUnit, 0, 0, GL_FALSE, 0, GL_READ_ONLY,
+                               imgFmt);
             m_renderer.m_computeShaderProgram->release();
             for (int unit = 4; unit >= 0; --unit) {
                 glActiveTexture(GL_TEXTURE0 + unit);
@@ -2972,17 +3846,7 @@ void GpuPreviewViewport::renderInProcessShaderPass()
 
     auto drawFullscreenQuad = [this]() {
         m_renderer.m_quadVao.bind();
-        m_renderer.m_quadVbo.bind();
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
-                              reinterpret_cast<void *>(offsetof(Vertex, x)));
-        glEnableVertexAttribArray(1);
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
-                              reinterpret_cast<void *>(offsetof(Vertex, u)));
         glDrawArrays(GL_TRIANGLES, 0, 6);
-        glDisableVertexAttribArray(1);
-        glDisableVertexAttribArray(0);
-        m_renderer.m_quadVbo.release();
         m_renderer.m_quadVao.release();
     };
 
@@ -3102,9 +3966,21 @@ void GpuPreviewViewport::paintGL()
     glDisable(GL_CULL_FACE);
     glDisable(GL_BLEND);
 
-    if (m_previewMode == PreviewMode::InProcessImage && m_renderer.m_inProcessImageTex == 0 &&
-        !m_fallbackImage.isNull()) {
-        m_renderer.uploadFallbackImageTexture(m_fallbackImage);
+    if (m_previewMode == PreviewMode::InProcessImage && m_renderer.m_inProcessImageTex == 0) {
+        if (!m_fallbackImage.isNull()) {
+            m_renderer.uploadFallbackImageTexture(m_fallbackImage);
+            if (m_renderer.m_inProcessImageTex != 0) {
+                m_fallbackImage = QImage();
+            }
+        } else {
+            const QString &srcPath = extraViewportStates()[this].sourceImagePath;
+            if (!srcPath.isEmpty()) {
+                const QImage restored = decodeStillImageFile(srcPath);
+                if (!restored.isNull()) {
+                    m_renderer.uploadFallbackImageTexture(restored);
+                }
+            }
+        }
     }
 
     GLuint activeTex = 0;
@@ -3145,28 +4021,35 @@ void GpuPreviewViewport::paintGL()
     if (activeTex != 0 && m_renderer.m_blitProgram) {
         m_renderer.m_blitProgram->bind();
 
-        const QMatrix4x4 mvp = computeBlitMvp(cW, cH);
+        ExtraRendererState &extra = getExtraRendererState(&m_renderer);
+        const GLuint blitId = m_renderer.m_blitProgram->programId();
+        if (extra.blitProgramId != blitId || blitId == 0u) {
+            extra.blitProgramId = blitId;
+            extra.blitUMvp = m_renderer.m_blitProgram->uniformLocation("u_mvp");
+            extra.blitUTexture = m_renderer.m_blitProgram->uniformLocation("u_texture");
+            extra.blitUFlipY = m_renderer.m_blitProgram->uniformLocation("u_flip_y");
+            extra.blitUIsBgr = m_renderer.m_blitProgram->uniformLocation("u_is_bgr");
+        }
 
-        m_renderer.m_blitProgram->setUniformValue("u_mvp", mvp);
-        m_renderer.m_blitProgram->setUniformValue("u_texture", 0);
-        m_renderer.m_blitProgram->setUniformValue("u_flip_y", flipY);
-        m_renderer.m_blitProgram->setUniformValue("u_is_bgr", isBgr);
+        const QMatrix4x4 mvp = computeBlitMvp(cW, cH);
+        if (extra.blitUMvp >= 0) {
+            m_renderer.m_blitProgram->setUniformValue(extra.blitUMvp, mvp);
+        }
+        if (extra.blitUTexture >= 0) {
+            m_renderer.m_blitProgram->setUniformValue(extra.blitUTexture, 0);
+        }
+        if (extra.blitUFlipY >= 0) {
+            m_renderer.m_blitProgram->setUniformValue(extra.blitUFlipY, flipY);
+        }
+        if (extra.blitUIsBgr >= 0) {
+            m_renderer.m_blitProgram->setUniformValue(extra.blitUIsBgr, isBgr);
+        }
 
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, activeTex);
 
         m_renderer.m_quadVao.bind();
-        m_renderer.m_quadVbo.bind();
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
-                              reinterpret_cast<void *>(offsetof(Vertex, x)));
-        glEnableVertexAttribArray(1);
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
-                              reinterpret_cast<void *>(offsetof(Vertex, u)));
         glDrawArrays(GL_TRIANGLES, 0, 6);
-        glDisableVertexAttribArray(1);
-        glDisableVertexAttribArray(0);
-        m_renderer.m_quadVbo.release();
         m_renderer.m_quadVao.release();
 
         glBindTexture(GL_TEXTURE_2D, 0);
@@ -3289,15 +4172,35 @@ void GpuPreviewViewport::drawSafeFrameGuides(QPainter &painter, const QRectF &di
         safeRect = QRectF(displayRect.left(), displayRect.center().y() - h * 0.5f, w, h);
     }
 
-    // Outside letterbox/pillarbox dim mask
+    // Outside letterbox/pillarbox dim mask using axis-aligned strips to avoid per-frame
+    // QPainterPath boolean tessellation overhead.
     painter.save();
-    QPainterPath fullPath;
-    fullPath.addRect(displayRect);
-    QPainterPath safePath;
-    safePath.addRect(safeRect);
-    QPainterPath maskPath = fullPath.subtracted(safePath);
-
-    painter.fillPath(maskPath, QColor(0, 0, 0, 110));
+    const QColor dimColor(0, 0, 0, 110);
+    if (safeRect.top() > displayRect.top()) {
+        painter.fillRect(QRectF(displayRect.left(), displayRect.top(), displayRect.width(),
+                                safeRect.top() - displayRect.top()),
+                         dimColor);
+    }
+    if (safeRect.bottom() < displayRect.bottom()) {
+        painter.fillRect(QRectF(displayRect.left(), safeRect.bottom(), displayRect.width(),
+                                displayRect.bottom() - safeRect.bottom()),
+                         dimColor);
+    }
+    const double midTop = std::max(displayRect.top(), safeRect.top());
+    const double midBottom = std::min(displayRect.bottom(), safeRect.bottom());
+    const double midH = std::max(0.0, midBottom - midTop);
+    if (midH > 0.0) {
+        if (safeRect.left() > displayRect.left()) {
+            painter.fillRect(
+                QRectF(displayRect.left(), midTop, safeRect.left() - displayRect.left(), midH),
+                dimColor);
+        }
+        if (safeRect.right() < displayRect.right()) {
+            painter.fillRect(
+                QRectF(safeRect.right(), midTop, displayRect.right() - safeRect.right(), midH),
+                dimColor);
+        }
+    }
 
     // Safe Frame Boundary (Cyan Accent)
     QPen boundaryPen(QColor(0, 229, 255, 180), 1.5, Qt::SolidLine);
@@ -3390,7 +4293,12 @@ void GpuPreviewViewport::drawSafeFrameGuides(QPainter &painter, const QRectF &di
 
 void GpuPreviewViewport::drawActionBar(QPainter &painter)
 {
-    m_inputMapper.updateLayout(size());
+    ExtraViewportState &vpExtra = extraViewportStates()[this];
+    const QSize curSize = size();
+    if (vpExtra.lastLayoutSize != curSize) {
+        m_inputMapper.updateLayout(curSize);
+        vpExtra.lastLayoutSize = curSize;
+    }
     const auto &lay = m_inputMapper.layout();
 
     painter.save();
@@ -3507,21 +4415,42 @@ void GpuPreviewViewport::drawStatusOverlay(QPainter &painter)
     hudFont.setPixelSize(11);
     painter.setFont(hudFont);
 
-    QString modeStr = (m_previewMode == PreviewMode::DmaBufLive) ? QStringLiteral("LIVE DMA-BUF")
-                      : (m_previewMode == PreviewMode::InProcessShader) ? QStringLiteral("SHADER")
-                      : (m_previewMode == PreviewMode::InProcessImage)  ? QStringLiteral("IMAGE")
-                                                                        : QStringLiteral("IDLE");
+    const uint32_t cW = contentWidth();
+    const uint32_t cH = contentHeight();
+    const int roundedZoomPct = static_cast<int>(std::lround(m_zoom * 100.0f));
+    const int roundedFps = static_cast<int>(std::lround(m_currentFps));
+    const int widgetW = width();
 
-    QString telemetryStr = QStringLiteral("%1 | %2x%3 | %4% | %5 FPS")
-                               .arg(modeStr)
-                               .arg(contentWidth())
-                               .arg(contentHeight())
-                               .arg(std::round(m_zoom * 100.0f))
-                               .arg(QString::number(m_currentFps, 'f', 0));
-
+    ExtraViewportState &vpExtra = extraViewportStates()[this];
     QFontMetrics fm(hudFont);
-    float maxHudW = std::max(80.0f, static_cast<float>(width()) - 20.0f);
-    float hudW = std::min(maxHudW, static_cast<float>(fm.horizontalAdvance(telemetryStr) + 16));
+    if (vpExtra.cachedTelemetryStr.isEmpty() || vpExtra.cachedStatusMode != m_previewMode ||
+        vpExtra.cachedStatusCW != cW || vpExtra.cachedStatusCH != cH ||
+        vpExtra.cachedStatusZoomPct != roundedZoomPct || vpExtra.cachedStatusFps != roundedFps ||
+        vpExtra.cachedStatusWidgetW != widgetW) {
+        const QString modeStr =
+            (m_previewMode == PreviewMode::DmaBufLive)        ? QStringLiteral("LIVE DMA-BUF")
+            : (m_previewMode == PreviewMode::InProcessShader) ? QStringLiteral("SHADER")
+            : (m_previewMode == PreviewMode::InProcessImage)  ? QStringLiteral("IMAGE")
+                                                              : QStringLiteral("IDLE");
+        vpExtra.cachedTelemetryStr = QStringLiteral("%1 | %2x%3 | %4% | %5 FPS")
+                                         .arg(modeStr)
+                                         .arg(cW)
+                                         .arg(cH)
+                                         .arg(roundedZoomPct)
+                                         .arg(roundedFps);
+        const float maxHudW = std::max(80.0f, static_cast<float>(widgetW) - 20.0f);
+        vpExtra.cachedHudW = std::min(
+            maxHudW, static_cast<float>(fm.horizontalAdvance(vpExtra.cachedTelemetryStr) + 16));
+        vpExtra.cachedStatusMode = m_previewMode;
+        vpExtra.cachedStatusCW = cW;
+        vpExtra.cachedStatusCH = cH;
+        vpExtra.cachedStatusZoomPct = roundedZoomPct;
+        vpExtra.cachedStatusFps = roundedFps;
+        vpExtra.cachedStatusWidgetW = widgetW;
+    }
+
+    const QString &telemetryStr = vpExtra.cachedTelemetryStr;
+    const float hudW = vpExtra.cachedHudW;
     QRectF hudRect(10.0f, 10.0f, hudW, 22.0f);
 
     painter.setPen(Qt::NoPen);
@@ -4183,11 +5112,41 @@ void GpuPreviewViewport::ensureGizmoVboCapacity(size_t requiredBytes)
 void GpuPreviewViewport::renderGizmoOverlayPass(uint32_t contentW, uint32_t contentH)
 {
     m_gizmoOverlay.setContentSize(contentW, contentH);
+    ExtraViewportState &vpExtra = extraViewportStates()[this];
+    ExtraRendererState &extra = getExtraRendererState(&m_renderer);
+
     if (m_gizmoOverlay.toolMode() == ViewportToolMode::Navigate && !m_hasGizmoEmittersOrLights &&
         !m_gizmoOverlay.hasVisibleRiggingOverlay() && m_contourPreviewLoops.empty()) {
+        if (m_heatmapVertices.capacity() > 4096u) {
+            std::vector<GizmoVertex>().swap(m_heatmapVertices);
+        } else {
+            m_heatmapVertices.clear();
+        }
+        if (m_gizmoVertices.capacity() > 8192u) {
+            std::vector<GizmoVertex>().swap(m_gizmoVertices);
+        } else {
+            m_gizmoVertices.clear();
+        }
+        if (auto *ctx = QOpenGLContext::currentContext()) {
+            auto *gl = ctx->functions();
+            shrinkBufferIfOversized(gl, extra.heatmapVbo, extra.heatmapVboCapBytes);
+            shrinkBufferIfOversized(gl, extra.wireframeVbo, extra.wireframeVboCapBytes);
+            shrinkBufferIfOversized(gl, extra.contourVbo, extra.contourVboCapBytes);
+            shrinkBufferIfOversized(gl, m_renderer.m_gizmoVbo, m_renderer.m_gizmoVboCapacityBytes);
+            shrinkBufferIfOversized(gl, extra.dynVbo2, extra.dynVbo2CapBytes);
+        }
+        extra.cachedHeatmapVertCount = 0;
+        extra.cachedHeatmapGen = 0;
+        extra.cachedWireframeVertCount = 0;
+        extra.cachedWireframeGen = 0;
+        extra.cachedContourVertCount = 0;
+        extra.cachedContourGen = 0;
         return;
     }
 
+    const uint32_t effCW = (contentW > 0u) ? contentW : static_cast<uint32_t>(std::max(0, width()));
+    const uint32_t effCH =
+        (contentH > 0u) ? contentH : static_cast<uint32_t>(std::max(0, height()));
     const QMatrix4x4 viewProj = computeGizmoViewProj(contentW, contentH);
     const QRectF displayRect = computeContentDisplayRect();
     const float orthoZoom = std::max(0.01f, static_cast<float>(displayRect.height()) /
@@ -4196,12 +5155,122 @@ void GpuPreviewViewport::renderGizmoOverlayPass(uint32_t contentW, uint32_t cont
     const QVector3D camEye(cam.eye_pos[0], cam.eye_pos[1], cam.eye_pos[2]);
     const float fovYDeg = (cam.fov_y_deg > 1.0f) ? cam.fov_y_deg : 60.0f;
 
-    m_gizmoOverlay.buildHeatmapTriangleVertices(m_heatmapVertices);
-    m_gizmoOverlay.buildRenderVertices(size(), viewProj, camEye, fovYDeg, orthoZoom,
-                                       m_hasCustomSceneViewProj, m_gizmoVertices);
-    if (!m_contourPreviewLoops.empty()) {
-        const float ch = static_cast<float>(std::max<uint32_t>(
-            1u, contentH > 0u ? contentH : static_cast<uint32_t>(std::max(1, height()))));
+    const auto &mesh = m_gizmoOverlay.meshWireframe();
+    const auto &wb = m_gizmoOverlay.weightBrushState();
+    const bool wantHeatmap =
+        wb.heatmapEnabled && !mesh.vertices.empty() && mesh.indices.size() >= 3u;
+    const bool wantWireframe = mesh.visible && !mesh.vertices.empty() && mesh.indices.size() >= 3u;
+    const bool wantContour = !m_contourPreviewLoops.empty();
+
+    // Build dynamic overlays (bones, IK, handles, cursor) while hiding mesh wireframe from
+    // ViewportGizmoOverlay so it skips per-frame O(T log T) edge sorting; wireframe edges are
+    // deduplicated in O(V + T) and cached in wireframeVbo across frames.
+    {
+        WireframeVisibilityGuard wireGuard(m_gizmoOverlay, mesh.visible);
+        m_gizmoOverlay.buildRenderVertices(size(), viewProj, camEye, fovYDeg, orthoZoom,
+                                           m_hasCustomSceneViewProj, m_gizmoVertices);
+    }
+    if (mesh.visible && m_gizmoOverlay.toolMode() != ViewportToolMode::ContourPin &&
+        !mesh.pins.empty()) {
+        appendContourPinDiamonds(mesh, (effCH > 0u) ? effCH : 1u, m_gizmoVertices);
+    }
+
+    if (!wantHeatmap && !wantWireframe && !wantContour && m_gizmoVertices.size() < 2u) {
+        return;
+    }
+
+    ensureGizmoGlInitialized();
+    if (!m_renderer.m_gizmoProgram || !m_renderer.m_gizmoProgram->isLinked() ||
+        !m_renderer.m_gizmoVao.isCreated()) {
+        return;
+    }
+    auto *ctx = QOpenGLContext::currentContext();
+    if (!ctx) {
+        return;
+    }
+    auto *gl = ctx->functions();
+
+    if (!wantHeatmap) {
+        extra.cachedHeatmapVertCount = 0;
+        extra.cachedHeatmapGen = 0;
+        if (m_heatmapVertices.capacity() > 4096u) {
+            std::vector<GizmoVertex>().swap(m_heatmapVertices);
+        } else {
+            m_heatmapVertices.clear();
+        }
+        shrinkBufferIfOversized(gl, extra.heatmapVbo, extra.heatmapVboCapBytes);
+    } else {
+        const bool heatmapDirty =
+            (extra.cachedHeatmapGen != vpExtra.heatmapGen || extra.cachedHeatCW != effCW ||
+             extra.cachedHeatCH != effCH || extra.cachedHeatBone != wb.activeBoneIndex ||
+             extra.cachedHeatOpacity != wb.heatmapOpacity ||
+             extra.cachedHeatPalette != wb.palette ||
+             extra.cachedHeatVertsPtr != mesh.vertices.data() ||
+             extra.cachedHeatVertsCount != mesh.vertices.size() ||
+             extra.cachedHeatIndicesPtr != mesh.indices.data() ||
+             extra.cachedHeatIndicesCount != mesh.indices.size());
+        if (heatmapDirty) {
+            buildHeatmapTrianglesFast(mesh, wb.activeBoneIndex, wb.heatmapOpacity, wb.palette,
+                                      effCW, effCH, m_heatmapVertices);
+            uploadStaticGizmoBuffer(gl, extra.heatmapVao, extra.heatmapVbo,
+                                    extra.heatmapVboCapBytes, m_heatmapVertices);
+            extra.cachedHeatmapVertCount =
+                std::min(m_heatmapVertices.size(), ViewportGizmoOverlay::kMaxDynamicVertices);
+            extra.cachedHeatmapGen = vpExtra.heatmapGen;
+            extra.cachedHeatCW = effCW;
+            extra.cachedHeatCH = effCH;
+            extra.cachedHeatBone = wb.activeBoneIndex;
+            extra.cachedHeatOpacity = wb.heatmapOpacity;
+            extra.cachedHeatPalette = wb.palette;
+            extra.cachedHeatVertsPtr = mesh.vertices.data();
+            extra.cachedHeatVertsCount = mesh.vertices.size();
+            extra.cachedHeatIndicesPtr = mesh.indices.data();
+            extra.cachedHeatIndicesCount = mesh.indices.size();
+            if (!m_brushStrokeActive && m_heatmapVertices.capacity() > 4096u) {
+                std::vector<GizmoVertex>().swap(m_heatmapVertices);
+            }
+        }
+    }
+
+    if (!wantWireframe) {
+        extra.cachedWireframeVertCount = 0;
+        extra.cachedWireframeGen = 0;
+        shrinkBufferIfOversized(gl, extra.wireframeVbo, extra.wireframeVboCapBytes);
+    } else {
+        const bool wireframeDirty = (extra.cachedWireframeGen != vpExtra.wireframeGen ||
+                                     extra.cachedWireCW != effCW || extra.cachedWireCH != effCH ||
+                                     extra.cachedWireHighlight != mesh.highlightContourEdges ||
+                                     extra.cachedWireVertsPtr != mesh.vertices.data() ||
+                                     extra.cachedWireVertsCount != mesh.vertices.size() ||
+                                     extra.cachedWireIndicesPtr != mesh.indices.data() ||
+                                     extra.cachedWireIndicesCount != mesh.indices.size());
+        if (wireframeDirty) {
+            std::vector<GizmoVertex> wireVerts;
+            buildWireframeLinesLinear(mesh, effCW, effCH, wireVerts);
+            uploadStaticGizmoBuffer(gl, extra.wireframeVao, extra.wireframeVbo,
+                                    extra.wireframeVboCapBytes, wireVerts);
+            extra.cachedWireframeVertCount =
+                std::min(wireVerts.size(), ViewportGizmoOverlay::kMaxDynamicVertices);
+            extra.cachedWireframeGen = vpExtra.wireframeGen;
+            extra.cachedWireCW = effCW;
+            extra.cachedWireCH = effCH;
+            extra.cachedWireHighlight = mesh.highlightContourEdges;
+            extra.cachedWireVertsPtr = mesh.vertices.data();
+            extra.cachedWireVertsCount = mesh.vertices.size();
+            extra.cachedWireIndicesPtr = mesh.indices.data();
+            extra.cachedWireIndicesCount = mesh.indices.size();
+        }
+    }
+
+    const uint32_t contourCH =
+        (contentH > 0u) ? contentH : static_cast<uint32_t>(std::max(1, height()));
+    if (!wantContour) {
+        extra.cachedContourVertCount = 0;
+        extra.cachedContourGen = 0;
+        shrinkBufferIfOversized(gl, extra.contourVbo, extra.contourVboCapBytes);
+    } else if (extra.cachedContourGen != vpExtra.contourGen || extra.cachedContourCH != contourCH) {
+        std::vector<GizmoVertex> contourVerts;
+        const double chD = static_cast<double>(std::max<uint32_t>(1u, contourCH));
         for (const auto &loop : m_contourPreviewLoops) {
             if (loop.points.size() < 2u) {
                 continue;
@@ -4211,7 +5280,7 @@ void GpuPreviewViewport::renderGizmoOverlayPass(uint32_t contentW, uint32_t cont
             const float b = loop.isHole ? 0.686f : 0.973f;
             const float a = loop.isHole ? 0.85f : 0.92f;
             for (size_t i = 0; i < loop.points.size(); ++i) {
-                if (m_gizmoVertices.size() + 2u > ViewportGizmoOverlay::kMaxDynamicVertices) {
+                if (contourVerts.size() + 2u > ViewportGizmoOverlay::kMaxDynamicVertices) {
                     break;
                 }
                 const auto &p0 = loop.points[i];
@@ -4220,30 +5289,28 @@ void GpuPreviewViewport::renderGizmoOverlayPass(uint32_t contentW, uint32_t cont
                     !std::isfinite(p1.y)) {
                     continue;
                 }
-                m_gizmoVertices.push_back(GizmoVertex{
-                    static_cast<float>(p0.x), static_cast<float>(static_cast<double>(ch) - p0.y),
-                    0.0f, r, g, b, a});
-                m_gizmoVertices.push_back(GizmoVertex{
-                    static_cast<float>(p1.x), static_cast<float>(static_cast<double>(ch) - p1.y),
-                    0.0f, r, g, b, a});
+                contourVerts.push_back(GizmoVertex{
+                    static_cast<float>(p0.x), static_cast<float>(chD - p0.y), 0.0f, r, g, b, a});
+                contourVerts.push_back(GizmoVertex{
+                    static_cast<float>(p1.x), static_cast<float>(chD - p1.y), 0.0f, r, g, b, a});
             }
         }
-    }
-    if (m_heatmapVertices.empty() && m_gizmoVertices.empty()) {
-        return;
-    }
-
-    ensureGizmoGlInitialized();
-    if (!m_renderer.m_gizmoProgram || !m_renderer.m_gizmoProgram->isLinked() ||
-        !m_renderer.m_gizmoVao.isCreated()) {
-        return;
+        uploadStaticGizmoBuffer(gl, extra.contourVao, extra.contourVbo, extra.contourVboCapBytes,
+                                contourVerts);
+        extra.cachedContourVertCount =
+            std::min(contourVerts.size(), ViewportGizmoOverlay::kMaxDynamicVertices);
+        extra.cachedContourGen = vpExtra.contourGen;
+        extra.cachedContourCH = contourCH;
     }
 
     const size_t maxVerts = ViewportGizmoOverlay::kMaxDynamicVertices;
-    const size_t heatCount = std::min(m_heatmapVertices.size(), maxVerts);
+    const size_t heatCount = extra.cachedHeatmapVertCount;
+    const size_t wireCount = extra.cachedWireframeVertCount;
+    const size_t contourCount = extra.cachedContourVertCount;
     const size_t lineCount = std::min(m_gizmoVertices.size(), maxVerts);
-    const size_t maxBytesNeeded = std::max(heatCount, lineCount) * sizeof(GizmoVertex);
-    ensureGizmoVboCapacity(maxBytesNeeded);
+    if (heatCount < 3u && wireCount < 2u && contourCount < 2u && lineCount < 2u) {
+        return;
+    }
 
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
@@ -4251,22 +5318,75 @@ void GpuPreviewViewport::renderGizmoOverlayPass(uint32_t contentW, uint32_t cont
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     m_renderer.m_gizmoProgram->bind();
-    m_renderer.m_gizmoProgram->setUniformValue("u_mvp", viewProj);
+    const GLuint gizmoId = m_renderer.m_gizmoProgram->programId();
+    if (extra.gizmoProgramId != gizmoId || gizmoId == 0u) {
+        extra.gizmoProgramId = gizmoId;
+        extra.gizmoUMvp = m_renderer.m_gizmoProgram->uniformLocation("u_mvp");
+    }
+    if (extra.gizmoUMvp >= 0) {
+        m_renderer.m_gizmoProgram->setUniformValue(extra.gizmoUMvp, viewProj);
+    }
 
-    m_renderer.m_gizmoVao.bind();
-    m_renderer.m_gizmoVbo.bind();
-    if (heatCount >= 3u) {
-        m_renderer.m_gizmoVbo.write(0, m_heatmapVertices.data(),
-                                    static_cast<int>(heatCount * sizeof(GizmoVertex)));
+    if (heatCount >= 3u && extra.heatmapVao.isCreated()) {
+        extra.heatmapVao.bind();
         glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(heatCount));
+        extra.heatmapVao.release();
+    }
+    if (wireCount >= 2u && extra.wireframeVao.isCreated()) {
+        extra.wireframeVao.bind();
+        glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(wireCount));
+        extra.wireframeVao.release();
+    }
+    if (contourCount >= 2u && extra.contourVao.isCreated()) {
+        extra.contourVao.bind();
+        glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(contourCount));
+        extra.contourVao.release();
     }
     if (lineCount >= 2u) {
-        m_renderer.m_gizmoVbo.write(0, m_gizmoVertices.data(),
-                                    static_cast<int>(lineCount * sizeof(GizmoVertex)));
+        const uint8_t slot = extra.dynPingPongIdx & 1u;
+        extra.dynPingPongIdx ^= 1u;
+        QOpenGLVertexArrayObject &dynVao = (slot == 0u) ? m_renderer.m_gizmoVao : extra.dynVao2;
+        QOpenGLBuffer &dynVbo = (slot == 0u) ? m_renderer.m_gizmoVbo : extra.dynVbo2;
+        size_t &dynCap = (slot == 0u) ? m_renderer.m_gizmoVboCapacityBytes : extra.dynVbo2CapBytes;
+
+        const size_t maxBytes = maxVerts * sizeof(GizmoVertex);
+        const size_t lineBytes = lineCount * sizeof(GizmoVertex);
+        if (!dynVao.isCreated() || !dynVbo.isCreated()) {
+            setupGizmoVaoAndBuffer(
+                gl, dynVao, dynVbo, dynCap,
+                std::min(std::max<size_t>(lineBytes, 1024u * sizeof(GizmoVertex)), maxBytes));
+        }
+
+        if (dynCap < lineBytes) {
+            size_t newCap = std::max<size_t>(dynCap * 2u, 1024u * sizeof(GizmoVertex));
+            while (newCap < lineBytes && newCap < maxBytes) {
+                newCap = std::min(newCap * 2u, maxBytes);
+            }
+            dynCap = std::min(newCap, maxBytes);
+            extra.dynSmallFrames = 0u;
+        } else if (dynCap > 262144u && lineBytes <= 32768u) {
+            if (++extra.dynSmallFrames > 16u) {
+                dynCap = 65536u;
+                extra.dynSmallFrames = 0u;
+            }
+        } else {
+            extra.dynSmallFrames = 0u;
+        }
+
+        dynVao.bind();
+        dynVbo.bind();
+        // Orphan active ping-pong VBO storage before sub-data upload to prevent pipeline stalls.
+        gl->glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(dynCap), nullptr, GL_STREAM_DRAW);
+        gl->glBufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(lineBytes),
+                            m_gizmoVertices.data());
         glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(lineCount));
+        dynVbo.release();
+        dynVao.release();
     }
-    m_renderer.m_gizmoVbo.release();
-    m_renderer.m_gizmoVao.release();
+
+    if (m_gizmoVertices.capacity() > 8192u && m_gizmoVertices.size() <= 2048u) {
+        std::vector<GizmoVertex>().swap(m_gizmoVertices);
+    }
 
     m_renderer.m_gizmoProgram->release();
     glDisable(GL_BLEND);
@@ -4291,6 +5411,12 @@ void GpuPreviewViewport::setPuppetMeshData(bool wireframeVisible,
 {
     m_gizmoOverlay.setContentSize(contentWidth(), contentHeight());
     m_gizmoOverlay.setMeshWireframe(wireframeVisible, std::move(vertices), std::move(indices));
+    auto &vpExtra = extraViewportStates()[this];
+    ++vpExtra.wireframeGen;
+    ++vpExtra.heatmapGen;
+    if (auto it = weightBridgeStates().find(&m_weightBridge); it != weightBridgeStates().end()) {
+        it->second.invalidateGrid();
+    }
     update();
 }
 
@@ -4298,6 +5424,7 @@ void GpuPreviewViewport::setPuppetWireframeVisible(bool visible)
 {
     m_gizmoOverlay.setContentSize(contentWidth(), contentHeight());
     m_gizmoOverlay.setMeshWireframeVisible(visible);
+    ++extraViewportStates()[this].wireframeGen;
     update();
 }
 
@@ -4311,6 +5438,7 @@ void GpuPreviewViewport::setPuppetContourPins(std::vector<we_cdt_pin_t> pins, in
 void GpuPreviewViewport::setPuppetContourPreviewLoops(std::vector<ContourPreviewLoop> loops)
 {
     m_contourPreviewLoops = std::move(loops);
+    ++extraViewportStates()[this].contourGen;
     update();
 }
 
@@ -4572,6 +5700,7 @@ void GpuPreviewViewport::remapPuppetBoneIndices(int32_t objectId,
     m_weightBridge.m_lockedBoneMask = nextLockedMask;
     // Discard pre-remap undo snapshots/dabs because their bone indices are stale.
     m_weightBridge.beginStroke();
+    ++extraViewportStates()[this].heatmapGen;
 
     if (m_rigDragKind == RigDragKind::BoneCreate ||
         m_rigDragKind == RigDragKind::BoneJointMoveOrReparent ||
@@ -4613,6 +5742,7 @@ void GpuPreviewViewport::setWeightHeatmapMode(bool enabled, uint32_t activeBoneI
 {
     m_gizmoOverlay.setContentSize(contentWidth(), contentHeight());
     m_gizmoOverlay.setWeightHeatmapEnabled(enabled, activeBoneIdx, opacity, palette);
+    ++extraViewportStates()[this].heatmapGen;
     update();
 }
 
@@ -4624,6 +5754,7 @@ void GpuPreviewViewport::setWeightBrushActiveBone(uint32_t activeBoneIdx)
     }
     state.activeBoneIndex = activeBoneIdx;
     m_gizmoOverlay.setWeightBrushState(state);
+    ++extraViewportStates()[this].heatmapGen;
     update();
 }
 
@@ -4671,6 +5802,7 @@ void GpuPreviewViewport::applyWeightBrushDab(const WeightBrushDab &dab)
         effectiveDab.falloff = m_weightBridge.m_falloff;
     }
     m_weightBridge.applyDab(m_gizmoOverlay, contentWidth(), contentHeight(), effectiveDab);
+    ++extraViewportStates()[this].heatmapGen;
 }
 
 void GpuPreviewViewport::recordWeightBrushDab(const QPointF &texel, float pressure, double tsSec)
@@ -4728,7 +5860,10 @@ void GpuPreviewViewport::finishWeightPaintStroke()
         }
     }
 
-    std::sort(m_weightBridge.m_dirtyVertices.begin(), m_weightBridge.m_dirtyVertices.end());
+    if (!std::is_sorted(m_weightBridge.m_dirtyVertices.begin(),
+                        m_weightBridge.m_dirtyVertices.end())) {
+        std::sort(m_weightBridge.m_dirtyVertices.begin(), m_weightBridge.m_dirtyVertices.end());
+    }
     m_weightBridge.m_dirtyVertices.erase(
         std::unique(m_weightBridge.m_dirtyVertices.begin(), m_weightBridge.m_dirtyVertices.end()),
         m_weightBridge.m_dirtyVertices.end());
@@ -4749,7 +5884,17 @@ void GpuPreviewViewport::finishWeightPaintStroke()
     }
 
     m_weightBridge.m_preBlocks.clear();
-    m_weightBridge.m_dirtyVertices.clear();
+    if (m_weightBridge.m_dirtyVertices.capacity() > 4096u) {
+        std::vector<uint32_t>().swap(m_weightBridge.m_dirtyVertices);
+    } else {
+        m_weightBridge.m_dirtyVertices.clear();
+    }
+    if (auto it = weightBridgeStates().find(&m_weightBridge); it != weightBridgeStates().end()) {
+        it->second.clearStrokeBits();
+    }
+    if (m_heatmapVertices.capacity() > 4096u) {
+        std::vector<GizmoVertex>().swap(m_heatmapVertices);
+    }
     emit weightPaintStrokeCommitted(m_puppetObjectId, preBlocks, postBlocks, dirtyEntries);
 }
 
@@ -4780,6 +5925,7 @@ void GpuPreviewViewport::applyVertexWeightBlocks(
         }
     }
     if (anyApplied) {
+        ++extraViewportStates()[this].heatmapGen;
         update();
     }
 }
@@ -4809,6 +5955,7 @@ void GpuPreviewViewport::applySolvedVertexWeights(
         anyApplied = true;
     }
     if (anyApplied) {
+        ++extraViewportStates()[this].heatmapGen;
         update();
     }
 }
@@ -4822,6 +5969,7 @@ void GpuPreviewViewport::normalizeAllVertexWeights(int32_t objectId,
     m_weightBridge.normalizeAllWeights(objectId, m_puppetObjectId, m_gizmoOverlay, lockedBones,
                                        preBlocks, postBlocks, dirtyEntries);
     if (!dirtyEntries.empty()) {
+        ++extraViewportStates()[this].heatmapGen;
         update();
         emit weightPaintStrokeCommitted(m_puppetObjectId, preBlocks, postBlocks, dirtyEntries);
     }
