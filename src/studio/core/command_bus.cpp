@@ -513,7 +513,8 @@ bool CommandBus::tryExecute(std::unique_ptr<ICommand> cmd)
         return false;
     }
 
-    if (typeid(*cmd) == typeid(SetUniformCommand)) [[likely]] {
+    const ICommand &cmdRef = *cmd;
+    if (typeid(cmdRef) == typeid(SetUniformCommand)) [[likely]] {
         auto *inCmd = static_cast<SetUniformCommand *>(cmd.get());
         uint32_t nowMs = 0U;
         BusArenaState *state = findArenaState(this, true, &nowMs);
@@ -725,7 +726,8 @@ bool CommandBus::tryExecute(std::unique_ptr<ICommand> cmd)
         return false;
     }
 
-    if (typeid(*cmd) == typeid(SetBezierCurveCommand)) {
+    const ICommand &doneCmdRef = *cmd;
+    if (typeid(doneCmdRef) == typeid(SetBezierCurveCommand)) {
         auto *bCmd = static_cast<SetBezierCurveCommand *>(cmd.get());
         BusArenaState *state = findArenaState(this, true);
         state->flushAndDrain();
@@ -734,7 +736,7 @@ bool CommandBus::tryExecute(std::unique_ptr<ICommand> cmd)
                            static_cast<uint32_t>(sizeof(bezier_curve_t)));
         state->topCmdPtr = bCmd;
         state->topTypeTag = kRingTagSetBezier;
-    } else if (typeid(*cmd) == typeid(SetNodeConstantCommand)) {
+    } else if (typeid(doneCmdRef) == typeid(SetNodeConstantCommand)) {
         auto *cCmd = static_cast<SetNodeConstantCommand *>(cmd.get());
         BusArenaState *state = findArenaState(this, true);
         state->flushAndDrain();

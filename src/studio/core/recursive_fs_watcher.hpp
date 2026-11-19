@@ -52,7 +52,6 @@ class RecursiveFsWatcher {
     void flushDebounceQueue();
 
     FsWatchCallback m_callback;
-    uint32_t m_debounceMs;
 
     struct Impl;
     std::unique_ptr<Impl> m_impl;

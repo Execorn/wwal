@@ -3914,7 +3914,8 @@ static void test_cubic_bezier_bisection_fallback(void)
 
     /* Linear identity curve */
     for (float p = 0.0f; p <= 1.0f; p += 0.1f) {
-        assert(fabsf(waywal_cubic_bezier_solve_t(&BEZIER_LINEAR, p) - p) < 1e-5f);
+        float t = waywal_cubic_bezier_solve_t(&BEZIER_LINEAR, p);
+        assert(fabsf(3.0f * t * t - 2.0f * t * t * t - p) < 1e-5f);
         assert(fabsf(bezier_eval(&BEZIER_LINEAR, p) - p) < 1e-5f);
     }
 

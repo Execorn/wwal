@@ -11,7 +11,13 @@
 
 #include <ctype.h>
 #include <math.h>
+#if defined(__has_include) && __has_include(<stdckdint.h>)
 #include <stdckdint.h>
+#else
+#define ckd_add(r, a, b) __builtin_add_overflow((a), (b), (r))
+#define ckd_sub(r, a, b) __builtin_sub_overflow((a), (b), (r))
+#define ckd_mul(r, a, b) __builtin_mul_overflow((a), (b), (r))
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

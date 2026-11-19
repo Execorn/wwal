@@ -3550,8 +3550,8 @@ static bool solve_sparse_ldlt_or_ic0(uint32_t n, const uint32_t *perm_row_ptr,
 
     /* Multi-RHS forward / diagonal / backward solves directly in-place on packed batches */
     uint32_t n_batches = (B + WE_RIG_SOLVE_BATCH - 1u) / WE_RIG_SOLVE_BATCH;
-    uint32_t n_thr = 1u;
 #ifdef HAVE_OPENMP
+    uint32_t n_thr = 1u;
     if (n >= 512u && n_batches >= 2u) {
         int max_t = omp_get_max_threads();
         if (max_t > 1) {

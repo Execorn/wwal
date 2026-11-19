@@ -916,7 +916,7 @@ static void test_mainwindow_apply_wallpaper_ipc_integration_and_command_bus_fall
     tcfg.centerX = 0.30f;
     tcfg.centerY = 0.70f;
     tcfg.hasCustomBezier = true;
-    tcfg.bezier = bezier_curve_t{0.15f, 0.85f, 0.70f, 0.95f};
+    tcfg.bezier = bezier_curve_t{{0.15f}, {0.85f}, {0.70f}, {0.95f}};
     win.bezierEditor()->setTransitionConfig(tcfg);
 
     assert(win.themeStudio() != nullptr);

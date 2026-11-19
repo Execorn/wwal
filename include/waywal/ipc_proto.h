@@ -225,17 +225,25 @@ typedef struct {
     uint8_t has_crop_gravity;
     uint8_t invert_y;
     uint8_t no_cache;
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#if defined(__clang__)
+#pragma clang diagnostic ignored "-Wnested-anon-types"
+#pragma clang diagnostic ignored "-Wgnu-anonymous-struct"
+#endif
+#endif
     union {
         uint8_t _pad_flags;
-#ifdef __cplusplus
-        __extension__
-#endif
         struct {
             uint8_t is_solid_color : 1;
             uint8_t pos_y_inverted : 1;
             uint8_t _pad_flags_bits : 6;
         };
     };
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
     uint8_t source_color_index;
     uint8_t has_source_color_index;
     uint8_t has_seed_color;
@@ -411,12 +419,17 @@ typedef struct {
 static_assert(sizeof(waywal_set_uniform_structured_t) == 148,
               "waywal_set_uniform_structured_t must be 148 bytes");
 
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#if defined(__clang__)
+#pragma clang diagnostic ignored "-Wnested-anon-types"
+#pragma clang diagnostic ignored "-Wgnu-anonymous-struct"
+#endif
+#endif
 typedef struct {
     union {
         /* Standard 64/64 layout (CLI, daemon, legacy) */
-#ifdef __cplusplus
-        __extension__
-#endif
         struct {
             char output[64];         /* Empty string "" = apply to all outputs */
             char name[64];           /* GLSL uniform name or WE property key */
@@ -424,9 +437,6 @@ typedef struct {
             float values[4];
         };
         /* Structured 32/64 layout with explicit persistence flags */
-#ifdef __cplusplus
-        __extension__
-#endif
         struct {
             char target_output[32];
             char uniform_name[64];
@@ -440,6 +450,9 @@ typedef struct {
         uint8_t raw[148];
     };
 } waywal_set_uniform_payload_t;
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 static_assert(sizeof(waywal_set_uniform_payload_t) == 148,
               "waywal_set_uniform_payload_t must be 148 bytes");
 typedef waywal_set_uniform_payload_t waywal_shader_param_payload_t;

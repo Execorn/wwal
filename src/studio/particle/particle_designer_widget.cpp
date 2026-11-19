@@ -2727,7 +2727,7 @@ void ParticleDesignerWidget::ensureUiInitialized()
     connect(m_worldSpaceCheck, &QCheckBox::toggled, this, onSystemScalarChanged);
     connect(ex.perspectiveCheck, &QCheckBox::toggled, this, onSystemScalarChanged);
 
-    auto syncCurveHandleControls = [this](ScalarCurveEditorWidget *editor, QComboBox *modeCombo,
+    auto syncCurveHandleControls = [](ScalarCurveEditorWidget *editor, QComboBox *modeCombo,
                                           QDoubleSpinBox *inSpin, QDoubleSpinBox *outSpin) {
         if (!editor || !modeCombo || !inSpin || !outSpin) {
             return;

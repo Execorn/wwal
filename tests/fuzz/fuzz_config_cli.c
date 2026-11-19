@@ -171,8 +171,8 @@ static void run_builtin_config_cli_corpus(void)
         "--crop-gravity top-left",
         "img /tmp/test.png --transition-shader /nonexistent/fuzz.comp --crop-gravity 0.25,0.75",
         "video /tmp/loop.mp4 --loop 0 --speed 1.5 -o DP-1,HDMI-A-1",
-        "slideshow start /tmp --interval 120 --shuffle --transition-type wave --transition-wave "
-        "30,0.08",
+        ("slideshow start /tmp --interval 120 --shuffle --transition-type wave --transition-wave "
+         "30,0.08"),
         "slideshow --duration 1h30m --sort descending /tmp -o DP-1",
         "--help",
         "-h",

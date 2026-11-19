@@ -992,7 +992,7 @@ void test_ipc_client_set_wallpaper_and_puppet_scrub_sync_wire()
     wallOpts.crop_gravity_x = 0.25f;
     wallOpts.crop_gravity_y = 0.75f;
     wallOpts.has_custom_bezier = true;
-    wallOpts.bezier = bezier_curve_t{0.12f, 0.88f, 0.74f, 0.96f};
+    wallOpts.bezier = bezier_curve_t{{0.12f}, {0.88f}, {0.74f}, {0.96f}};
     client.setWallpaper(wallOpts);
 
     pumpUntil([&]() { return sawSetImageOk.load(); });

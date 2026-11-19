@@ -315,7 +315,7 @@ struct WallpaperApplyOptions {
     float transition_wave_amp{0.05f};
     float transition_center_x{0.5f};
     float transition_center_y{0.5f};
-    bezier_curve_t bezier{0.25f, 0.1f, 0.25f, 1.0f};
+    bezier_curve_t bezier{{0.25f}, {0.1f}, {0.25f}, {1.0f}};
     bool has_custom_bezier{false};
     float crop_gravity_x{0.5f};
     float crop_gravity_y{0.5f};

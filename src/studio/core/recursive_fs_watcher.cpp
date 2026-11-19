@@ -811,8 +811,7 @@ struct RecursiveFsWatcher::Impl {
 };
 
 RecursiveFsWatcher::RecursiveFsWatcher(FsWatchCallback callback, uint32_t debounce_ms)
-    : m_callback(std::move(callback)), m_debounceMs(debounce_ms),
-      m_impl(std::make_unique<Impl>(debounce_ms))
+    : m_callback(std::move(callback)), m_impl(std::make_unique<Impl>(debounce_ms))
 {
 }
 

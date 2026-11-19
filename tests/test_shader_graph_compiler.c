@@ -22,6 +22,7 @@
 #include <inttypes.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1143,7 +1144,7 @@ static void *malloc_churn_thread(void *arg)
     uint32_t idx = 0;
     uint32_t seed = 0x9e3779b9u;
     uint32_t ops = 0;
-    while (!__atomic_load_n(&ctx->stop, __ATOMIC_ACQUIRE)) {
+    while (!atomic_load_explicit(&ctx->stop, memory_order_acquire)) {
         seed = seed * 1664525u + 1013904223u;
         size_t sz = 16u + (seed % 32768u);
         free(ring[idx]);
@@ -1242,7 +1243,7 @@ static void test_multithreaded_16t_compile_p99_slo(void)
     for (int t = 0; t < kThreads; ++t) {
         pthread_join(tids[t], NULL);
     }
-    __atomic_store_n(&churn.stop, true, __ATOMIC_RELEASE);
+    atomic_store_explicit(&churn.stop, true, memory_order_release);
     for (int c = 0; c < kChurnThreads; ++c) {
         pthread_join(churn_tids[c], NULL);
     }

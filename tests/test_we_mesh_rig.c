@@ -188,8 +188,8 @@ static float get_bone_weight(const we_mdl_vertex_t *v, uint32_t bone)
 #define RIG_HARD_CHECK(cond, fmt, ...)                                                             \
     do {                                                                                           \
         if (!(cond)) {                                                                             \
-            fprintf(stderr, "RIG_HARD_CHECK failed at %s:%d: " fmt "\n", __FILE__,                 \
-                    __LINE__, ##__VA_ARGS__);                                                      \
+            fprintf(stderr, "RIG_HARD_CHECK failed at %s:%d: " fmt "\n", __FILE__, __LINE__        \
+                    __VA_OPT__(, ) __VA_ARGS__);                                                   \
             abort();                                                                               \
         }                                                                                          \
     } while (0)
