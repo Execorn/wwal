@@ -350,7 +350,8 @@ static void test_security_hardening(void)
         mkdir(sbox_ssh, 0700);
         mkdir(sbox_cfg, 0700);
         /* Plant a symlink ~/.config/wwal -> ~/.ssh to confirm O_NOFOLLOW blocks rule escalation */
-        (void)symlink(sbox_ssh, sbox_cfg_wwal);
+        if (symlink(sbox_ssh, sbox_cfg_wwal) != 0)
+            _exit(99);
         mkdir(sbox_local, 0700);
         mkdir(sbox_lshare, 0700);
         mkdir(sbox_keyrings, 0700);

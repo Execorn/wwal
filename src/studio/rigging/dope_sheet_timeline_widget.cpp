@@ -2733,8 +2733,9 @@ void FCurveCanvas::mousePressEvent(QMouseEvent *event)
                 m_dragStartMouse = event->position();
                 m_dragMutated = false;
                 m_preDragSel = impl->selectedKeys;
-                m_preDragSlots = {
-                    SelectedFCurveSlot{ch.boneIndex, ch.channelIndex, ki, k, k, val - k.value}};
+                m_preDragSlots.clear();
+                m_preDragSlots.push_back(
+                    SelectedFCurveSlot{ch.boneIndex, ch.channelIndex, ki, k, k, val - k.value});
                 m_curDragSlots = m_preDragSlots;
                 captureChannelNeighborSpan(ch, ki);
             };
