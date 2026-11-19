@@ -125,6 +125,7 @@ void DesktopPreviewMockup::resizeEvent(QResizeEvent *event)
 
 bool DesktopPreviewMockup::event(QEvent *event)
 {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 6, 0)
     if (event && event->type() == QEvent::DevicePixelRatioChange) {
         if (width() > 0 && height() > 0) {
             const qreal dpr = std::max(1.0, devicePixelRatioF());
@@ -135,6 +136,7 @@ bool DesktopPreviewMockup::event(QEvent *event)
         }
         update();
     }
+#endif
     return QWidget::event(event);
 }
 

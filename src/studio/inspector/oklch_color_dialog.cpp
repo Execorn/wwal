@@ -344,10 +344,12 @@ void OklchColorWheel::resizeEvent(QResizeEvent *) { m_cacheDirty = true; }
 
 bool OklchColorWheel::event(QEvent *event)
 {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 6, 0)
     if (event && event->type() == QEvent::DevicePixelRatioChange) {
         m_cacheDirty = true;
         update();
     }
+#endif
     return QWidget::event(event);
 }
 
