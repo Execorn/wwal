@@ -176,6 +176,7 @@ class VirtualizedGridWidget : public QWidget {
     [[nodiscard]] FuzzyCatalogIndex &catalogIndex() noexcept { return m_index; }
     [[nodiscard]] GpuTexturePool &texturePool() noexcept { return m_pool; }
     [[nodiscard]] HoverPreviewController &hoverController() noexcept { return m_hover; }
+    [[nodiscard]] GridGlCanvas *canvas() const noexcept { return m_canvas; }
 
     [[nodiscard]] std::vector<uint32_t> selectedIds() const;
     [[nodiscard]] const std::vector<uint32_t> &playlistQueue() const noexcept

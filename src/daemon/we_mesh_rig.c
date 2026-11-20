@@ -2592,10 +2592,10 @@ sn_solve_4rhs_avx2(uint32_t n, uint32_t num_sn, const uint32_t *restrict sn_star
         uint32_t s0 = sn_start[s];
         uint32_t s1 = sn_start[s + 1u];
         uint32_t w = s1 - s0;
-        const double *t_mat = &sn_t[t_off[s]];
-        const double *b_mat = &sn_b[b_off[s]];
-        const uint32_t *s_rows = &li[lp[s]];
         uint32_t h = lp[s + 1u] - lp[s];
+        const double *t_mat = (w > 1u && sn_t) ? &sn_t[t_off[s]] : NULL;
+        const double *b_mat = (h > 0u && sn_b) ? &sn_b[b_off[s]] : NULL;
+        const uint32_t *s_rows = (h > 0u && li) ? &li[lp[s]] : NULL;
 
         if (w == 1u) {
             __m256d x0 = _mm256_loadu_pd(&x[(size_t)s0 * 4u]);
@@ -2646,10 +2646,10 @@ sn_solve_4rhs_avx2(uint32_t n, uint32_t num_sn, const uint32_t *restrict sn_star
         uint32_t s0 = sn_start[s];
         uint32_t s1 = sn_start[s + 1u];
         uint32_t w = s1 - s0;
-        const double *t_mat = &sn_t[t_off[s]];
-        const double *b_mat = &sn_b[b_off[s]];
-        const uint32_t *s_rows = &li[lp[s]];
         uint32_t h = lp[s + 1u] - lp[s];
+        const double *t_mat = (w > 1u && sn_t) ? &sn_t[t_off[s]] : NULL;
+        const double *b_mat = (h > 0u && sn_b) ? &sn_b[b_off[s]] : NULL;
+        const uint32_t *s_rows = (h > 0u && li) ? &li[lp[s]] : NULL;
 
         if (w == 1u) {
             __m256d x0 = _mm256_loadu_pd(&x[(size_t)s0 * 4u]);
@@ -2747,10 +2747,10 @@ static void sn_solve_4rhs_scalar(uint32_t n, uint32_t num_sn, const uint32_t *re
         uint32_t s0 = sn_start[s];
         uint32_t s1 = sn_start[s + 1u];
         uint32_t w = s1 - s0;
-        const double *t_mat = &sn_t[t_off[s]];
-        const double *b_mat = &sn_b[b_off[s]];
-        const uint32_t *s_rows = &li[lp[s]];
         uint32_t h = lp[s + 1u] - lp[s];
+        const double *t_mat = (w > 1u && sn_t) ? &sn_t[t_off[s]] : NULL;
+        const double *b_mat = (h > 0u && sn_b) ? &sn_b[b_off[s]] : NULL;
+        const uint32_t *s_rows = (h > 0u && li) ? &li[lp[s]] : NULL;
 
         for (uint32_t j = 0; j < w; j++) {
             const double *xj = &x[(size_t)(s0 + j) * 4u];
@@ -2788,10 +2788,10 @@ static void sn_solve_4rhs_scalar(uint32_t n, uint32_t num_sn, const uint32_t *re
         uint32_t s0 = sn_start[s];
         uint32_t s1 = sn_start[s + 1u];
         uint32_t w = s1 - s0;
-        const double *t_mat = &sn_t[t_off[s]];
-        const double *b_mat = &sn_b[b_off[s]];
-        const uint32_t *s_rows = &li[lp[s]];
         uint32_t h = lp[s + 1u] - lp[s];
+        const double *t_mat = (w > 1u && sn_t) ? &sn_t[t_off[s]] : NULL;
+        const double *b_mat = (h > 0u && sn_b) ? &sn_b[b_off[s]] : NULL;
+        const uint32_t *s_rows = (h > 0u && li) ? &li[lp[s]] : NULL;
 
         for (uint32_t p = 0; p < h; p++) {
             const double *brow = &b_mat[(size_t)p * w];
@@ -2835,8 +2835,8 @@ static void factor_one_supernode(uint32_t d, const uint32_t *restrict sn_start,
     uint32_t d1 = sn_start[d + 1u];
     uint32_t w_d = d1 - d0;
     uint32_t wd_s = (w_d + 3u) & ~3u;
-    const uint32_t *d_rows = &Li[Lp[d]];
     uint32_t h_d = Lp[d + 1u] - Lp[d];
+    const uint32_t *d_rows = (h_d > 0u && Li) ? &Li[Lp[d]] : NULL;
     uint32_t m_d = w_d + h_d;
 
     memset(panel, 0, (size_t)m_d * wd_s * sizeof(double));
@@ -2870,8 +2870,8 @@ static void factor_one_supernode(uint32_t d, const uint32_t *restrict sn_start,
         uint32_t c0 = sn_start[s];
         uint32_t c1 = sn_start[s + 1u];
         uint32_t w_s = c1 - c0;
-        const uint32_t *s_rows = &Li[Lp[s]];
         uint32_t h_s = Lp[s + 1u] - Lp[s];
+        const uint32_t *s_rows = (h_s > 0u && Li) ? &Li[Lp[s]] : NULL;
         uint32_t p0 = next_ptr[s];
         uint32_t p1 = p0;
         while (p1 < h_s && s_rows[p1] < d1) {
@@ -2958,8 +2958,8 @@ static void factor_one_supernode(uint32_t d, const uint32_t *restrict sn_start,
         s = nxt;
     }
 
-    double *t_d = &sn_T[t_off[d]];
-    double *b_d = (h_d > 0u) ? &sn_B[b_off[d]] : NULL;
+    double *t_d = (w_d > 1u && sn_T) ? &sn_T[t_off[d]] : NULL;
+    double *b_d = (h_d > 0u && sn_B) ? &sn_B[b_off[d]] : NULL;
     for (uint32_t c = 0; c < w_d; c++) {
         double piv = panel[(size_t)c * wd_s + c];
         double scale_floor = fmax(1e-15 * fabs(perm_diag[d0 + c]), 1e-18);

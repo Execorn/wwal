@@ -131,13 +131,13 @@ jobs:
         if: matrix.profile == 'release'
         run: |
           readelf -d build/wwald | grep NEEDED
-          ! readelf -d build/wwald | grep -E 'NEEDED.*(libav|libswscale|libwebp|libavif|libjxl|librsvg|libpipewire|libzstd|libsodium|libcurl|libQt6)'
+          ! readelf -d build/wwald | grep -E 'NEEDED.*(libav|libswscale|libpng|libjpeg|libturbojpeg|libwebp|libavif|libjxl|librsvg|libpipewire|libzstd|libsodium|libcurl|libQt6)'
           needed_count=$(readelf -d build/wwald | grep -c NEEDED)
           echo "wwald DT_NEEDED count: ${needed_count}"
           if [ "${{ matrix.compiler }}" = "gcc" ]; then
-            test "${needed_count}" -eq 14
+            test "${needed_count}" -eq 12
           else
-            test "${needed_count}" -ge 13 -a "${needed_count}" -le 15
+            test "${needed_count}" -ge 11 -a "${needed_count}" -le 13
           fi
           QT_QPA_PLATFORM=offscreen ./build/wwal-studio --headless-check
 

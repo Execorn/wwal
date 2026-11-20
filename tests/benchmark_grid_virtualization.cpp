@@ -888,7 +888,7 @@ static void test_fuzzy_and_grid_regressions()
             }
         }
 
-        auto *canvas = grid.findChild<GridGlCanvas *>();
+        auto *canvas = grid.canvas();
         auto *scrollBar = grid.findChild<QScrollBar *>();
         assert(canvas && scrollBar);
         canvas->resize(620, 400);
